@@ -129,7 +129,9 @@ run_claude_with_retry() {
 # Usage: run_claude <prompt> <log_name> [extra_claude_args...]
 #
 # 环境变量:
-#   CLAUDE_MODEL  主模型（默认: glm-5-turbo）
+#   CLAUDE_MODEL    主模型（默认: glm-5-turbo）
+#   LANDLOCK_CONFIG Landlock 配置文件路径（可选，设置后自动包裹）
+#   LANDLOCK_RUNNER landlock_runner.py 路径（默认: utils/landlock-runner/landlock_runner.py）
 run_claude() {
     local prompt="$1"
     local log_name="$2"
@@ -142,12 +144,18 @@ run_claude() {
         perm_flag="--permission-mode acceptEdits"
     fi
 
-    claude -p "$prompt" \
+    local claude_cmd=(claude -p "$prompt" \
         --output-format stream-json --verbose \
         --no-session-persistence \
         $perm_flag \
         --model "${CLAUDE_MODEL:-glm-5-turbo}" \
-        "$@" \
-        2>"$prefix.err" | tee "$prefix.jsonl" | \
+        "$@")
+
+    if [ -n "$LANDLOCK_CONFIG" ] && [ -f "$LANDLOCK_CONFIG" ]; then
+        local runner="${LANDLOCK_RUNNER:-utils/landlock-runner/landlock_runner.py}"
+        claude_cmd=(python3 "$runner" "$LANDLOCK_CONFIG" "${claude_cmd[@]}")
+    fi
+
+    "${claude_cmd[@]}" 2>"$prefix.err" | tee "$prefix.jsonl" | \
         jq -r 'select(.type=="result") | .result'
 }
