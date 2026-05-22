@@ -144,9 +144,17 @@ run_claude() {
         perm_flag="--permission-mode acceptEdits"
     fi
 
+    # 检测会话标志：传入 --session-id / --resume / --continue 时保留会话持久化
+    local no_persist="--no-session-persistence"
+    for arg in "$@"; do
+        case "$arg" in
+            --session-id|--resume|-r|--continue|-c) no_persist=""; break ;;
+        esac
+    done
+
     local claude_cmd=(claude -p "$prompt" \
         --output-format stream-json --verbose \
-        --no-session-persistence \
+        $no_persist \
         $perm_flag \
         --model "${CLAUDE_MODEL:-glm-5-turbo}" \
         "$@")
