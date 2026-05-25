@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Iteration progress tracking with interrupt recovery.
-# Provides: progress_read, progress_write, run_iterations
+# Provides: progress_read, progress_write, progress_iterations
 #
 # Prerequisites: $OUTPUT_DIR must be set by the caller (e.g. via setup_output_dir).
 
@@ -26,10 +26,10 @@ progress_write() {
 }
 
 # 对用户指定任务执行多轮迭代，自动跳过已完成轮次并支持断点恢复
-# 用法: run_iterations <task_id> <max_iterations> <callback> [callback_args...]
+# 用法: progress_iterations <task_id> <max_iterations> <callback> [callback_args...]
 # 回调签名: callback <iteration> <max_iterations> [callback_args...]
 # 返回: 0=完成  1=失败中止  2=已跳过
-run_iterations() {
+progress_iterations() {
     local task_id="$1" max_iter="$2" callback="$3"
     shift 3
 

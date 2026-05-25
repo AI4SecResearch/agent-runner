@@ -9,7 +9,7 @@ Designed for batch-processing pipelines where an agent (e.g. Claude Code) is inv
 | File | Purpose |
 |------|---------|
 | `runner.sh` | Agent invocation: `run_claude`, `_run_with_watchdog`, `run_claude_with_retry`, `check_claude_result` |
-| `progress.sh` | Iteration progress: `progress_read`, `progress_write`, `run_iterations` |
+| `progress.sh` | Iteration progress: `progress_read`, `progress_write`, `progress_iterations` |
 
 ## Quick start
 
@@ -21,7 +21,7 @@ OUTPUT_DIR="$PWD/output"
 mkdir -p "$OUTPUT_DIR"
 
 run_claude_with_retry "Summarize this document" "summary"
-run_iterations my-task 10 my_callback
+progress_iterations my-task 10 my_callback
 ```
 
 ## Prerequisites
@@ -71,6 +71,6 @@ Read the last completed iteration number for a task. Returns `0` if no state exi
 
 Persist the completed iteration number. State is stored in `$OUTPUT_DIR/state/<task_id>`.
 
-**`run_iterations <task_id> <max_iterations> <callback> [callback_args...]`**
+**`progress_iterations <task_id> <max_iterations> <callback> [callback_args...]`**
 
 Run a callback for iterations 1..max, skipping already-completed ones. The callback receives `<iteration> <max_iterations> [args...]`. Returns: 0 = all done, 1 = callback failed, 2 = already complete (skipped).
