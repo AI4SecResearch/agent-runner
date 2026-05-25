@@ -115,7 +115,7 @@ run_claude_with_retry() {
     for ((attempt=1; attempt<=retries; attempt++)); do
         echo "          ⚠️ 主模型失败，glm-4.7 重试 $attempt/$retries: $log_name" >&2
         local retry_name="${log_name}-retry${attempt}"
-        if _run_with_watchdog "$prompt" "$retry_name" --model glm-4.7 \
+        if _run_with_watchdog "$prompt" "$retry_name" "$@" --model glm-4.7 \
            && check_claude_result "$retry_name"; then
             return 0
         fi
