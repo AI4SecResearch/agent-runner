@@ -109,15 +109,30 @@ run_claude_with_retry() {
         return 0
     fi
 
+    # 从首次调用的 JSONL 提取 session_id，供重试时 resume
+    local session_id=""
+    if [ -f "$OUTPUT_DIR/${log_name}.jsonl" ]; then
+        session_id=$(jq -r 'select(.session_id != null) | .session_id' \
+            "$OUTPUT_DIR/${log_name}.jsonl" 2>/dev/null | head -1)
+    fi
+
     # 重试（glm-4.7）
     local retries="${CLAUDE_RETRIES:-1}"
     local attempt
     for ((attempt=1; attempt<=retries; attempt++)); do
-        echo "          ⚠️ 主模型失败，glm-4.7 重试 $attempt/$retries: $log_name" >&2
         local retry_name="${log_name}-retry${attempt}"
-        if _run_with_watchdog "$prompt" "$retry_name" "$@" --model glm-4.7 \
-           && check_claude_result "$retry_name"; then
-            return 0
+        if [ -n "$session_id" ]; then
+            echo "          ⚠️ 主模型失败，glm-4.7 续接会话重试 $attempt/$retries: $log_name" >&2
+            if _run_with_watchdog "继续" "$retry_name" --resume "$session_id" --model glm-4.7 \
+               && check_claude_result "$retry_name"; then
+                return 0
+            fi
+        else
+            echo "          ⚠️ 主模型失败，glm-4.7 重试 $attempt/$retries: $log_name" >&2
+            if _run_with_watchdog "$prompt" "$retry_name" "$@" --model glm-4.7 \
+               && check_claude_result "$retry_name"; then
+                return 0
+            fi
         fi
     done
 
@@ -144,17 +159,8 @@ run_claude() {
         perm_flag="--permission-mode acceptEdits"
     fi
 
-    # 检测会话标志：传入 --session-id / --resume / --continue 时保留会话持久化
-    local no_persist="--no-session-persistence"
-    for arg in "$@"; do
-        case "$arg" in
-            --session-id|--resume|-r|--continue|-c) no_persist=""; break ;;
-        esac
-    done
-
     local claude_cmd=(claude -p "$prompt" \
         --output-format stream-json --verbose \
-        $no_persist \
         $perm_flag \
         --model "${CLAUDE_MODEL:-glm-5-turbo}" \
         "$@")
