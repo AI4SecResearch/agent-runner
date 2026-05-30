@@ -18,6 +18,7 @@
 check_claude_result() {
     local log_name="$1"
     local jsonl="$OUTPUT_DIR/${log_name}.jsonl"
+    [ -s "$jsonl" ] || return 1
     local is_error
     is_error=$(jq -r 'select(.type=="result") | .is_error // false' \
         "$jsonl" 2>/dev/null)
