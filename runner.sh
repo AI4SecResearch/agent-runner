@@ -159,6 +159,32 @@ _agent_once_with_watchdog() {
     return 0
 }
 
+# 运行 agent_once_with_watchdog 并检查结果，处理额度耗尽
+# 返回: 0=成功  1=失败(可重试)  2=额度耗尽且无key pool(放弃)
+agent_once_with_disable() {
+    local prompt="$1"
+    local log_name="$2"
+    shift 2
+
+    _agent_once_with_watchdog "$prompt" "$log_name" "$@" \
+        && check_agent_result "$log_name" \
+        && return 0
+
+    local classify_result=$(classify_agent_error "$log_name")
+    local should_disable="${classify_result##*:}"
+
+    if [ "$should_disable" = "true" ]; then
+        if [ -f "$(_kp_config)" ]; then
+            key_pool_disable
+        else
+            echo "          ⚠️ 额度耗尽且无 key pool: $log_name" >&2
+            return 2
+        fi
+    fi
+
+    return 1
+}
+
 # ── Retry orchestration (bash loop, Python-driven plan) ───────────
 
 # 用法: agent_with_retry <prompt> <log_name> [extra_args...]
@@ -174,20 +200,14 @@ agent_with_retry() {
     key_pool_init
 
     # ── Primary attempt (current key, primary model) ──
-    if _agent_once_with_watchdog "$prompt" "$log_name" "$@" \
-       && check_agent_result "$log_name"; then
-        key_pool_on_success
-        return 0
-    fi
+    agent_once_with_disable "$prompt" "$log_name" "$@"
+    case $? in
+        0) key_pool_on_success; return 0;;
+        2) return 1;;
+    esac
 
     local classify_result=$(classify_agent_error "$log_name")
     local action="${classify_result%%:*}"
-    local should_disable="${classify_result##*:}"
-
-    # ── Disable exhausted key if quota error ──
-    if [ "$should_disable" = "true" ]; then
-        key_pool_disable
-    fi
 
     # ── No key pool: only downgrade available ──
     if [ ! -f "$(_kp_config)" ]; then
@@ -216,16 +236,16 @@ agent_with_retry() {
 
             if [ -n "$session_id" ]; then
                 echo "          ⚠️ 续接会话 $((i+1))/$count ($model): $log_name" >&2
-                _agent_once_with_watchdog "继续" "$name" --resume "$session_id" $model_flag
+                agent_once_with_disable "继续" "$name" --resume "$session_id" $model_flag
             else
                 echo "          ⚠️ 重试 $((i+1))/$count ($model): $log_name" >&2
-                _agent_once_with_watchdog "$prompt" "$name" $model_flag
+                agent_once_with_disable "$prompt" "$name" $model_flag
             fi
 
-            if check_agent_result "$name"; then
-                [ "$model" != "glm-4.7" ] && key_pool_on_success
-                return 0
-            fi
+            case $? in
+                0) [ "$model" != "glm-4.7" ] && key_pool_on_success; return 0;;
+                2) return 1;;
+            esac
         done
     done < <(python3 "$_runner_py" retry-plan --action "$action" --config "$(_kp_config)" --state "$(_kp_state)")
 
