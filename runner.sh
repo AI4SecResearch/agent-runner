@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Agent invocation with reliability features.
-# Provides: run_claude, _run_with_watchdog, run_claude_with_retry
+# Provides: agent_once, _agent_once_with_watchdog, agent_with_retry
 #
 # Prerequisites: $OUTPUT_DIR must be set by the caller (e.g. via setup_output_dir).
 #
@@ -45,27 +45,27 @@ key_pool_available_size() {
 
 # ── Result check & error classification (delegates to runner.py) ──
 
-# 用法: check_claude_result <log_name>
+# 用法: check_agent_result <log_name>
 # 返回 0=成功  1=失败
-check_claude_result() {
+check_agent_result() {
     python3 "$_runner_py" check-result "$OUTPUT_DIR/${1}.jsonl"
 }
 
-classify_claude_error() {
+classify_agent_error() {
     python3 "$_runner_py" classify "$OUTPUT_DIR/${1}.jsonl" \
         --config "$(_kp_config)" --state "$(_kp_state)"
 }
 
 # ── Process execution (pure bash) ─────────────────────────────────
 
-# Run a single Claude step with standard output routing
-# Usage: run_claude <prompt> <log_name> [extra_claude_args...]
+# Run a single agent step with standard output routing
+# Usage: agent_once <prompt> <log_name> [extra_args...]
 #
 # 环境变量:
 #   CLAUDE_MODEL    主模型（默认: glm-5-turbo）
 #   LANDLOCK_CONFIG Landlock 配置文件路径（可选，设置后自动包裹）
 #   LANDLOCK_RUNNER landlock_runner.py 路径（默认: utils/landlock-runner/landlock_runner.py）
-run_claude() {
+agent_once() {
     local prompt="$1"
     local log_name="$2"
     shift 2
@@ -77,7 +77,7 @@ run_claude() {
         perm_flag="--permission-mode acceptEdits"
     fi
 
-    local claude_cmd=(claude -p "$prompt" \
+    local agent_cmd=(claude -p "$prompt" \
         --output-format stream-json --verbose \
         $perm_flag \
         --model "${CLAUDE_MODEL:-glm-5-turbo}" \
@@ -85,17 +85,17 @@ run_claude() {
 
     if [ -n "$LANDLOCK_CONFIG" ] && [ -f "$LANDLOCK_CONFIG" ]; then
         local runner="${LANDLOCK_RUNNER:-utils/landlock-runner/landlock_runner.py}"
-        claude_cmd=(python3 "$runner" "$LANDLOCK_CONFIG" "${claude_cmd[@]}")
+        agent_cmd=(python3 "$runner" "$LANDLOCK_CONFIG" "${agent_cmd[@]}")
     fi
 
-    "${claude_cmd[@]}" 2>"$prefix.err" | tee "$prefix.jsonl" | \
+    "${agent_cmd[@]}" 2>"$prefix.err" | tee "$prefix.jsonl" | \
         jq -r 'select(.type=="result") | .result'
 }
 
-# 后台执行 run_claude 并监控 jsonl 增长，超时则 kill
-# 用法与 run_claude 一致: _run_with_watchdog <prompt> <log_name> [extra_args...]
+# 后台执行 agent_once 并监控 jsonl 增长，超时则 kill
+# 用法与 agent_once 一致: _agent_once_with_watchdog <prompt> <log_name> [extra_args...]
 # 返回 0=正常结束  1=超时被 kill
-_run_with_watchdog() {
+_agent_once_with_watchdog() {
     local prompt="$1"
     local log_name="$2"
     shift 2
@@ -103,7 +103,7 @@ _run_with_watchdog() {
     local stall_timeout="${CLAUDE_STALL_TIMEOUT:-300}"
     local max_timeout="${CLAUDE_TIMEOUT:-0}"
 
-    run_claude "$prompt" "$log_name" "$@" > /dev/null &
+    agent_once "$prompt" "$log_name" "$@" > /dev/null &
     local job_pid=$!
 
     local start_time last_size last_growth
@@ -161,12 +161,12 @@ _run_with_watchdog() {
 
 # ── Retry orchestration (bash loop, Python-driven plan) ───────────
 
-# 用法: run_claude_with_retry <prompt> <log_name> [extra_args...]
+# 用法: agent_with_retry <prompt> <log_name> [extra_args...]
 # 返回 0=成功  1=均失败
 #
 # Python 生成重试计划 (retry-plan)，bash 通用循环执行。
 # 恢复策略由 api-keys.json 中 provider 的 error_handling 配置决定。
-run_claude_with_retry() {
+agent_with_retry() {
     local prompt="$1"
     local log_name="$2"
     shift 2
@@ -174,13 +174,13 @@ run_claude_with_retry() {
     key_pool_init
 
     # ── Primary attempt (current key, primary model) ──
-    if _run_with_watchdog "$prompt" "$log_name" "$@" \
-       && check_claude_result "$log_name"; then
+    if _agent_once_with_watchdog "$prompt" "$log_name" "$@" \
+       && check_agent_result "$log_name"; then
         key_pool_on_success
         return 0
     fi
 
-    local classify_result=$(classify_claude_error "$log_name")
+    local classify_result=$(classify_agent_error "$log_name")
     local action="${classify_result%%:*}"
     local should_disable="${classify_result##*:}"
 
@@ -216,13 +216,13 @@ run_claude_with_retry() {
 
             if [ -n "$session_id" ]; then
                 echo "          ⚠️ 续接会话 $((i+1))/$count ($model): $log_name" >&2
-                _run_with_watchdog "继续" "$name" --resume "$session_id" $model_flag
+                _agent_once_with_watchdog "继续" "$name" --resume "$session_id" $model_flag
             else
                 echo "          ⚠️ 重试 $((i+1))/$count ($model): $log_name" >&2
-                _run_with_watchdog "$prompt" "$name" $model_flag
+                _agent_once_with_watchdog "$prompt" "$name" $model_flag
             fi
 
-            if check_claude_result "$name"; then
+            if check_agent_result "$name"; then
                 [ "$model" != "glm-4.7" ] && key_pool_on_success
                 return 0
             fi

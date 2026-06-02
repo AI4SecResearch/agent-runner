@@ -8,7 +8,7 @@ Designed for batch-processing pipelines where an agent (e.g. Claude Code) is inv
 
 | File | Purpose |
 |------|---------|
-| `runner.sh` | Agent invocation: `run_claude`, `_run_with_watchdog`, `run_claude_with_retry`, `check_claude_result` |
+| `runner.sh` | Agent invocation: `agent_once`, `_agent_once_with_watchdog`, `agent_with_retry`, `check_agent_result` |
 | `progress.sh` | Iteration progress: `progress_read`, `progress_write`, `progress_iterations` |
 
 ## Quick start
@@ -20,7 +20,7 @@ source agent-runner/runner.sh
 OUTPUT_DIR="$PWD/output"
 mkdir -p "$OUTPUT_DIR"
 
-run_claude_with_retry "Summarize this document" "summary"
+agent_with_retry "Summarize this document" "summary"
 progress_iterations my-task 10 my_callback
 ```
 
@@ -28,7 +28,7 @@ progress_iterations my-task 10 my_callback
 
 - `$OUTPUT_DIR` must be set before calling any function
 - `jq` must be available in `$PATH`
-- `claude` CLI must be available for `run_claude` and friends
+- `claude` CLI must be available for `agent_once` and friends
 
 ## Environment variables
 
@@ -45,19 +45,19 @@ progress_iterations my-task 10 my_callback
 
 ### runner.sh
 
-**`run_claude <prompt> <log_name> [extra_args...]`**
+**`agent_once <prompt> <log_name> [extra_args...]`**
 
 Run the agent CLI once. Writes `$OUTPUT_DIR/<log_name>.jsonl` (stream-json log), `$OUTPUT_DIR/<log_name>.err` (stderr), and prints the result text to stdout.
 
-**`check_claude_result <log_name>`**
+**`check_agent_result <log_name>`**
 
 Check whether a completed run produced a success result. Returns 0 on success, 1 on error.
 
-**`_run_with_watchdog <prompt> <log_name> [extra_args...]`**
+**`_agent_once_with_watchdog <prompt> <log_name> [extra_args...]`**
 
 Run the agent in the background with a watchdog that monitors JSONL file growth. Kills the process on stall timeout or total timeout. Returns 0 if completed normally, 1 if killed.
 
-**`run_claude_with_retry <prompt> <log_name> [extra_args...]`**
+**`agent_with_retry <prompt> <log_name> [extra_args...]`**
 
 Run with watchdog, then retry with a fallback model on failure. Returns 0 if any attempt succeeded, 1 if all attempts failed.
 
