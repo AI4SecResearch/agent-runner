@@ -28,6 +28,12 @@ import sys
 import time
 
 DISABLE_TTL = 5 * 3600  # 5 hours
+DEBUG = False
+
+
+def _dbg(msg):
+    if DEBUG:
+        print(f"[runner.py] {msg}", file=sys.stderr)
 
 
 class KeyPool:
@@ -85,6 +91,7 @@ class KeyPool:
             return
         with os.fdopen(fd, "w") as f:
             json.dump({"current_index": 0, "disabled": {}, "success_count": 0}, f)
+        _dbg(f"init: created state file {self.state_path}")
 
     # ── Disabled key helpers ────────────────────────────────────────
 
@@ -131,7 +138,9 @@ class KeyPool:
         if not keys:
             return ""
         self._init_state()
-        return self.current_key()
+        key = self.current_key()
+        _dbg(f"init: key[{self._read_state().get('current_index', 0)}]={key[:8]}...")
+        return key
 
     def rotate(self):
         """Atomically advance to next non-disabled key, return new key."""
@@ -143,12 +152,14 @@ class KeyPool:
             self._purge_expired(data)
             disabled = self._active_disabled(data)
             if len(disabled) >= len(keys):
+                _dbg(f"rotate: all {len(keys)} keys disabled")
                 return ""
             cur = data.get("current_index", 0)
             new_idx = (cur + 1) % len(keys)
             while new_idx in disabled:
                 new_idx = (new_idx + 1) % len(keys)
             data["current_index"] = new_idx
+            _dbg(f"rotate: {cur}→{new_idx} key={keys[new_idx][:8]}... disabled={disabled}")
             return keys[new_idx]
 
         return self._modify_state(_rotate)
@@ -163,11 +174,14 @@ class KeyPool:
         try:
             idx = keys.index(key_str)
         except ValueError:
+            _dbg(f"disable: key {key_str[:8]}... not found in config")
             return ""
 
         def _disable(data):
             self._purge_expired(data)
-            data.setdefault("disabled", {})[str(idx)] = time.time() + DISABLE_TTL
+            expiry = time.time() + DISABLE_TTL
+            data.setdefault("disabled", {})[str(idx)] = expiry
+            _dbg(f"disable: key[{idx}]={key_str[:8]}... until={expiry:.0f}")
             return key_str
 
         return self._modify_state(_disable)
@@ -178,7 +192,9 @@ class KeyPool:
         if not os.path.exists(self.state_path):
             return total
         data = self._read_state()
-        return total - len(self._active_disabled(data))
+        active = total - len(self._active_disabled(data))
+        _dbg(f"available_size: {active}/{total}")
+        return active
 
     def on_success(self):
         """Check proactive rotation. Returns new key if rotated, else empty string."""
@@ -189,6 +205,7 @@ class KeyPool:
             count = data.get("success_count", 0) + 1
             if count < rotate_every:
                 data["success_count"] = count
+                _dbg(f"on_success: count={count}/{rotate_every}")
                 return ""
             data["success_count"] = 0
             # Rotate within the same lock
@@ -286,6 +303,7 @@ def classify_error(jsonl_path, config_path, state_path):
 
     # Auto-disable key when action involves rotation (quota exhaustion)
     disable_flag = "true" if "rotate" in action else "false"
+    _dbg(f"classify: error_code={error_code} provider={provider} action={action} disable={disable_flag}")
 
     return f"{action}:{disable_flag}"
 
@@ -300,9 +318,11 @@ def retry_plan(action, config_path, state_path):
         pool = KeyPool(config_path, state_path)
         pool_size = pool.available_size()
         if pool_size == 0:
+            _dbg(f"retry_plan: action={action} pool_size=0, no available keys")
             return []
     else:
         pool_size = 1
+    _dbg(f"retry_plan: action={action} pool_size={pool_size}")
     if action == "rotate_key":
         return [("primary", pool_size)]
     elif action == "downgrade":
