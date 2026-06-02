@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Agent invocation with reliability features.
-# Provides: run_claude, check_claude_result, _run_with_watchdog, run_claude_with_retry
+# Provides: run_claude, _run_with_watchdog, run_claude_with_retry
 #
 # Prerequisites: $OUTPUT_DIR must be set by the caller (e.g. via setup_output_dir).
 #
@@ -10,19 +10,86 @@
 #   CLAUDE_MODEL         Primary model (default: glm-5-turbo)
 #   CLAUDE_STALL_TIMEOUT Seconds before killing a stalled process (default: 300)
 #   CLAUDE_TIMEOUT       Hard total timeout, 0 = unlimited (default: 0)
-#   CLAUDE_RETRIES       Number of fallback retries (default: 1)
+#   KEY_POOL_CONFIG      Path to api-keys.json (default: api-keys.json)
 
-# 检查 run_claude 的输出是否为成功结果
+_runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_runner_py="$_runner_dir/runner.py"
+
+_kp_config() { echo "${KEY_POOL_CONFIG:-$_runner_dir/../../api-keys.json}"; }
+_kp_state()  { echo "${DATA_DIR}/key-pool-state.json"; }
+
+# ── Key pool (delegates to runner.py) ──────────────────────────────
+
+key_pool_init() {
+    local key=$(python3 "$_runner_py" init --config "$(_kp_config)" --state "$(_kp_state)")
+    [ -n "$key" ] && export ANTHROPIC_AUTH_TOKEN="$key"
+}
+
+key_pool_rotate() {
+    local key=$(python3 "$_runner_py" rotate --config "$(_kp_config)" --state "$(_kp_state)")
+    [ -n "$key" ] && export ANTHROPIC_AUTH_TOKEN="$key"
+}
+
+key_pool_on_success() {
+    local key=$(python3 "$_runner_py" on-success --config "$(_kp_config)" --state "$(_kp_state)")
+    [ -n "$key" ] && export ANTHROPIC_AUTH_TOKEN="$key"
+}
+
+key_pool_disable() {
+    python3 "$_runner_py" disable --key "$ANTHROPIC_AUTH_TOKEN" --config "$(_kp_config)" --state "$(_kp_state)"
+}
+
+key_pool_available_size() {
+    python3 "$_runner_py" available-size --config "$(_kp_config)" --state "$(_kp_state)"
+}
+
+# ── Result check & error classification (delegates to runner.py) ──
+
 # 用法: check_claude_result <log_name>
 # 返回 0=成功  1=失败
 check_claude_result() {
-    local log_name="$1"
-    local jsonl="$OUTPUT_DIR/${log_name}.jsonl"
-    [ -s "$jsonl" ] || return 1
-    local is_error
-    is_error=$(jq -r 'select(.type=="result") | .is_error // false' \
-        "$jsonl" 2>/dev/null)
-    [ "$is_error" != "true" ]
+    python3 "$_runner_py" check-result "$OUTPUT_DIR/${1}.jsonl"
+}
+
+classify_claude_error() {
+    python3 "$_runner_py" classify "$OUTPUT_DIR/${1}.jsonl" \
+        --config "$(_kp_config)" --state "$(_kp_state)"
+}
+
+# ── Process execution (pure bash) ─────────────────────────────────
+
+# Run a single Claude step with standard output routing
+# Usage: run_claude <prompt> <log_name> [extra_claude_args...]
+#
+# 环境变量:
+#   CLAUDE_MODEL    主模型（默认: glm-5-turbo）
+#   LANDLOCK_CONFIG Landlock 配置文件路径（可选，设置后自动包裹）
+#   LANDLOCK_RUNNER landlock_runner.py 路径（默认: utils/landlock-runner/landlock_runner.py）
+run_claude() {
+    local prompt="$1"
+    local log_name="$2"
+    shift 2
+    local prefix="$OUTPUT_DIR/$log_name"
+    local perm_flag
+    if [ "${SANDBOX:-}" = "1" ]; then
+        perm_flag="--dangerously-skip-permissions"
+    else
+        perm_flag="--permission-mode acceptEdits"
+    fi
+
+    local claude_cmd=(claude -p "$prompt" \
+        --output-format stream-json --verbose \
+        $perm_flag \
+        --model "${CLAUDE_MODEL:-glm-5-turbo}" \
+        "$@")
+
+    if [ -n "$LANDLOCK_CONFIG" ] && [ -f "$LANDLOCK_CONFIG" ]; then
+        local runner="${LANDLOCK_RUNNER:-utils/landlock-runner/landlock_runner.py}"
+        claude_cmd=(python3 "$runner" "$LANDLOCK_CONFIG" "${claude_cmd[@]}")
+    fi
+
+    "${claude_cmd[@]}" 2>"$prefix.err" | tee "$prefix.jsonl" | \
+        jq -r 'select(.type=="result") | .result'
 }
 
 # 后台执行 run_claude 并监控 jsonl 增长，超时则 kill
@@ -92,85 +159,76 @@ _run_with_watchdog() {
     return 0
 }
 
-# 运行 Claude 调用，失败或超时时自动用 glm-4.7 重试
+# ── Retry orchestration (bash loop, Python-driven plan) ───────────
+
 # 用法: run_claude_with_retry <prompt> <log_name> [extra_args...]
 # 返回 0=成功  1=均失败
-# 无 stdout 输出，调用方从 jsonl 日志读取结果文本
 #
-# 环境变量:
-#   CLAUDE_RETRIES  重试次数（默认: 1）
+# Python 生成重试计划 (retry-plan)，bash 通用循环执行。
+# 恢复策略由 api-keys.json 中 provider 的 error_handling 配置决定。
 run_claude_with_retry() {
     local prompt="$1"
     local log_name="$2"
     shift 2
 
-    # 首次调用（主模型）
+    key_pool_init
+
+    # ── Primary attempt (current key, primary model) ──
     if _run_with_watchdog "$prompt" "$log_name" "$@" \
        && check_claude_result "$log_name"; then
+        key_pool_on_success
         return 0
     fi
 
-    # 从首次调用的 JSONL 提取 session_id，供重试时 resume
+    local classify_result=$(classify_claude_error "$log_name")
+    local action="${classify_result%%:*}"
+    local should_disable="${classify_result##*:}"
+
+    # ── Disable exhausted key if quota error ──
+    if [ "$should_disable" = "true" ]; then
+        key_pool_disable
+    fi
+
+    # ── No key pool: only downgrade available ──
+    if [ ! -f "$(_kp_config)" ]; then
+        action="downgrade"
+    fi
+
+    # ── Extract session_id from primary attempt for resumption ──
     local session_id=""
     if [ -f "$OUTPUT_DIR/${log_name}.jsonl" ]; then
         session_id=$(jq -r 'select(.session_id != null) | .session_id' \
             "$OUTPUT_DIR/${log_name}.jsonl" 2>/dev/null | head -1)
     fi
 
-    # 重试（glm-4.7）
-    local retries="${CLAUDE_RETRIES:-1}"
-    local attempt
-    for ((attempt=1; attempt<=retries; attempt++)); do
-        local retry_name="${log_name}-retry${attempt}"
-        if [ -n "$session_id" ]; then
-            echo "          ⚠️ 主模型失败，glm-4.7 续接会话重试 $attempt/$retries: $log_name" >&2
-            if _run_with_watchdog "继续" "$retry_name" --resume "$session_id" --model glm-4.7 \
-               && check_claude_result "$retry_name"; then
-                return 0
-            fi
-        else
-            echo "          ⚠️ 主模型失败，glm-4.7 重试 $attempt/$retries: $log_name" >&2
-            if _run_with_watchdog "$prompt" "$retry_name" "$@" --model glm-4.7 \
-               && check_claude_result "$retry_name"; then
-                return 0
-            fi
-        fi
-    done
+    # ── Execute retry plan from Python ──
+    local attempt=0
 
-    echo "          ⚠️ glm-4.7 重试全部失败 ($retries 次): $log_name" >&2
+    while IFS=' ' read -r model count; do
+        local model_flag=""
+        [ "$model" != "primary" ] && model_flag="--model $model"
+        [ "$model" = "glm-4.7" ] && echo "          ⚠️ 降级至 glm-4.7: $log_name" >&2
+
+        for ((i=0; i<count; i++)); do
+            key_pool_rotate
+            attempt=$((attempt + 1))
+            local name="${log_name}-r${attempt}"
+
+            if [ -n "$session_id" ]; then
+                echo "          ⚠️ 续接会话 $((i+1))/$count ($model): $log_name" >&2
+                _run_with_watchdog "继续" "$name" --resume "$session_id" $model_flag
+            else
+                echo "          ⚠️ 重试 $((i+1))/$count ($model): $log_name" >&2
+                _run_with_watchdog "$prompt" "$name" $model_flag
+            fi
+
+            if check_claude_result "$name"; then
+                [ "$model" != "glm-4.7" ] && key_pool_on_success
+                return 0
+            fi
+        done
+    done < <(python3 "$_runner_py" retry-plan --action "$action" --config "$(_kp_config)" --state "$(_kp_state)")
+
+    echo "          ⚠️ 所有模型和 key 均已耗尽: $log_name" >&2
     return 1
-}
-
-# Run a single Claude step with standard output routing
-# Usage: run_claude <prompt> <log_name> [extra_claude_args...]
-#
-# 环境变量:
-#   CLAUDE_MODEL    主模型（默认: glm-5-turbo）
-#   LANDLOCK_CONFIG Landlock 配置文件路径（可选，设置后自动包裹）
-#   LANDLOCK_RUNNER landlock_runner.py 路径（默认: utils/landlock-runner/landlock_runner.py）
-run_claude() {
-    local prompt="$1"
-    local log_name="$2"
-    shift 2
-    local prefix="$OUTPUT_DIR/$log_name"
-    local perm_flag
-    if [ "${SANDBOX:-}" = "1" ]; then
-        perm_flag="--dangerously-skip-permissions"
-    else
-        perm_flag="--permission-mode acceptEdits"
-    fi
-
-    local claude_cmd=(claude -p "$prompt" \
-        --output-format stream-json --verbose \
-        $perm_flag \
-        --model "${CLAUDE_MODEL:-glm-5-turbo}" \
-        "$@")
-
-    if [ -n "$LANDLOCK_CONFIG" ] && [ -f "$LANDLOCK_CONFIG" ]; then
-        local runner="${LANDLOCK_RUNNER:-utils/landlock-runner/landlock_runner.py}"
-        claude_cmd=(python3 "$runner" "$LANDLOCK_CONFIG" "${claude_cmd[@]}")
-    fi
-
-    "${claude_cmd[@]}" 2>"$prefix.err" | tee "$prefix.jsonl" | \
-        jq -r 'select(.type=="result") | .result'
 }
