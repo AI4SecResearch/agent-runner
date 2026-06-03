@@ -82,16 +82,18 @@ class KeyPool:
                 fcntl.flock(f, fcntl.LOCK_UN)
 
     def _init_state(self):
-        """Create state file if absent. Atomic create-or-skip."""
-        if os.path.exists(self.state_path):
-            return
-        try:
-            fd = os.open(self.state_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            return
-        with os.fdopen(fd, "w") as f:
-            json.dump({"current_index": 0, "disabled": {}, "success_count": 0}, f)
-        _dbg(f"init: created state file {self.state_path}")
+        """Ensure state file is initialized. LOCK_EX serializes concurrent inits."""
+        fd = os.open(self.state_path, os.O_CREAT | os.O_RDWR, 0o644)
+        with os.fdopen(fd, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                if f.read().strip():
+                    return
+                json.dump({"current_index": 0, "disabled": {}, "success_count": 0}, f)
+                f.truncate()
+                _dbg(f"init: created state file {self.state_path}")
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
     # ── Disabled key helpers ────────────────────────────────────────
 
