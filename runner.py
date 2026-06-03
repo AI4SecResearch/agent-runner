@@ -95,16 +95,27 @@ class KeyPool:
 
     # ── Disabled key helpers ────────────────────────────────────────
 
+    @staticmethod
+    def _parse_expiry(v):
+        """Parse expiry value (str or number) to epoch seconds."""
+        if isinstance(v, (int, float)):
+            return v
+        from datetime import datetime
+        return datetime.strptime(v, "%Y-%m-%d %H:%M").timestamp()
+
+    @staticmethod
+    def _format_expiry(epoch):
+        """Format epoch seconds to 'YYYY-MM-DD HH:MM'."""
+        from datetime import datetime
+        return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+
     def _active_disabled(self, data):
         """Return set of currently-disabled key indices (read-only filter)."""
         disabled_map = data.get("disabled", {})
         if not disabled_map:
             return set()
         now = time.time()
-        # Clock skew: expiry unreasonably far in the future
-        if any(v > now + DISABLE_TTL for v in disabled_map.values()):
-            return set()
-        return {int(k) for k, v in disabled_map.items() if v > now}
+        return {int(k) for k, v in disabled_map.items() if self._parse_expiry(v) > now}
 
     def _purge_expired(self, data):
         """Remove expired entries from disabled map. Modifies data in place."""
@@ -112,10 +123,7 @@ class KeyPool:
         if not disabled_map:
             return
         now = time.time()
-        if any(v > now + DISABLE_TTL for v in disabled_map.values()):
-            data["disabled"] = {}
-            return
-        expired = [k for k, v in disabled_map.items() if v <= now]
+        expired = [k for k, v in disabled_map.items() if self._parse_expiry(v) <= now]
         for k in expired:
             del disabled_map[k]
 
@@ -180,8 +188,8 @@ class KeyPool:
         def _disable(data):
             self._purge_expired(data)
             expiry = time.time() + DISABLE_TTL
-            data.setdefault("disabled", {})[str(idx)] = expiry
-            _dbg(f"disable: key[{idx}]={key_str[:8]}... until={expiry:.0f}")
+            data.setdefault("disabled", {})[str(idx)] = self._format_expiry(expiry)
+            _dbg(f"disable: key[{idx}]={key_str[:8]}... until={self._format_expiry(expiry)}")
             return key_str
 
         return self._modify_state(_disable)
