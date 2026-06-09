@@ -228,6 +228,7 @@ class KeyPool:
             while new_idx in disabled:
                 new_idx = (new_idx + 1) % len(keys)
             data["current_index"] = new_idx
+            _dbg(f"on_success: count={count}/{rotate_every}, rotating {cur}→{new_idx} key={keys[new_idx][:8]}...")
             return keys[new_idx]
 
         return self._modify_state(_on_success)
