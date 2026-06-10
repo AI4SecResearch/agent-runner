@@ -40,6 +40,7 @@ progress_iterations() {
         return 2
     fi
 
+    local i
     for ((i=completed+1; i<=max_iter; i++)); do
         "$callback" "$i" "$max_iter" "$@"
         if [ $? -ne 0 ]; then

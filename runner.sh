@@ -224,11 +224,13 @@ agent_with_retry() {
     # ── Execute retry plan from Python ──
     local attempt=0
 
+    local model count
     while IFS=' ' read -r model count; do
         local model_flag=""
         [ "$model" != "primary" ] && model_flag="--model $model"
         [ "$model" = "glm-4.7" ] && echo "          ⚠️ 降级至 glm-4.7: $log_name" >&2
 
+        local i
         for ((i=0; i<count; i++)); do
             key_pool_rotate
             attempt=$((attempt + 1))
