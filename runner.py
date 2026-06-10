@@ -102,14 +102,17 @@ class KeyPool:
         """Parse expiry value (str or number) to epoch seconds."""
         if isinstance(v, (int, float)):
             return v
-        from datetime import datetime
-        return datetime.strptime(v, "%Y-%m-%d %H:%M").timestamp()
+        from datetime import datetime, timezone, timedelta
+        return datetime.strptime(v, "%Y-%m-%d %H:%M").replace(
+            tzinfo=timezone(timedelta(hours=8))
+        ).timestamp()
 
     @staticmethod
     def _format_expiry(epoch):
-        """Format epoch seconds to 'YYYY-MM-DD HH:MM'."""
-        from datetime import datetime
-        return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+        """Format epoch seconds to 'YYYY-MM-DD HH:MM' (CST/UTC+8)."""
+        from datetime import datetime, timezone, timedelta
+        cst = timezone(timedelta(hours=8))
+        return datetime.fromtimestamp(epoch, tz=cst).strftime("%Y-%m-%d %H:%M")
 
     def _active_disabled(self, data):
         """Return set of currently-disabled key indices (read-only filter)."""
