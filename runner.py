@@ -75,8 +75,11 @@ class KeyPool:
                 data = json.load(f)
                 result = fn(data)
                 f.seek(0)
-                f.truncate()
                 json.dump(data, f)
+                # json.dump() 只填缓冲、不触发 write()：内容真正进内核要等 with
+                # 结束的 close()，而那已在 finally 解锁之后。故紧跟 truncate()——
+                # 它发 ftruncate 前会先 flush 写缓冲，把 write() 收进 flock 临界区内。
+                f.truncate()
                 return result
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
