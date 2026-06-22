@@ -13,7 +13,7 @@
 #   CODEX_SANDBOX        Codex sandbox mode (default: danger-full-access)
 #   CODEX_WEB_SEARCH     Codex web search mode: cached|live|disabled
 #   CODEX_NETWORK_ACCESS Set to true/1 to enable command network access in workspace-write
-#   CODEX_FORK_SESSION_ARG Codex resume fork flag (default: --fork-session; empty disables)
+#   CODEX_FORK_SESSION_ARG Codex resume fork flag, when supported by the CLI (empty disables)
 #   CLAUDE_STALL_TIMEOUT Seconds before killing a stalled process (default: 300)
 #   CLAUDE_TIMEOUT       Hard total timeout, 0 = unlimited (default: 0)
 #   KEY_POOL_CONFIG      Path to api-keys.json (default: api-keys.json)
@@ -212,11 +212,7 @@ agent_once_codex() {
             codex_cmd+=(--model "$CODEX_MODEL")
         fi
         local codex_fork_session_arg
-        if [ "${CODEX_FORK_SESSION_ARG+x}" = "x" ]; then
-            codex_fork_session_arg="$CODEX_FORK_SESSION_ARG"
-        else
-            codex_fork_session_arg="--fork-session"
-        fi
+        codex_fork_session_arg="${CODEX_FORK_SESSION_ARG:-}"
         if [ "$fork_session" = "1" ] && [ -n "$codex_fork_session_arg" ]; then
             codex_cmd+=("$codex_fork_session_arg")
         fi
