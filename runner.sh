@@ -8,12 +8,17 @@
 # Environment variables:
 #   SANDBOX              Set to "1" in container to skip permission prompts
 #   CLAUDE_MODEL         Primary model (default: glm-5-turbo)
+#   DOWNGRADE_MODEL      Fallback model for the "downgrade" retry tier (default: glm-4.7)
 #   CLAUDE_STALL_TIMEOUT Seconds before killing a stalled process (default: 300)
 #   CLAUDE_TIMEOUT       Hard total timeout, 0 = unlimited (default: 0)
 #   KEY_POOL_CONFIG      Path to api-keys.json (default: api-keys.json)
 
 _runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _runner_py="$_runner_dir/runner.py"
+
+# Fallback model for the "downgrade" retry tier emitted by runner.py's
+# retry-plan; resolved here so the concrete model id lives in one place.
+DOWNGRADE_MODEL="${DOWNGRADE_MODEL:-glm-4.7}"
 
 _kp_config() { echo "${KEY_POOL_CONFIG:-$_runner_dir/../../api-keys.json}"; }
 _kp_state()  { echo "${DATA_DIR}/key-pool-state.json"; }
@@ -227,8 +232,12 @@ agent_with_retry() {
     local model count
     while IFS=' ' read -r model count; do
         local model_flag=""
-        [ "$model" != "primary" ] && model_flag="--model $model"
-        [ "$model" = "glm-4.7" ] && echo "          ⚠️ 降级至 glm-4.7: $log_name" >&2
+        case "$model" in
+            primary)   ;;  # use the default CLAUDE_MODEL
+            downgrade) model_flag="--model $DOWNGRADE_MODEL"
+                       echo "          ⚠️ 降级至 $DOWNGRADE_MODEL: $log_name" >&2 ;;
+            *)         model_flag="--model $model" ;;
+        esac
 
         local i
         for ((i=0; i<count; i++)); do
@@ -245,7 +254,7 @@ agent_with_retry() {
             fi
 
             case $? in
-                0) [ "$model" != "glm-4.7" ] && key_pool_on_success; return 0;;
+                0) [ "$model" != "downgrade" ] && key_pool_on_success; return 0;;
                 2) return 1;;
             esac
         done

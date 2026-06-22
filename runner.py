@@ -343,9 +343,9 @@ def retry_plan(action, config_path, state_path):
     if action == "rotate_key":
         return [("primary", pool_size)]
     elif action == "downgrade":
-        return [("glm-4.7", pool_size)]
+        return [("downgrade", pool_size)]
     else:  # rotate_then_downgrade
-        return [("primary", pool_size), ("glm-4.7", pool_size)]
+        return [("primary", pool_size), ("downgrade", pool_size)]
 
 
 def main():
