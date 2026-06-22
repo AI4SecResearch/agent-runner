@@ -65,13 +65,13 @@ key_pool_available_size() {
 # 用法: check_agent_result <log_name>
 # 返回 0=成功  1=失败
 check_agent_result() {
-    agent_backend_result_ok "$1"
+    agent_backend_result_ok "$OUTPUT_DIR/$1"
 }
 
 # 用法: classify_agent_error <log_name>
 # 输出 "<action>:<disable_flag>"
 classify_agent_error() {
-    local text=$(agent_backend_result_text "$1")
+    local text=$(agent_backend_result_text "$OUTPUT_DIR/$1")
     printf '%s' "$text" | python3 "$_runner_py" classify --text - \
         --config "$(_kp_config)" --state "$(_kp_state)"
 }
@@ -123,7 +123,7 @@ _agent_once_with_watchdog() {
         elapsed=$((now - start_time))
 
         # agent 已完成输出 → 立即退出（由后端判断其原生日志是否出现结果）
-        if agent_backend_is_complete "$log_name"; then
+        if agent_backend_is_complete "$OUTPUT_DIR/$log_name"; then
             break
         fi
 
@@ -235,7 +235,7 @@ agent_with_retry() {
     fi
 
     # ── Extract session_id from primary attempt for resumption ──
-    local session_id=$(agent_backend_session_id "$log_name")
+    local session_id=$(agent_backend_session_id "$OUTPUT_DIR/$log_name")
 
     # ── Execute retry plan from Python ──
     local attempt=0

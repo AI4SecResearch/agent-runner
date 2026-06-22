@@ -36,33 +36,33 @@ agent_backend_invoke() {
 }
 
 # Has the agent emitted its final result line? (watchdog early-exit)
-# Usage: agent_backend_is_complete <log_name>
+# Usage: agent_backend_is_complete <prefix>
 agent_backend_is_complete() {
-    local jsonl="$OUTPUT_DIR/${1}.jsonl"
+    local jsonl="${1}.jsonl"
     [ -f "$jsonl" ] && grep -q '"type":"result"' "$jsonl"
 }
 
 # Did the run succeed? Returns 0 if a non-error result line is present.
-# Usage: agent_backend_result_ok <log_name>
+# Usage: agent_backend_result_ok <prefix>
 agent_backend_result_ok() {
-    local jsonl="$OUTPUT_DIR/${1}.jsonl"
+    local jsonl="${1}.jsonl"
     [ -s "$jsonl" ] || return 1
     jq -se 'any(.[]; .type == "result" and ((.is_error // false) | not))' \
         "$jsonl" >/dev/null 2>&1
 }
 
 # The result text (used by error classification).
-# Usage: agent_backend_result_text <log_name>
+# Usage: agent_backend_result_text <prefix>
 agent_backend_result_text() {
-    local jsonl="$OUTPUT_DIR/${1}.jsonl"
+    local jsonl="${1}.jsonl"
     [ -f "$jsonl" ] || return 0
     jq -r 'select(.type=="result") | .result' "$jsonl" 2>/dev/null | head -1
 }
 
 # The session id the agent recorded (empty = none / unsupported).
-# Usage: agent_backend_session_id <log_name>
+# Usage: agent_backend_session_id <prefix>
 agent_backend_session_id() {
-    local jsonl="$OUTPUT_DIR/${1}.jsonl"
+    local jsonl="${1}.jsonl"
     [ -f "$jsonl" ] || return 0
     jq -r 'select(.session_id != null) | .session_id' "$jsonl" 2>/dev/null | head -1
 }
@@ -77,13 +77,13 @@ agent_backend_perm_args() {
     fi
 }
 
-# Model flag fragment. <tier> is a logical token from the retry plan or "primary".
-# Usage: agent_backend_model_args <primary|downgrade|explicit:<id>>
+# Model flag fragment. <tier> is a logical token from the retry plan, or a model id.
+# Usage: agent_backend_model_args <primary|downgrade|<model_id>>
 agent_backend_model_args() {
     case "$1" in
+        primary)    echo "--model ${CLAUDE_MODEL}" ;;
         downgrade)  echo "--model ${DOWNGRADE_MODEL}" ;;
-        explicit:*) echo "--model ${1#explicit:}" ;;
-        *)          echo "--model ${CLAUDE_MODEL}" ;;
+        *)          echo "--model $1" ;;
     esac
 }
 
