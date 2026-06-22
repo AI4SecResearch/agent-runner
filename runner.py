@@ -325,12 +325,15 @@ def classify_error(jsonl_path, config_path, state_path):
     return f"{action}:{disable_flag}"
 
 
-def retry_plan(action, config_path, state_path):
+def retry_plan(action, config_path, state_path, fallback_model="glm-4.7"):
     """Generate retry plan using current available key count from state.
 
     Falls back to single-key downgrade when config is absent.
     Returns empty list when all keys are disabled.
     """
+    if not fallback_model:
+        fallback_model = "glm-4.7"
+
     if os.path.exists(config_path):
         pool = KeyPool(config_path, state_path)
         pool_size = pool.available_size()
@@ -339,13 +342,15 @@ def retry_plan(action, config_path, state_path):
             return []
     else:
         pool_size = 1
+
+    fallback = fallback_model.strip()
     _dbg(f"retry_plan: action={action} pool_size={pool_size}")
     if action == "rotate_key":
         return [("primary", pool_size)]
     elif action == "downgrade":
-        return [("glm-4.7", pool_size)]
+        return [(fallback, pool_size)]
     else:  # rotate_then_downgrade
-        return [("primary", pool_size), ("glm-4.7", pool_size)]
+        return [("primary", pool_size), (fallback, pool_size)]
 
 
 def main():
@@ -398,6 +403,7 @@ def main():
     p.add_argument("--action", required=True)
     p.add_argument("--config", required=True)
     p.add_argument("--state", required=True)
+    p.add_argument("--fallback-model", default="glm-4.7")
 
     args = parser.parse_args()
 
@@ -454,7 +460,12 @@ def main():
         print(action)
 
     elif args.command == "retry-plan":
-        for model, count in retry_plan(args.action, args.config, args.state):
+        for model, count in retry_plan(
+            args.action,
+            args.config,
+            args.state,
+            args.fallback_model,
+        ):
             print(f"{model} {count}")
 
 
