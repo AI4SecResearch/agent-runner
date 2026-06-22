@@ -240,53 +240,20 @@ class KeyPool:
         return self._modify_state(_on_success)
 
 
-def check_result(jsonl_path):
-    """Check if a JSONL log indicates success. Returns True/False."""
-    if not os.path.exists(jsonl_path) or os.path.getsize(jsonl_path) == 0:
-        return False
-
-    with open(jsonl_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if entry.get("type") == "result":
-                return not entry.get("is_error", False)
-
-    return False
-
-
-def classify_error(jsonl_path, config_path, state_path):
-    """Classify error from JSONL and look up action + disable flag from provider config.
+def classify_error(result_text, config_path, state_path):
+    """Classify an error from the agent's result text and look up action + disable
+    flag from the provider config.
 
     Returns "action:disable_flag" where disable_flag is "true" or "false".
     Action is one of: "rotate_key", "downgrade", "rotate_then_downgrade".
     """
     default_action = "rotate_then_downgrade"
 
-    if not os.path.exists(jsonl_path):
-        return f"{default_action}:false"
-
     error_code = None
-    with open(jsonl_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if entry.get("type") == "result" and entry.get("is_error"):
-                result_text = entry.get("result", "")[:500]
-                match = re.search(r"\[(\d{4})\]", result_text)
-                if match:
-                    error_code = match.group(1)
-                break
+    if result_text:
+        match = re.search(r"\[(\d{4})\]", result_text[:500])
+        if match:
+            error_code = match.group(1)
 
     if error_code is None:
         return f"{default_action}:false"
@@ -383,13 +350,9 @@ def main():
     p.add_argument("--config", required=True)
     p.add_argument("--state", required=True)
 
-    # check-result
-    p = sub.add_parser("check-result")
-    p.add_argument("jsonl")
-
-    # classify
+    # classify (reads result text from --text; "-" means stdin)
     p = sub.add_parser("classify")
-    p.add_argument("jsonl")
+    p.add_argument("--text", required=True)
     p.add_argument("--config", required=True)
     p.add_argument("--state", required=True)
 
@@ -446,11 +409,9 @@ def main():
         pool = KeyPool(args.config, args.state)
         print(pool.available_size())
 
-    elif args.command == "check-result":
-        sys.exit(0 if check_result(args.jsonl) else 1)
-
     elif args.command == "classify":
-        action = classify_error(args.jsonl, args.config, args.state)
+        text = sys.stdin.read() if args.text == "-" else args.text
+        action = classify_error(text, args.config, args.state)
         print(action)
 
     elif args.command == "retry-plan":

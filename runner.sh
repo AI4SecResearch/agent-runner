@@ -1,27 +1,39 @@
 #!/bin/bash
 
-# Agent invocation with reliability features.
-# Provides: agent_once, _agent_once_with_watchdog, agent_with_retry
+# Agent invocation with reliability features (agent-agnostic).
+# Provides: agent_once, _agent_once_with_watchdog, agent_with_retry, agent_once_session_resume
+#
+# All agent-specific behavior (binary, flags, output format, log parsing) lives in
+# a backend implementing the 9-op interface (see backends/<name>.sh). The active
+# backend is selected by $AGENT_BACKEND (default: claude-code) and sourced from
+# common.sh. This file contains only generic orchestration.
 #
 # Prerequisites: $OUTPUT_DIR must be set by the caller (e.g. via setup_output_dir).
 #
 # Environment variables:
+#   AGENT_BACKEND        Backend name (default: claude-code); sources backends/<name>.sh
 #   SANDBOX              Set to "1" in container to skip permission prompts
-#   CLAUDE_MODEL         Primary model (default: glm-5-turbo)
-#   DOWNGRADE_MODEL      Fallback model for the "downgrade" retry tier (default: glm-4.7)
 #   CLAUDE_STALL_TIMEOUT Seconds before killing a stalled process (default: 300)
 #   CLAUDE_TIMEOUT       Hard total timeout, 0 = unlimited (default: 0)
 #   KEY_POOL_CONFIG      Path to api-keys.json (default: api-keys.json)
+#   LANDLOCK_CONFIG      Optional landlock config; wraps each agent command
+#   LANDLOCK_RUNNER      landlock_runner.py path (default: utils/landlock-runner/landlock_runner.py)
 
 _runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _runner_py="$_runner_dir/runner.py"
 
-# Fallback model for the "downgrade" retry tier emitted by runner.py's
-# retry-plan; resolved here so the concrete model id lives in one place.
-DOWNGRADE_MODEL="${DOWNGRADE_MODEL:-glm-4.7}"
-
 _kp_config() { echo "${KEY_POOL_CONFIG:-$_runner_dir/../../api-keys.json}"; }
 _kp_state()  { echo "${DATA_DIR}/key-pool-state.json"; }
+
+# Run a command under landlock if LANDLOCK_CONFIG is set, else run it directly.
+# Used by backends inside agent_backend_invoke so landlock stays generic.
+_landlock_wrap() {
+    if [ -n "$LANDLOCK_CONFIG" ] && [ -f "$LANDLOCK_CONFIG" ]; then
+        python3 "${LANDLOCK_RUNNER:-utils/landlock-runner/landlock_runner.py}" "$LANDLOCK_CONFIG" "$@"
+    else
+        "$@"
+    fi
+}
 
 # ── Key pool (delegates to runner.py) ──────────────────────────────
 
@@ -48,53 +60,41 @@ key_pool_available_size() {
     python3 "$_runner_py" available-size --config "$(_kp_config)" --state "$(_kp_state)"
 }
 
-# ── Result check & error classification (delegates to runner.py) ──
+# ── Result check & error classification ───────────────────────────
 
 # 用法: check_agent_result <log_name>
 # 返回 0=成功  1=失败
 check_agent_result() {
-    python3 "$_runner_py" check-result "$OUTPUT_DIR/${1}.jsonl"
+    agent_backend_result_ok "$1"
 }
 
+# 用法: classify_agent_error <log_name>
+# 输出 "<action>:<disable_flag>"
 classify_agent_error() {
-    python3 "$_runner_py" classify "$OUTPUT_DIR/${1}.jsonl" \
+    local text=$(agent_backend_result_text "$1")
+    printf '%s' "$text" | python3 "$_runner_py" classify --text - \
         --config "$(_kp_config)" --state "$(_kp_state)"
 }
 
-# ── Process execution (pure bash) ─────────────────────────────────
+# ── Process execution (pure bash, generic) ────────────────────────
 
-# Run a single agent step with standard output routing
+# Run a single agent step with standard output routing.
 # Usage: agent_once <prompt> <log_name> [extra_args...]
-#
-# 环境变量:
-#   CLAUDE_MODEL    主模型（默认: glm-5-turbo）
-#   LANDLOCK_CONFIG Landlock 配置文件路径（可选，设置后自动包裹）
-#   LANDLOCK_RUNNER landlock_runner.py 路径（默认: utils/landlock-runner/landlock_runner.py）
+# Extra args are passed through to the agent; a caller-supplied --model takes
+# precedence over the primary model (exactly one --model is emitted).
 agent_once() {
     local prompt="$1"
     local log_name="$2"
     shift 2
     local prefix="$OUTPUT_DIR/$log_name"
-    local perm_flag
-    if [ "${SANDBOX:-}" = "1" ]; then
-        perm_flag="--dangerously-skip-permissions"
-    else
-        perm_flag="--permission-mode acceptEdits"
-    fi
 
-    local agent_cmd=(claude -p "$prompt" \
-        --output-format stream-json --verbose \
-        $perm_flag \
-        --model "${CLAUDE_MODEL:-glm-5-turbo}" \
-        "$@")
+    local -a argv=( $(agent_backend_perm_args) )
+    local a has_model=0
+    for a in "$@"; do [ "$a" = "--model" ] && has_model=1; done
+    [ "$has_model" -eq 0 ] && argv+=( $(agent_backend_model_args primary) )
+    argv+=( "$@" )
 
-    if [ -n "$LANDLOCK_CONFIG" ] && [ -f "$LANDLOCK_CONFIG" ]; then
-        local runner="${LANDLOCK_RUNNER:-utils/landlock-runner/landlock_runner.py}"
-        agent_cmd=(python3 "$runner" "$LANDLOCK_CONFIG" "${agent_cmd[@]}")
-    fi
-
-    "${agent_cmd[@]}" 2>"$prefix.err" | tee "$prefix.jsonl" | \
-        jq -r 'select(.type=="result") | .result'
+    agent_backend_invoke "$prompt" "$prefix" "${argv[@]}"
 }
 
 # 后台执行 agent_once 并监控 jsonl 增长，超时则 kill
@@ -122,8 +122,8 @@ _agent_once_with_watchdog() {
         now=$(date +%s)
         elapsed=$((now - start_time))
 
-        # result 行出现 → claude 已完成输出，立即退出
-        if grep -q '"type":"result"' "$jsonl_file" 2>/dev/null; then
+        # agent 已完成输出 → 立即退出（由后端判断其原生日志是否出现结果）
+        if agent_backend_is_complete "$log_name"; then
             break
         fi
 
@@ -151,7 +151,7 @@ _agent_once_with_watchdog() {
     done
 
     if [ "$timed_out" -eq 1 ]; then
-        # 先杀子进程（pipeline 中的 claude/tee/jq），再杀父 shell
+        # 先杀子进程（pipeline 中的 agent/tee/jq），再杀父 shell
         # 反过来会导致子 shell 先死，子进程被 init 收养，pkill -P 找不到
         pkill -P "$job_pid" 2>/dev/null
         kill "$job_pid" 2>/dev/null
@@ -190,6 +190,21 @@ agent_once_with_disable() {
     return 1
 }
 
+# 恢复会话执行；若后端不支持恢复（agent_backend_resume_args 为空），则退化为全新会话。
+# 用法: agent_once_session_resume <prompt> <log_name> <session_id> [extra_args...]
+agent_once_session_resume() {
+    local prompt="$1"
+    local log_name="$2"
+    local sid="$3"
+    shift 3
+    local resume_args=$(agent_backend_resume_args "$sid")
+    if [ -n "$resume_args" ]; then
+        agent_once_with_disable "$prompt" "$log_name" $resume_args "$@"
+    else
+        agent_once_with_disable "$prompt" "$log_name" "$@"
+    fi
+}
+
 # ── Retry orchestration (bash loop, Python-driven plan) ───────────
 
 # 用法: agent_with_retry <prompt> <log_name> [extra_args...]
@@ -220,24 +235,14 @@ agent_with_retry() {
     fi
 
     # ── Extract session_id from primary attempt for resumption ──
-    local session_id=""
-    if [ -f "$OUTPUT_DIR/${log_name}.jsonl" ]; then
-        session_id=$(jq -r 'select(.session_id != null) | .session_id' \
-            "$OUTPUT_DIR/${log_name}.jsonl" 2>/dev/null | head -1)
-    fi
+    local session_id=$(agent_backend_session_id "$log_name")
 
     # ── Execute retry plan from Python ──
     local attempt=0
 
     local model count
     while IFS=' ' read -r model count; do
-        local model_flag=""
-        case "$model" in
-            primary)   ;;  # use the default CLAUDE_MODEL
-            downgrade) model_flag="--model $DOWNGRADE_MODEL"
-                       echo "          ⚠️ 降级至 $DOWNGRADE_MODEL: $log_name" >&2 ;;
-            *)         model_flag="--model $model" ;;
-        esac
+        local model_args=$(agent_backend_model_args "$model")
 
         local i
         for ((i=0; i<count; i++)); do
@@ -247,10 +252,10 @@ agent_with_retry() {
 
             if [ -n "$session_id" ]; then
                 echo "          ⚠️ 续接会话 $((i+1))/$count ($model): $log_name" >&2
-                agent_once_with_disable "继续" "$name" --resume "$session_id" $model_flag
+                agent_once_session_resume "继续" "$name" "$session_id" $model_args
             else
                 echo "          ⚠️ 重试 $((i+1))/$count ($model): $log_name" >&2
-                agent_once_with_disable "$prompt" "$name" $model_flag
+                agent_once_with_disable "$prompt" "$name" $model_args
             fi
 
             case $? in
