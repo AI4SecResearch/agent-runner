@@ -23,7 +23,6 @@ import argparse
 import fcntl
 import json
 import os
-import re
 import sys
 import time
 
@@ -265,44 +264,22 @@ class KeyPool:
         return self._modify_state(_on_success)
 
 
-def classify_error(result_text, config_path, state_path):
-    """Classify an error from the agent's result text and look up action + disable
-    flag from the provider config.
+def classify_error(payload_text, config_path, state_path):
+    """Classify an error from the agent's payload via the active provider module.
 
-    Returns "action:disable_flag" where disable_flag is "true" or "false".
-    Action is one of: "rotate_key", "downgrade", "rotate_then_downgrade".
-
-    The error code is matched as [NNN] or [NNNN] — 3 digits covers HTTP status
-    codes emitted by the opencode backend, 4 digits covers upstream codes such
-    as zhipu's [1305].
+    The provider is the active key's provider (KeyPool); interpretation is
+    delegated to the providers package. Returns "action:disable".
     """
-    default_action = "rotate_then_downgrade"
-
-    error_code = None
-    if result_text:
-        match = re.search(r"\[(\d{3,4})\]", result_text[:500])
-        if match:
-            error_code = match.group(1)
-
-    if error_code is None:
-        return f"{default_action}:false"
-
-    if not os.path.exists(config_path):
-        return f"{default_action}:false"
-
-    pool = KeyPool(config_path, state_path)
-    provider = pool._provider_for_current()
-    if provider is None:
-        return f"{default_action}:false"
-
-    handling = pool.config["providers"][provider].get("error_handling", {})
-    action = handling.get(error_code, handling.get("_default", default_action))
-
-    # Auto-disable key when action involves rotation (quota exhaustion)
-    disable_flag = "true" if "rotate" in action else "false"
-    _dbg(f"classify: error_code={error_code} provider={provider} action={action} disable={disable_flag}")
-
-    return f"{action}:{disable_flag}"
+    provider = None
+    handling = {}
+    if os.path.exists(config_path):
+        pool = KeyPool(config_path, state_path)
+        provider = pool._provider_for_current()
+        handling = (
+            pool.config.get("providers", {}).get(provider or "", {}).get("error_handling", {})
+        )
+    from providers import classify as provider_classify
+    return provider_classify(provider, payload_text, handling)
 
 
 def retry_plan(action, config_path, state_path):

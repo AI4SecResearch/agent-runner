@@ -51,12 +51,13 @@ agent_backend_result_ok() {
         "$jsonl" >/dev/null 2>&1
 }
 
-# The result text (used by error classification).
+# The error payload (JSON) fed to the provider layer. claude-code renders the
+# provider error inline in its result text, so surface it as {message}.
 # Usage: agent_backend_result_text <prefix>
 agent_backend_result_text() {
     local jsonl="${1}.jsonl"
     [ -f "$jsonl" ] || return 0
-    jq -r 'select(.type=="result") | .result' "$jsonl" 2>/dev/null | head -1
+    jq -c 'select(.type=="result") | {message: .result}' "$jsonl" 2>/dev/null | head -1
 }
 
 # The session id the agent recorded (empty = none / unsupported).

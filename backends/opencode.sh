@@ -59,20 +59,18 @@ agent_backend_result_ok() {
         "$jsonl" >/dev/null 2>&1
 }
 
-# The error text fed to classify_error (runner.py). Emit both the upstream
-# code from responseBody (zhipu returns "1000" etc.) and the HTTP statusCode
-# (bailian returns a non-numeric code, so HTTP status is the only numeric
-# signal). classify_error's regex matches the first [NNN] or [NNNN], so
-# upstream code takes precedence when both are numeric; users can map either
-# namespace in error_handling.
+# The error payload (JSON) fed to the provider layer (providers.classify).
+# Surface the upstream code from responseBody and the HTTP statusCode as
+# structured fields; the provider module picks/maps them.
 # Usage: agent_backend_result_text <prefix>
 agent_backend_result_text() {
     local jsonl="${1}.jsonl"
     [ -f "$jsonl" ] || return 0
-    jq -r 'select(.type == "error") |
-        (try (.error.data.responseBody | fromjson | .error.code) catch null) as $upstream |
-        "\(.error.data.message) [\($upstream // "")] [\(.error.data.statusCode)]"' \
-        "$jsonl" 2>/dev/null | head -1
+    jq -c 'select(.type == "error") | {
+        message: .error.data.message,
+        code: (try (.error.data.responseBody | fromjson | .error.code) catch null),
+        status: .error.data.statusCode
+    }' "$jsonl" 2>/dev/null | head -1
 }
 
 # The session id the agent recorded (empty = none / unsupported).
