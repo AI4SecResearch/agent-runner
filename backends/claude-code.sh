@@ -1,10 +1,10 @@
 #!/bin/bash
 # Claude Code backend for the agent-runner.
 #
-# Implements the 9-op backend interface consumed by runner.sh:
+# Implements the 10-op backend interface consumed by runner.sh:
 #   agent_backend_invoke / agent_backend_is_complete / agent_backend_result_ok / agent_backend_result_text /
 #   agent_backend_session_id / agent_backend_perm_args / agent_backend_model_args / agent_backend_resume_args /
-#   agent_backend_fork_args
+#   agent_backend_fork_args / agent_backend_auth_env_var
 #
 # This backend owns everything Claude-Code-specific: the `claude` binary, the
 # prompt flag, the stream-json output format, how the jsonl log is parsed, and the
@@ -98,4 +98,11 @@ agent_backend_resume_args() {
 # Usage: agent_backend_fork_args
 agent_backend_fork_args() {
     echo "--fork-session"
+}
+
+# The env var this agent reads for its API key (the key pool exports the current
+# key here). claude-code always reads ANTHROPIC_AUTH_TOKEN.
+# Usage: agent_backend_auth_env_var
+agent_backend_auth_env_var() {
+    echo "ANTHROPIC_AUTH_TOKEN"
 }

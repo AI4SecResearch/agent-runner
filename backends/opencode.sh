@@ -1,10 +1,10 @@
 #!/bin/bash
 # OpenCode backend for the agent-runner.
 #
-# Implements the 9-op backend interface consumed by runner.sh:
+# Implements the 10-op backend interface consumed by runner.sh:
 #   agent_backend_invoke / agent_backend_is_complete / agent_backend_result_ok / agent_backend_result_text /
 #   agent_backend_session_id / agent_backend_perm_args / agent_backend_model_args / agent_backend_resume_args /
-#   agent_backend_fork_args
+#   agent_backend_fork_args / agent_backend_auth_env_var
 #
 # This backend owns everything OpenCode-specific: the `opencode` binary, the
 # `run` subcommand, the positional prompt, the --format json output, how the
@@ -16,10 +16,10 @@
 #   OPENCODE_MODEL           Primary model id, provider-prefixed (default: bailian/glm-5.2)
 #   OPENCODE_DOWNGRADE_MODEL Downgrade-tier model id (default: bailian/glm-5.1)
 #
-# Auth: OpenCode reads provider-specific env vars configured in
-# ~/.config/opencode/opencode.json (e.g., {env:Z_AI_API_KEY}). The key pool in
-# runner.sh exports the current key to the provider's env_var (declared in
-# api-keys.json) before each invocation.
+# Auth: OpenCode reads the API key from the env var configured in
+# ~/.config/opencode/opencode.json (default Z_AI_API_KEY). The key pool in
+# runner.sh exports the current key to this agent's auth env var
+# (agent_backend_auth_env_var) before each invocation.
 
 # Defaults live in the backend so generic code stays agent-agnostic. Sourced via
 # common.sh, so these are in scope wherever agent_with_retry is (incl. xargs
@@ -113,4 +113,12 @@ agent_backend_resume_args() {
 # Usage: agent_backend_fork_args
 agent_backend_fork_args() {
     echo "--fork"
+}
+
+# The env var this agent reads for its API key. OpenCode reads whatever its
+# opencode.json is configured with (default Z_AI_API_KEY); override via
+# OPENCODE_AUTH_ENV_VAR if your config differs.
+# Usage: agent_backend_auth_env_var
+agent_backend_auth_env_var() {
+    echo "${OPENCODE_AUTH_ENV_VAR:-Z_AI_API_KEY}"
 }

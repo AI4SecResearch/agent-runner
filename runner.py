@@ -14,7 +14,6 @@ Subcommands (called by runner.sh):
     available-size  Non-disabled key count
     disable         Disable a key by value with TTL
     on-success      Increment success counter, rotate at threshold
-    current-env-var Return env_var name for the current key's provider
     classify        Extract error code → lookup action + auto-disable flag
     retry-plan      Generate (model, count) retry rounds from available keys
 """
@@ -66,19 +65,6 @@ class KeyPool:
             return None
         idx = self._read_state().get("current_index", 0) % len(pairs)
         return pairs[idx][1]
-
-    def current_env_var(self):
-        """Return the env_var declared on the current key's provider.
-
-        Falls back to ANTHROPIC_AUTH_TOKEN when the field is absent or the
-        state file doesn't exist (so the default backend keeps working).
-        """
-        provider = self._provider_for_current()
-        if provider is None:
-            return "ANTHROPIC_AUTH_TOKEN"
-        return self.config["providers"][provider].get(
-            "env_var", "ANTHROPIC_AUTH_TOKEN"
-        )
 
     # ── State file access (LOCK_SH / LOCK_EX) ──────────────────────
 
@@ -340,11 +326,6 @@ def main():
     p.add_argument("--config", required=True)
     p.add_argument("--state", required=True)
 
-    # current-env-var
-    p = sub.add_parser("current-env-var")
-    p.add_argument("--config", required=True)
-    p.add_argument("--state", required=True)
-
     # classify (reads result text from --text; "-" means stdin)
     p = sub.add_parser("classify")
     p.add_argument("--text", required=True)
@@ -403,11 +384,6 @@ def main():
             sys.exit(0)
         pool = KeyPool(args.config, args.state)
         print(pool.available_size())
-
-    elif args.command == "current-env-var":
-        # Resolve even without state file (returns the default env var).
-        pool = KeyPool(args.config, args.state)
-        print(pool.current_env_var())
 
     elif args.command == "classify":
         text = sys.stdin.read() if args.text == "-" else args.text

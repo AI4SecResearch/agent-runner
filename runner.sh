@@ -4,7 +4,7 @@
 # Provides: agent_once, _agent_once_with_watchdog, agent_with_retry, agent_once_session_resume
 #
 # All agent-specific behavior (binary, flags, output format, log parsing) lives in
-# a backend implementing the 9-op interface (see backends/<name>.sh). The active
+# a backend implementing the 10-op interface (see backends/<name>.sh). The active
 # backend is selected by $AGENT_BACKEND (default: claude-code) and sourced from
 # common.sh. This file contains only generic orchestration.
 #
@@ -42,13 +42,13 @@ _landlock_wrap() {
 # it into the next agent invocation.
 _kp_current_env_var=""
 
-# Export the current key under the provider-declared env var. Reads the env-var
-# name from runner.py's current-env-var; clears any previously-set one first.
+# Export the current key under the active agent's auth env var (each backend
+# declares the variable it reads for its API key). Clears any previously-set
+# one first so a changed env var doesn't leak the old value into the next run.
 _kp_export_key() {
     local key="$1"
     [ -n "$key" ] || return 0
-    local env_var=$(python3 "$_runner_py" current-env-var \
-        --config "$(_kp_config)" --state "$(_kp_state)")
+    local env_var=$(agent_backend_auth_env_var)
     [ -n "$env_var" ] || env_var="ANTHROPIC_AUTH_TOKEN"
     if [ -n "$_kp_current_env_var" ] && [ "$_kp_current_env_var" != "$env_var" ]; then
         unset "$_kp_current_env_var"
