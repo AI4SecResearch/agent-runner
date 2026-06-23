@@ -14,7 +14,7 @@ Subcommands (called by runner.sh):
     available-size  Non-disabled key count
     disable         Disable a key by value with TTL
     on-success      Increment success counter, rotate at threshold
-    check-result    Check JSONL for success/failure
+    current-env-var Return env_var name for the current key's provider
     classify        Extract error code → lookup action + auto-disable flag
     retry-plan      Generate (model, count) retry rounds from available keys
 """
@@ -49,12 +49,37 @@ class KeyPool:
                 self._config = json.load(f)
         return self._config
 
+    def _all_key_provider_pairs(self):
+        """Flatten all provider keys into a list of (key, provider_name) pairs."""
+        pairs = []
+        for pname, provider_cfg in self.config.get("providers", {}).items():
+            pairs.extend((k, pname) for k in provider_cfg.get("keys", []))
+        return pairs
+
     def _all_keys(self):
         """Flatten all provider keys into a single list."""
-        keys = []
-        for provider_cfg in self.config.get("providers", {}).values():
-            keys.extend(provider_cfg.get("keys", []))
-        return keys
+        return [k for k, _ in self._all_key_provider_pairs()]
+
+    def _provider_for_current(self):
+        """Return the provider name for the current key index, or None."""
+        pairs = self._all_key_provider_pairs()
+        if not pairs or not os.path.exists(self.state_path):
+            return None
+        idx = self._read_state().get("current_index", 0) % len(pairs)
+        return pairs[idx][1]
+
+    def current_env_var(self):
+        """Return the env_var declared on the current key's provider.
+
+        Falls back to ANTHROPIC_AUTH_TOKEN when the field is absent or the
+        state file doesn't exist (so the default backend keeps working).
+        """
+        provider = self._provider_for_current()
+        if provider is None:
+            return "ANTHROPIC_AUTH_TOKEN"
+        return self.config["providers"][provider].get(
+            "env_var", "ANTHROPIC_AUTH_TOKEN"
+        )
 
     # ── State file access (LOCK_SH / LOCK_EX) ──────────────────────
 
@@ -246,12 +271,16 @@ def classify_error(result_text, config_path, state_path):
 
     Returns "action:disable_flag" where disable_flag is "true" or "false".
     Action is one of: "rotate_key", "downgrade", "rotate_then_downgrade".
+
+    The error code is matched as [NNN] or [NNNN] — 3 digits covers HTTP status
+    codes emitted by the opencode backend, 4 digits covers upstream codes such
+    as zhipu's [1305].
     """
     default_action = "rotate_then_downgrade"
 
     error_code = None
     if result_text:
-        match = re.search(r"\[(\d{4})\]", result_text[:500])
+        match = re.search(r"\[(\d{3,4})\]", result_text[:500])
         if match:
             error_code = match.group(1)
 
@@ -261,28 +290,12 @@ def classify_error(result_text, config_path, state_path):
     if not os.path.exists(config_path):
         return f"{default_action}:false"
 
-    with open(config_path) as f:
-        config = json.load(f)
-
-    provider = None
-    all_keys_flat = []
-    for pname, pcfg in config.get("providers", {}).items():
-        all_keys_flat.extend([(k, pname) for k in pcfg.get("keys", [])])
-
-    if os.path.exists(state_path):
-        with open(state_path) as sf:
-            fcntl.flock(sf, fcntl.LOCK_SH)
-            try:
-                idx = json.load(sf).get("current_index", 0)
-            finally:
-                fcntl.flock(sf, fcntl.LOCK_UN)
-        if idx < len(all_keys_flat):
-            current_key, provider = all_keys_flat[idx]
-
+    pool = KeyPool(config_path, state_path)
+    provider = pool._provider_for_current()
     if provider is None:
         return f"{default_action}:false"
 
-    handling = config["providers"][provider].get("error_handling", {})
+    handling = pool.config["providers"][provider].get("error_handling", {})
     action = handling.get(error_code, handling.get("_default", default_action))
 
     # Auto-disable key when action involves rotation (quota exhaustion)
@@ -350,6 +363,11 @@ def main():
     p.add_argument("--config", required=True)
     p.add_argument("--state", required=True)
 
+    # current-env-var
+    p = sub.add_parser("current-env-var")
+    p.add_argument("--config", required=True)
+    p.add_argument("--state", required=True)
+
     # classify (reads result text from --text; "-" means stdin)
     p = sub.add_parser("classify")
     p.add_argument("--text", required=True)
@@ -408,6 +426,11 @@ def main():
             sys.exit(0)
         pool = KeyPool(args.config, args.state)
         print(pool.available_size())
+
+    elif args.command == "current-env-var":
+        # Resolve even without state file (returns the default env var).
+        pool = KeyPool(args.config, args.state)
+        print(pool.current_env_var())
 
     elif args.command == "classify":
         text = sys.stdin.read() if args.text == "-" else args.text

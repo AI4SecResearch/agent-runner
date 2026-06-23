@@ -37,23 +37,45 @@ _landlock_wrap() {
 
 # ── Key pool (delegates to runner.py) ──────────────────────────────
 
+# Tracks the env var the last key was exported to, so cross-provider rotation
+# (which changes the env var name) unsets the previous one rather than leaking
+# it into the next agent invocation.
+_kp_current_env_var=""
+
+# Export the current key under the provider-declared env var. Reads the env-var
+# name from runner.py's current-env-var; clears any previously-set one first.
+_kp_export_key() {
+    local key="$1"
+    [ -n "$key" ] || return 0
+    local env_var=$(python3 "$_runner_py" current-env-var \
+        --config "$(_kp_config)" --state "$(_kp_state)")
+    [ -n "$env_var" ] || env_var="ANTHROPIC_AUTH_TOKEN"
+    if [ -n "$_kp_current_env_var" ] && [ "$_kp_current_env_var" != "$env_var" ]; then
+        unset "$_kp_current_env_var"
+    fi
+    export "$env_var=$key"
+    _kp_current_env_var="$env_var"
+}
+
 key_pool_init() {
     local key=$(python3 "$_runner_py" init --config "$(_kp_config)" --state "$(_kp_state)")
-    [ -n "$key" ] && export ANTHROPIC_AUTH_TOKEN="$key"
+    _kp_export_key "$key"
 }
 
 key_pool_rotate() {
     local key=$(python3 "$_runner_py" rotate --config "$(_kp_config)" --state "$(_kp_state)")
-    [ -n "$key" ] && export ANTHROPIC_AUTH_TOKEN="$key"
+    _kp_export_key "$key"
 }
 
 key_pool_on_success() {
     local key=$(python3 "$_runner_py" on-success --config "$(_kp_config)" --state "$(_kp_state)")
-    [ -n "$key" ] && export ANTHROPIC_AUTH_TOKEN="$key"
+    _kp_export_key "$key"
 }
 
 key_pool_disable() {
-    python3 "$_runner_py" disable --key "$ANTHROPIC_AUTH_TOKEN" --config "$(_kp_config)" --state "$(_kp_state)"
+    local env_var="${_kp_current_env_var:-ANTHROPIC_AUTH_TOKEN}"
+    python3 "$_runner_py" disable --key "${!env_var}" \
+        --config "$(_kp_config)" --state "$(_kp_state)"
 }
 
 key_pool_available_size() {
