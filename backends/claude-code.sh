@@ -16,6 +16,8 @@
 #   CLAUDE_MODEL      Primary model id (default: glm-5-turbo)
 #   DOWNGRADE_MODEL   Downgrade-tier model id (default: glm-4.7)
 
+source "${BASH_SOURCE[0]%/*}/../landlock.sh"
+
 # Defaults live in the backend so generic code stays agent-agnostic. Sourced via
 # common.sh, so these are in scope wherever agent_with_retry is (incl. xargs
 # children, which re-source common.sh).

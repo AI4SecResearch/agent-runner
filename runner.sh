@@ -13,27 +13,15 @@
 # Environment variables:
 #   AGENT_BACKEND        Backend name (default: claude-code); sources backends/<name>.sh
 #   SANDBOX              Set to "1" in container to skip permission prompts
-#   CLAUDE_STALL_TIMEOUT Seconds before killing a stalled process (default: 300)
-#   CLAUDE_TIMEOUT       Hard total timeout, 0 = unlimited (default: 0)
+#   AGENT_STALL_TIMEOUT Seconds before killing a stalled process (default: 300)
+#   AGENT_TIMEOUT       Hard total timeout, 0 = unlimited (default: 0)
 #   KEY_POOL_CONFIG      Path to api-keys.json (default: api-keys.json)
-#   LANDLOCK_CONFIG      Optional landlock config; wraps each agent command
-#   LANDLOCK_RUNNER      landlock_runner.py path (default: utils/landlock-runner/landlock_runner.py)
 
 _runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _runner_py="$_runner_dir/runner.py"
 
 _kp_config() { echo "${KEY_POOL_CONFIG:-$_runner_dir/../../api-keys.json}"; }
 _kp_state()  { echo "${DATA_DIR}/key-pool-state.json"; }
-
-# Run a command under landlock if LANDLOCK_CONFIG is set, else run it directly.
-# Used by backends inside agent_backend_invoke so landlock stays generic.
-_landlock_wrap() {
-    if [ -n "$LANDLOCK_CONFIG" ] && [ -f "$LANDLOCK_CONFIG" ]; then
-        python3 "${LANDLOCK_RUNNER:-utils/landlock-runner/landlock_runner.py}" "$LANDLOCK_CONFIG" "$@"
-    else
-        "$@"
-    fi
-}
 
 # ── Key pool (delegates to runner.py) ──────────────────────────────
 
@@ -43,13 +31,14 @@ _landlock_wrap() {
 _kp_current_env_var=""
 
 # Export the current key under the active agent's auth env var (each backend
-# declares the variable it reads for its API key). Clears any previously-set
-# one first so a changed env var doesn't leak the old value into the next run.
+# declares the variable it reads for its API key). No-op when there's no key
+# (no keypool) or the backend doesn't use env-var auth. Clears any
+# previously-set one first so a changed env var doesn't leak old value.
 _kp_export_key() {
     local key="$1"
     [ -n "$key" ] || return 0
     local env_var=$(agent_backend_auth_env_var)
-    [ -n "$env_var" ] || env_var="ANTHROPIC_AUTH_TOKEN"
+    [ -n "$env_var" ] || return 0
     if [ -n "$_kp_current_env_var" ] && [ "$_kp_current_env_var" != "$env_var" ]; then
         unset "$_kp_current_env_var"
     fi
@@ -73,8 +62,8 @@ key_pool_on_success() {
 }
 
 key_pool_disable() {
-    local env_var="${_kp_current_env_var:-ANTHROPIC_AUTH_TOKEN}"
-    python3 "$_runner_py" disable --key "${!env_var}" \
+    [ -n "$_kp_current_env_var" ] || return 0
+    python3 "$_runner_py" disable --key "${!_kp_current_env_var}" \
         --config "$(_kp_config)" --state "$(_kp_state)"
 }
 
@@ -127,8 +116,8 @@ _agent_once_with_watchdog() {
     local log_name="$2"
     shift 2
     local jsonl_file="$OUTPUT_DIR/${log_name}.jsonl"
-    local stall_timeout="${CLAUDE_STALL_TIMEOUT:-300}"
-    local max_timeout="${CLAUDE_TIMEOUT:-0}"
+    local stall_timeout="${AGENT_STALL_TIMEOUT:-300}"
+    local max_timeout="${AGENT_TIMEOUT:-0}"
 
     agent_once "$prompt" "$log_name" "$@" > /dev/null &
     local job_pid=$!

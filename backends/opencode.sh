@@ -21,6 +21,8 @@
 # runner.sh exports the current key to this agent's auth env var
 # (agent_backend_auth_env_var) before each invocation.
 
+source "${BASH_SOURCE[0]%/*}/../landlock.sh"
+
 # Defaults live in the backend so generic code stays agent-agnostic. Sourced via
 # common.sh, so these are in scope wherever agent_with_retry is (incl. xargs
 # children, which re-source common.sh).
