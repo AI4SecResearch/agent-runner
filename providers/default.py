@@ -1,8 +1,10 @@
 """Generic fallback provider.
 
-Maps the extracted error code to a recovery action via the provider's
-error_handling config (code -> action, "_default" fallback). Used when no
-provider-specific module is registered (or as the base behavior).
+Maps the extracted error code to a recovery action using the supplied
+error_handling override (code -> action, "_default" fallback), falling back to
+DEFAULT_ACTION when neither matches. Unlike provider-specific modules, this
+generic fallback ships no built-in code table — it relies entirely on the
+override (or the default action). Used when no provider module is registered.
 """
 
 DEFAULT_ACTION = "rotate_then_downgrade"

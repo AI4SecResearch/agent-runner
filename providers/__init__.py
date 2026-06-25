@@ -15,7 +15,6 @@ from . import base, default, zhipu
 # Providers in the same family can share a module until they diverge.
 REGISTRY = {
     "zhipu": zhipu,
-    "zhipuai-coding-plan": zhipu,
 }
 
 

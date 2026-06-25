@@ -7,24 +7,7 @@
         "yyyyy",
         "zzzzz"
       ],
-      "env_var": "ANTHROPIC_AUTH_TOKEN",
-      "error_handling": {
-        "1305": "downgrade",
-        "1308": "rotate_key",
-        "1310": "rotate_key",
-        "_default": "rotate_then_downgrade"
-      }
-    },
-    "zhipuai-coding-plan": {
-      "keys": [
-        "aaaaa",
-        "bbbbb"
-      ],
-      "env_var": "Z_AI_API_KEY",
-      "error_handling": {
-        "1000": "rotate_key",
-        "_default": "rotate_then_downgrade"
-      }
+      "env_var": "ANTHROPIC_AUTH_TOKEN"
     }
   }
 }
