@@ -25,40 +25,62 @@ _kp_state()  { echo "${DATA_DIR}/key-pool-state.json"; }
 
 # ── Key pool (delegates to runner.py) ──────────────────────────────
 
-# Tracks the env var the last key was exported to, so cross-provider rotation
-# (which changes the env var name) unsets the previous one rather than leaking
-# it into the next agent invocation.
+# Tracks the API key env var the last key was exported to, so a changed var name
+# unsets the previous one rather than leaking it into the next invocation.
 _kp_current_env_var=""
 
-# Export the current key under the active agent's auth env var (each backend
-# declares the variable it reads for its API key). No-op when there's no key
-# (no keypool) or the backend doesn't use env-var auth. Clears any
-# previously-set one first so a changed env var doesn't leak old value.
-_kp_export_key() {
-    local key="$1"
+# Apply a key-pool JSON line {key, base_url, primary_model, downgrade_model}:
+# export the key to the backend's API key env var, the base_url to the backend's
+# base_url env var, and the resolved models to the agent-agnostic
+# PRIMARY_MODEL / DOWNGRADE_MODEL. Each is exported only when non-empty, so a
+# provider that omits base_url/models leaves the backend defaults in place.
+# No-op when the line is empty (no key / no rotation).
+_kp_apply() {
+    local line="$1"
+    [ -n "$line" ] || return 0
+
+    local key base_url pmodel dmodel
+    key=$(printf '%s' "$line" | jq -r '.key')
     [ -n "$key" ] || return 0
-    local env_var=$(agent_backend_auth_env_var)
-    [ -n "$env_var" ] || return 0
-    if [ -n "$_kp_current_env_var" ] && [ "$_kp_current_env_var" != "$env_var" ]; then
-        unset "$_kp_current_env_var"
+    base_url=$(printf '%s' "$line" | jq -r '.base_url // ""')
+    pmodel=$(printf '%s' "$line" | jq -r '.primary_model // ""')
+    dmodel=$(printf '%s' "$line" | jq -r '.downgrade_model // ""')
+
+    # key → API key env var (backend-declared); unset a previously-exported var if
+    # its name changed.
+    local api_key_var; api_key_var=$(agent_backend_api_key_env_var)
+    if [ -n "$api_key_var" ]; then
+        if [ -n "$_kp_current_env_var" ] && [ "$_kp_current_env_var" != "$api_key_var" ]; then
+            unset "$_kp_current_env_var"
+        fi
+        export "$api_key_var=$key"
+        _kp_current_env_var="$api_key_var"
     fi
-    export "$env_var=$key"
-    _kp_current_env_var="$env_var"
+
+    # base_url → base_url env var (backend-declared; empty for backends that
+    # route via their own config rather than an env var). Exported only when
+    # both the var name and the value are non-empty.
+    local base_url_var; base_url_var=$(agent_backend_base_url_env_var)
+    if [ -n "$base_url_var" ] && [ -n "$base_url" ]; then
+        export "$base_url_var=$base_url"
+    fi
+
+    # models → agent-agnostic PRIMARY_MODEL / DOWNGRADE_MODEL. Exported only when
+    # the provider specifies them, so an omitted field keeps the backend default.
+    [ -n "$pmodel" ] && export "PRIMARY_MODEL=$pmodel"
+    [ -n "$dmodel" ] && export "DOWNGRADE_MODEL=$dmodel"
 }
 
 key_pool_init() {
-    local key=$(python3 "$_runner_py" init --config "$(_kp_config)" --state "$(_kp_state)")
-    _kp_export_key "$key"
+    _kp_apply "$(python3 "$_runner_py" init --config "$(_kp_config)" --state "$(_kp_state)")"
 }
 
 key_pool_rotate() {
-    local key=$(python3 "$_runner_py" rotate --config "$(_kp_config)" --state "$(_kp_state)")
-    _kp_export_key "$key"
+    _kp_apply "$(python3 "$_runner_py" rotate --config "$(_kp_config)" --state "$(_kp_state)")"
 }
 
 key_pool_on_success() {
-    local key=$(python3 "$_runner_py" on-success --config "$(_kp_config)" --state "$(_kp_state)")
-    _kp_export_key "$key"
+    _kp_apply "$(python3 "$_runner_py" on-success --config "$(_kp_config)" --state "$(_kp_state)")"
 }
 
 key_pool_disable() {

@@ -8,8 +8,8 @@ Designed for batch-processing pipelines where an agent (e.g. Claude Code) is inv
 
 | File | Purpose |
 |------|---------|
-| `runner.sh` | Generic agent invocation: `agent_once`, `_agent_once_with_watchdog`, `agent_with_retry`, `check_agent_result`. Calls 9 `agent_backend_*` ops defined by the active backend. |
-| `backends/<name>.sh` | Backend implementing the 9-op interface for a specific agent CLI (e.g. `claude-code.sh`, `opencode.sh`). |
+| `runner.sh` | Generic agent invocation: `agent_once`, `_agent_once_with_watchdog`, `agent_with_retry`, `check_agent_result`. Calls 11 `agent_backend_*` ops defined by the active backend. |
+| `backends/<name>.sh` | Backend implementing the 11-op interface for a specific agent CLI (e.g. `claude-code.sh`, `opencode.sh`). |
 | `progress.sh` | Iteration progress: `progress_read`, `progress_write`, `progress_iterations` |
 
 ## Quick start
@@ -38,8 +38,8 @@ progress_iterations my-task 10 my_callback
 | `OUTPUT_DIR` | (required) | Directory for JSONL logs, error logs, and progress state |
 | `AGENT_BACKEND` | `claude-code` | Backend name; sources `backends/<name>.sh` |
 | `SANDBOX` | (unset) | Set to `"1"` to use `--dangerously-skip-permissions` |
-| `CLAUDE_STALL_TIMEOUT` | `300` | Seconds of no output before killing a stalled process |
-| `CLAUDE_TIMEOUT` | `0` | Hard total timeout in seconds; `0` = unlimited |
+| `AGENT_STALL_TIMEOUT` | `300` | Seconds of no output before killing a stalled process |
+| `AGENT_TIMEOUT` | `0` | Hard total timeout in seconds; `0` = unlimited |
 | `KEY_POOL_CONFIG` | `<repo>/api-keys.json` | Path to key-pool config |
 
 ## Backends
@@ -50,23 +50,22 @@ The runner is agent-agnostic; all agent-specific behavior lives in
 ### claude-code (default)
 
 - Binary: `claude`
-- Prereqs: `CLAUDE_MODEL`, `DOWNGRADE_MODEL` env vars
-- Auth: `ANTHROPIC_AUTH_TOKEN` env var (set by the key pool)
+- Prereqs: `PRIMARY_MODEL`, `DOWNGRADE_MODEL` env vars (the key pool exports the active provider's models; shell values serve as backend defaults)
+- API key: `ANTHROPIC_AUTH_TOKEN` env var (set by the key pool); base_url via `ANTHROPIC_BASE_URL` (set by the key pool from the provider's `base_url`)
 
 ### opencode
 
 - Binary: `opencode` (v1.17+)
 - Prereqs:
-  - `OPENCODE_MODEL`, `OPENCODE_DOWNGRADE_MODEL` env vars (must be `provider/model` form, e.g. `bailian/glm-5.2`)
-  - Custom providers configured in `~/.config/opencode/opencode.json`
-- Auth: per-provider env var (e.g., `Z_AI_API_KEY` for zhipuai-coding-plan, `BAILIAN_GLM5_API_KEY` for bailian). The key pool picks the var from the active provider's `env_var` field in `api-keys.json`.
+  - `PRIMARY_MODEL`, `DOWNGRADE_MODEL` env vars (must be `provider/model` form, e.g. `bailian/glm-5.2`; the key pool exports the active provider's models)
+  - Custom providers configured in `~/.config/opencode/opencode.json` (endpoint URL + protocol live here, keyed by the model's provider prefix; the key pool's per-provider `base_url` is unused for opencode)
+- API key: env var configured in `opencode.json` (default `Z_AI_API_KEY`); the key pool exports the current key to `agent_backend_api_key_env_var`.
 
 ### Error handling codes
 
-Error codes in `api-keys.json` `error_handling` are matched as `[NNN]` (3 digits, HTTP status — emitted by opencode) or `[NNNN]` (4 digits, upstream-specific — emitted by claude-code's zhipu path). Map them per provider:
+Error codes are matched as `[NNN]` (3 digits, HTTP status — emitted by opencode) or `[NNNN]` (4 digits, upstream-specific — emitted by claude-code's zhipu path). Each provider module ships a default `error_handling` table; `api-keys.json`'s optional `error_handling` overrides it per deployment:
 
-- claude-code + zhipu uses upstream codes (e.g., `"1305"`, `"1308"`).
-- opencode + zhipuai-coding-plan uses upstream codes from `responseBody.error.code` (e.g., `"1000"` for auth failure).
+- claude-code + zhipu uses upstream codes (e.g., `"1305"`, `"1308"`) — defaults live in `providers/zhipu.py`.
 - opencode + bailian has no upstream code; the runner falls back to HTTP status codes (e.g., `"401"`, `"429"`).
 
 ## Key pool config (`api-keys.json`)
@@ -77,13 +76,8 @@ Error codes in `api-keys.json` `error_handling` are matched as `[NNN]` (3 digits
   "providers": {
     "zhipu": {
       "keys": ["xxxxx", "yyyyy", "zzzzz"],
-      "env_var": "ANTHROPIC_AUTH_TOKEN",
-      "error_handling": { "1305": "downgrade", "_default": "rotate_then_downgrade" }
-    },
-    "zhipuai-coding-plan": {
-      "keys": ["aaaaa", "bbbbb"],
-      "env_var": "Z_AI_API_KEY",
-      "error_handling": { "1000": "rotate_key", "_default": "rotate_then_downgrade" }
+      "base_url": "https://open.bigmodel.cn/api/anthropic",
+      "models": ["glm-5-turbo", "glm-4.7"]
     }
   }
 }
@@ -91,8 +85,11 @@ Error codes in `api-keys.json` `error_handling` are matched as `[NNN]` (3 digits
 
 Per-provider fields:
 - `keys` (required): list of API keys.
-- `env_var` (optional): env var the key pool exports the current key to. Defaults to `ANTHROPIC_AUTH_TOKEN`. Set to the value your `opencode.json` provider reads via `{env:VAR_NAME}`.
-- `error_handling` (optional): map of `[NNN]` or `[NNNN]` codes → action. Actions: `rotate_key`, `downgrade`, `rotate_then_downgrade`. `_default` is the fallback.
+- `base_url` (optional): API base url. claude-code reads it via `ANTHROPIC_BASE_URL` (anthropic protocol); opencode ignores it (endpoint/protocol live in `opencode.json`).
+- `models` (optional): ordered model list — `[0]` is the primary tier, `[1]` the downgrade tier (a single-element list makes both the same). Optional `primary_model` / `downgrade_model` override the positional defaults. When omitted, the key pool leaves the backend's `PRIMARY_MODEL` / `DOWNGRADE_MODEL` defaults in place.
+- `error_handling` (optional): map of `[NNN]`/`[NNNN]` codes → action, overriding the provider module's built-in defaults. Actions: `rotate_key`, `downgrade`, `rotate_then_downgrade`. `_default` is the fallback.
+
+The key pool rotates across all providers' keys as one flat pool; rotating into a different provider re-applies that provider's `base_url` + models (cross-provider failover). The API key env var stays backend-declared.
 
 ## Functions
 

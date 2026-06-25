@@ -2,20 +2,26 @@
 """Agent runner core — key pool, error classification, result checking.
 
 Key pool:
-    - Config: api-keys.json (per-provider keys + error handling rules)
+    - Config: api-keys.json (per-provider keys + base_url + models,
+              plus an optional error_handling override)
     - State:  key-pool-state.json (current_index, disabled map with TTL, success_count)
     - Concurrency: LOCK_SH for reads, LOCK_EX for writes via fcntl.flock
     - Disabled keys auto-expire after DISABLE_TTL (5h); clock skew clears all
 
 Subcommands (called by runner.sh):
-    init            Init state file, return current key
-    rotate          Advance to next non-disabled key
+    init            Init state file; emit JSON line for current key + provider cfg
+    rotate          Advance to next non-disabled key; emit JSON line
     size            Total key count from config
     available-size  Non-disabled key count
     disable         Disable a key by value with TTL
-    on-success      Increment success counter, rotate at threshold
+    on-success      Increment success counter, rotate at threshold; emit JSON line
     classify        Extract error code → lookup action + auto-disable flag
     retry-plan      Generate (model, count) retry rounds from available keys
+
+The JSON line emitted by init/rotate/on-success carries the active key plus its
+provider's base_url + resolved primary/downgrade models, so the bash wrapper can
+apply them (cross-provider rotation reconfigures endpoint + model per provider).
+An empty line means no key / no rotation (preserves the existing [ -n "$key" ] signal).
 """
 
 import argparse
@@ -32,6 +38,25 @@ DEBUG = False
 def _dbg(msg):
     if DEBUG:
         print(f"[runner.py] {msg}", file=sys.stderr)
+
+
+def _resolve_models(cfg):
+    """Resolve (primary, downgrade) model ids from a provider config block.
+
+    Positional `models` list: [0]=primary, [1]=downgrade; a single-element list
+    makes primary and downgrade the same. Optional `primary_model` /
+    `downgrade_model` override the positional defaults. Returns (None, None) when
+    the provider declares no models, so the caller leaves the backend default in
+    place rather than clobbering it with an empty value.
+    """
+    if not cfg:
+        return None, None
+    models = cfg.get("models") or []
+    primary = cfg.get("primary_model") or (models[0] if models else None)
+    downgrade = cfg.get("downgrade_model")
+    if downgrade is None and models:
+        downgrade = models[1] if len(models) >= 2 else models[0]
+    return primary, downgrade
 
 
 class KeyPool:
@@ -58,13 +83,39 @@ class KeyPool:
         """Flatten all provider keys into a single list."""
         return [k for k, _ in self._all_key_provider_pairs()]
 
-    def _provider_for_current(self):
-        """Return the provider name for the current key index, or None."""
+    def _provider_cfg_for_current(self):
+        """Return (provider_name, provider_cfg) for the current key index.
+
+        Returns (None, None) when there are no keys or no state file yet.
+        """
         pairs = self._all_key_provider_pairs()
         if not pairs or not os.path.exists(self.state_path):
-            return None
+            return None, None
         idx = self._read_state().get("current_index", 0) % len(pairs)
-        return pairs[idx][1]
+        pname = pairs[idx][1]
+        return pname, self.config.get("providers", {}).get(pname, {})
+
+    def _provider_for_current(self):
+        """Return the provider name for the current key index, or None."""
+        return self._provider_cfg_for_current()[0]
+
+    def _apply_line(self, key):
+        """Print the JSON line the key-pool wrappers consume, or an empty line.
+
+        Carries the active key plus its provider's base_url + resolved models so
+        runner.sh can apply them (see _kp_apply). Empty when there is no key.
+        """
+        if not key:
+            print("")
+            return
+        _, cfg = self._provider_cfg_for_current()
+        primary, downgrade = _resolve_models(cfg)
+        print(json.dumps({
+            "key": key,
+            "base_url": (cfg or {}).get("base_url", ""),
+            "primary_model": primary or "",
+            "downgrade_model": downgrade or "",
+        }))
 
     # ── State file access (LOCK_SH / LOCK_EX) ──────────────────────
 
@@ -344,17 +395,14 @@ def main():
         if not os.path.exists(args.config):
             sys.exit(0)
         pool = KeyPool(args.config, args.state)
-        key = pool.init()
-        if key:
-            print(key)
+        pool._apply_line(pool.init())
 
     elif args.command == "rotate":
         if not os.path.exists(args.config):
             print("")
             sys.exit(0)
         pool = KeyPool(args.config, args.state)
-        key = pool.rotate()
-        print(key)
+        pool._apply_line(pool.rotate())
 
     elif args.command == "size":
         if not os.path.exists(args.config):
@@ -367,9 +415,7 @@ def main():
         if not os.path.exists(args.config):
             sys.exit(0)
         pool = KeyPool(args.config, args.state)
-        key = pool.on_success()
-        if key:
-            print(key)
+        pool._apply_line(pool.on_success())
 
     elif args.command == "disable":
         if not os.path.exists(args.config) or not os.path.exists(args.state):

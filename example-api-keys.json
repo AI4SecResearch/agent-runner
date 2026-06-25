@@ -7,7 +7,8 @@
         "yyyyy",
         "zzzzz"
       ],
-      "env_var": "ANTHROPIC_AUTH_TOKEN"
+      "base_url": "https://open.bigmodel.cn/api/anthropic",
+      "models": ["glm-5-turbo", "glm-4.7"]
     }
   }
 }

@@ -1,33 +1,39 @@
 #!/bin/bash
 # OpenCode backend for the agent-runner.
 #
-# Implements the 10-op backend interface consumed by runner.sh:
+# Implements the 11-op backend interface consumed by runner.sh:
 #   agent_backend_invoke / agent_backend_is_complete / agent_backend_result_ok / agent_backend_result_text /
 #   agent_backend_session_id / agent_backend_perm_args / agent_backend_model_args / agent_backend_resume_args /
-#   agent_backend_fork_args / agent_backend_auth_env_var
+#   agent_backend_fork_args / agent_backend_api_key_env_var / agent_backend_base_url_env_var
 #
 # This backend owns everything OpenCode-specific: the `opencode` binary, the
 # `run` subcommand, the positional prompt, the --format json output, how the
 # jsonl log is parsed, and the flag vocabulary (--model/-s/--fork). Generic
 # orchestration in runner.sh never references `opencode` directly.
 #
-# Env vars (read here, not in generic code):
-#   SANDBOX                  "1" → skip permission prompts (--dangerously-skip-permissions)
-#   OPENCODE_MODEL           Primary model id, provider-prefixed (default: bailian/glm-5.2)
-#   OPENCODE_DOWNGRADE_MODEL Downgrade-tier model id (default: bailian/glm-5.1)
+# Env vars (agent-agnostic; the key pool may override per provider):
+#   SANDBOX           "1" → skip permission prompts (--dangerously-skip-permissions)
+#   PRIMARY_MODEL     Primary model id, provider-prefixed (default: bailian/glm-5.2)
+#   DOWNGRADE_MODEL   Downgrade-tier model id (default: bailian/glm-5.1)
 #
 # Auth: OpenCode reads the API key from the env var configured in
 # ~/.config/opencode/opencode.json (default Z_AI_API_KEY). The key pool in
 # runner.sh exports the current key to this agent's auth env var
-# (agent_backend_auth_env_var) before each invocation.
+# (agent_backend_api_key_env_var) before each invocation.
+#
+# Endpoint/protocol: OpenCode routes by the provider prefix in the model id
+# (provider/model); the endpoint URL and protocol (openai by default, anthropic
+# where configured) live in ~/.config/opencode/opencode.json. There is no single
+# endpoint env var, so agent_backend_base_url_env_var is empty (the key pool's
+# per-provider base_url is unused for opencode).
 
 source "${BASH_SOURCE[0]%/*}/../landlock.sh"
 
 # Defaults live in the backend so generic code stays agent-agnostic. Sourced via
 # common.sh, so these are in scope wherever agent_with_retry is (incl. xargs
 # children, which re-source common.sh).
-OPENCODE_MODEL="${OPENCODE_MODEL:-bailian/glm-5.2}"
-OPENCODE_DOWNGRADE_MODEL="${OPENCODE_DOWNGRADE_MODEL:-bailian/glm-5.1}"
+PRIMARY_MODEL="${PRIMARY_MODEL:-bailian/glm-5.2}"
+DOWNGRADE_MODEL="${DOWNGRADE_MODEL:-bailian/glm-5.1}"
 
 # Run one agent step. Writes the json event stream to $prefix.jsonl, the stderr
 # stream to $prefix.err, and prints the assistant text on stdout (concatenated
@@ -97,8 +103,8 @@ agent_backend_perm_args() {
 # Usage: agent_backend_model_args <primary|downgrade|<model_id>>
 agent_backend_model_args() {
     case "$1" in
-        primary)   echo "--model ${OPENCODE_MODEL}" ;;
-        downgrade) echo "--model ${OPENCODE_DOWNGRADE_MODEL}" ;;
+        primary)   echo "--model ${PRIMARY_MODEL}" ;;
+        downgrade) echo "--model ${DOWNGRADE_MODEL}" ;;
         *)         echo "--model $1" ;;
     esac
 }
@@ -120,7 +126,16 @@ agent_backend_fork_args() {
 # The env var this agent reads for its API key. OpenCode reads whatever its
 # opencode.json is configured with (default Z_AI_API_KEY); override via
 # OPENCODE_AUTH_ENV_VAR if your config differs.
-# Usage: agent_backend_auth_env_var
-agent_backend_auth_env_var() {
+# Usage: agent_backend_api_key_env_var
+agent_backend_api_key_env_var() {
     echo "${OPENCODE_AUTH_ENV_VAR:-Z_AI_API_KEY}"
+}
+
+# The env var this agent reads for its base_url. Empty output ⇒ the key
+# pool skips base_url export: OpenCode's endpoint URL and protocol live in
+# opencode.json (selected by the model id's provider prefix), not in a
+# runner-exported env var. (Opt-out, like resume_args returning empty.)
+# Usage: agent_backend_base_url_env_var
+agent_backend_base_url_env_var() {
+    echo ""
 }

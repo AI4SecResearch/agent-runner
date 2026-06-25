@@ -1,27 +1,30 @@
 #!/bin/bash
 # Claude Code backend for the agent-runner.
 #
-# Implements the 10-op backend interface consumed by runner.sh:
+# Implements the 11-op backend interface consumed by runner.sh:
 #   agent_backend_invoke / agent_backend_is_complete / agent_backend_result_ok / agent_backend_result_text /
 #   agent_backend_session_id / agent_backend_perm_args / agent_backend_model_args / agent_backend_resume_args /
-#   agent_backend_fork_args / agent_backend_auth_env_var
+#   agent_backend_fork_args / agent_backend_api_key_env_var / agent_backend_base_url_env_var
 #
 # This backend owns everything Claude-Code-specific: the `claude` binary, the
 # prompt flag, the stream-json output format, how the jsonl log is parsed, and the
 # flag vocabulary (--model/--resume/--fork-session/--permission-mode). Generic
 # orchestration in runner.sh never references `claude` directly.
 #
-# Env vars (read here, not in generic code):
-#   SANDBOX           "1" → skip permission prompts (--dangerously-skip-permissions)
-#   CLAUDE_MODEL      Primary model id (default: glm-5-turbo)
-#   DOWNGRADE_MODEL   Downgrade-tier model id (default: glm-4.7)
+# Env vars (agent-agnostic; the key pool may override per provider):
+#   SANDBOX             "1" → skip permission prompts (--dangerously-skip-permissions)
+#   PRIMARY_MODEL       Primary model id (default: glm-5-turbo). The key pool exports the
+#                       active provider's model when api-keys.json declares one.
+#   DOWNGRADE_MODEL     Downgrade-tier model id (default: glm-4.7)
+#   ANTHROPIC_BASE_URL  base_url (read by the `claude` binary). The key pool exports
+#                       the active provider's base_url; claude-code speaks anthropic only.
 
 source "${BASH_SOURCE[0]%/*}/../landlock.sh"
 
 # Defaults live in the backend so generic code stays agent-agnostic. Sourced via
 # common.sh, so these are in scope wherever agent_with_retry is (incl. xargs
 # children, which re-source common.sh).
-CLAUDE_MODEL="${CLAUDE_MODEL:-glm-5-turbo}"
+PRIMARY_MODEL="${PRIMARY_MODEL:-glm-5-turbo}"
 DOWNGRADE_MODEL="${DOWNGRADE_MODEL:-glm-4.7}"
 
 # Run one agent step. Writes the stream-json log to $prefix.jsonl, the stderr
@@ -84,7 +87,7 @@ agent_backend_perm_args() {
 # Usage: agent_backend_model_args <primary|downgrade|<model_id>>
 agent_backend_model_args() {
     case "$1" in
-        primary)    echo "--model ${CLAUDE_MODEL}" ;;
+        primary)    echo "--model ${PRIMARY_MODEL}" ;;
         downgrade)  echo "--model ${DOWNGRADE_MODEL}" ;;
         *)          echo "--model $1" ;;
     esac
@@ -104,7 +107,15 @@ agent_backend_fork_args() {
 
 # The env var this agent reads for its API key (the key pool exports the current
 # key here). claude-code always reads ANTHROPIC_AUTH_TOKEN.
-# Usage: agent_backend_auth_env_var
-agent_backend_auth_env_var() {
+# Usage: agent_backend_api_key_env_var
+agent_backend_api_key_env_var() {
     echo "ANTHROPIC_AUTH_TOKEN"
+}
+
+# The env var this agent reads for its base_url (the key pool exports the
+# active provider's base_url here). claude-code reads ANTHROPIC_BASE_URL and
+# speaks the anthropic protocol only.
+# Usage: agent_backend_base_url_env_var
+agent_backend_base_url_env_var() {
+    echo "ANTHROPIC_BASE_URL"
 }
