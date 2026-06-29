@@ -1,0 +1,74 @@
+{
+  // Top-level user config for the LLM provider manager.
+  // This file contains REAL API keys — keep it 0600 and gitignored.
+  // Copy to `providers.jsonc` and fill in your own values.
+  "settings": {
+    "rotateEvery": 5,        // proactive rotate every N successes (0 = off)
+    "disableTtlHours": 5     // recovery TTL (hours) for a disabled key
+  },
+  // Default agent+provider+key used by `use` (and the shell-hook default eval)
+  // when invoked without arguments. `agent` is optional (defaults to "claude").
+  "default": { "agent": "claude", "provider": "zhipu", "key": "main" },
+  "providers": [
+    // ── Template A: symmetric (all keys share the same model set) ──
+    {
+      "id": "zhipu",
+      "type": "symmetric",
+      "displayName": "智谱",
+      "defaultKey": "main",
+      "baseURLs": {
+        "anthropic": "https://open.bigmodel.cn/api/anthropic",
+        "openai": "https://open.bigmodel.cn/api/compatible-mode/v1"
+      },
+      "keys": [
+        { "id": "main",   "key": "sk-REPLACE-ME-zhipu-main" },
+        { "id": "backup", "key": "sk-REPLACE-ME-zhipu-backup", "agentBlacklist": ["claude"] }
+      ],
+      "models": [
+        { "id": "glm-5.2",      "displayName": "GLM-5.2",     "context": 1000000, "output": 131072 },
+        { "id": "glm-5-turbo",  "displayName": "GLM-5 Turbo", "context":  128000, "output": 16384 }
+      ],
+      "errorHandling": {
+        // Optional overrides on top of the zhipu provider backend's built-in
+        // defaults (see providers/zhipu.py). Remove this block and zhipu
+        // still classifies correctly via built-in defaults.
+        "1305": "downgrade",
+        "1308": "rotate_key",
+        "1310": "rotate_key",
+        "_default": "rotate_then_downgrade"
+      }
+    },
+
+    // ── Template B: asymmetric (per-key model sets) ──
+    {
+      "id": "bailian",
+      "type": "asymmetric",
+      "displayName": "百炼",
+      "defaultKey": "account-a",
+      "baseURLs": {
+        "openai": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      },
+      "keys": [
+        {
+          "id": "account-a",
+          "key": "sk-REPLACE-ME-bailian-a",
+          "models": [
+            { "id": "glm-5.2", "displayName": "GLM-5.2", "context": 1000000, "output": 131072 }
+          ]
+        },
+        {
+          "id": "account-b",
+          "key": "sk-REPLACE-ME-bailian-b",
+          "models": [
+            { "id": "glm-4.6", "displayName": "GLM-4.6", "context": 128000, "output": 16384 }
+          ]
+        }
+      ],
+      "errorHandling": {
+        // Optional overrides on top of the bailian provider backend's built-in
+        // defaults (currently empty — falls back to _default action).
+        "_default": "rotate_key"
+      }
+    }
+  ]
+}
