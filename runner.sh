@@ -15,12 +15,13 @@
 #   SANDBOX              Set to "1" in container to skip permission prompts
 #   AGENT_STALL_TIMEOUT Seconds before killing a stalled process (default: 300)
 #   AGENT_TIMEOUT       Hard total timeout, 0 = unlimited (default: 0)
-#   KEY_POOL_CONFIG      Path to api-keys.json (default: api-keys.json)
+#   KEY_POOL_CONFIG      Path to providers.jsonc (lpm config; default: <workspace>/providers.jsonc)
+#   LLM_PROVIDER_CONFIG  Fallback config path (honored when KEY_POOL_CONFIG unset)
 
 _runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _runner_py="$_runner_dir/runner.py"
 
-_kp_config() { echo "${KEY_POOL_CONFIG:-$_runner_dir/../../api-keys.json}"; }
+_kp_config() { echo "${KEY_POOL_CONFIG:-${LLM_PROVIDER_CONFIG:-$_runner_dir/../../providers.jsonc}}"; }
 _kp_state()  { echo "${DATA_DIR}/key-pool-state.json"; }
 
 # ── Key pool (delegates to runner.py) ──────────────────────────────
@@ -244,7 +245,7 @@ agent_once_session_resume() {
 # 返回 0=成功  1=均失败
 #
 # Python 生成重试计划 (retry-plan)，bash 通用循环执行。
-# 恢复策略由 api-keys.json 中 provider 的 error_handling 配置决定。
+# 恢复策略由 providers.jsonc 中 provider 的 errorHandling 配置决定。
 agent_with_retry() {
     local prompt="$1"
     local log_name="$2"

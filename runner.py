@@ -1,445 +1,51 @@
 #!/usr/bin/env python3
-"""Agent runner core — key pool, error classification, result checking.
+"""agent-runner key-pool adapter — delegates to llm-provider-manager (lpm).
 
-Key pool:
-    - Config: api-keys.json (per-provider keys + base_url + models,
-              plus an optional error_handling override)
-    - State:  key-pool-state.json (current_index, disabled map with TTL, success_count)
-    - Concurrency: LOCK_SH for reads, LOCK_EX for writes via fcntl.flock
-    - Disabled keys auto-expire after DISABLE_TTL (5h); clock skew clears all
-
-Subcommands (called by runner.sh):
-    init            Init state file; emit JSON line for current key + provider cfg
-    rotate          Advance to next non-disabled key; emit JSON line
-    size            Total key count from config
-    available-size  Non-disabled key count
-    disable         Disable a key by value with TTL
-    on-success      Increment success counter, rotate at threshold; emit JSON line
-    classify        Extract error code → lookup action + auto-disable flag
-    retry-plan      Generate (model, count) retry rounds from available keys
-
-The JSON line emitted by init/rotate/on-success carries the active key plus its
-provider's base_url + resolved primary/downgrade models, so the bash wrapper can
-apply them (cross-provider rotation reconfigures endpoint + model per provider).
-An empty line means no key / no rotation (preserves the existing [ -n "$key" ] signal).
+lpm is vendored into agent-runner at ``llm-provider-manager/`` (git subtree), so
+the default is the in-tree copy. ``$LPM_SRC`` overrides it (e.g. point at a dev
+checkout of lpm); the default install path
+(``~/.local/share/llm-provider-manager`` — where install.sh clones lpm) is a
+last-resort fallback.
 """
-
-import argparse
-import fcntl
-import json
 import os
 import sys
-import time
 
-DISABLE_TTL = 5 * 3600  # 5 hours
-DEBUG = False
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
+for _cand in (os.environ.get("LPM_SRC"),                                      # explicit override
+              os.path.join(_HERE, "llm-provider-manager", "src"),              # vendored (subtree) — default
+              os.path.expanduser("~/.local/share/llm-provider-manager/src")):  # install fallback
+    if _cand and os.path.isdir(_cand):
+        if _cand not in sys.path:
+            sys.path.insert(0, _cand)
+        break
 
-def _dbg(msg):
-    if DEBUG:
-        print(f"[runner.py] {msg}", file=sys.stderr)
+try:
+    from llm_provider_manager.keypool import dispatch
+except ImportError:
+    sys.stderr.write(
+        "runner.py: llm_provider_manager not found.\n"
+        "  Expected the vendored llm-provider-manager/src; or set LPM_SRC=<lpm>/src;\n"
+        "  or install lpm (install.sh → ~/.local/share/llm-provider-manager).\n"
+    )
+    sys.exit(1)
 
-
-def _resolve_models(cfg):
-    """Resolve (primary, downgrade) model ids from a provider config block.
-
-    Positional `models` list: [0]=primary, [1]=downgrade; a single-element list
-    makes primary and downgrade the same. Optional `primary_model` /
-    `downgrade_model` override the positional defaults. Returns (None, None) when
-    the provider declares no models, so the caller leaves the backend default in
-    place rather than clobbering it with an empty value.
-    """
-    if not cfg:
-        return None, None
-    models = cfg.get("models") or []
-    primary = cfg.get("primary_model") or (models[0] if models else None)
-    downgrade = cfg.get("downgrade_model")
-    if downgrade is None and models:
-        downgrade = models[1] if len(models) >= 2 else models[0]
-    return primary, downgrade
+# agent-runner backend name → lpm agent id. Unknown backend falls back to the
+# lpm registry default (claude) with a stderr warning.
+_BACKEND_TO_AGENT = {"claude-code": "claude", "opencode": "opencode"}
 
 
-class KeyPool:
-    def __init__(self, config_path, state_path):
-        self.config_path = config_path
-        self.state_path = state_path
-        self._config = None
-
-    @property
-    def config(self):
-        if self._config is None:
-            with open(self.config_path) as f:
-                self._config = json.load(f)
-        return self._config
-
-    def _all_key_provider_pairs(self):
-        """Flatten all provider keys into a list of (key, provider_name) pairs."""
-        pairs = []
-        for pname, provider_cfg in self.config.get("providers", {}).items():
-            pairs.extend((k, pname) for k in provider_cfg.get("keys", []))
-        return pairs
-
-    def _all_keys(self):
-        """Flatten all provider keys into a single list."""
-        return [k for k, _ in self._all_key_provider_pairs()]
-
-    def _provider_cfg_for_current(self):
-        """Return (provider_name, provider_cfg) for the current key index.
-
-        Returns (None, None) when there are no keys or no state file yet.
-        """
-        pairs = self._all_key_provider_pairs()
-        if not pairs or not os.path.exists(self.state_path):
-            return None, None
-        idx = self._read_state().get("current_index", 0) % len(pairs)
-        pname = pairs[idx][1]
-        return pname, self.config.get("providers", {}).get(pname, {})
-
-    def _provider_for_current(self):
-        """Return the provider name for the current key index, or None."""
-        return self._provider_cfg_for_current()[0]
-
-    def _apply_line(self, key):
-        """Print the JSON line the key-pool wrappers consume, or an empty line.
-
-        Carries the active key plus its provider's base_url + resolved models so
-        runner.sh can apply them (see _kp_apply). Empty when there is no key.
-        """
-        if not key:
-            print("")
-            return
-        _, cfg = self._provider_cfg_for_current()
-        primary, downgrade = _resolve_models(cfg)
-        print(json.dumps({
-            "key": key,
-            "base_url": (cfg or {}).get("base_url", ""),
-            "primary_model": primary or "",
-            "downgrade_model": downgrade or "",
-        }))
-
-    # ── State file access (LOCK_SH / LOCK_EX) ──────────────────────
-
-    def _read_state(self):
-        """Read state under shared lock."""
-        with open(self.state_path) as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                return json.load(f)
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-
-    def _modify_state(self, fn):
-        """Read-modify-write under exclusive lock. Returns fn result."""
-        with open(self.state_path, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                data = json.load(f)
-                result = fn(data)
-                f.seek(0)
-                json.dump(data, f)
-                # json.dump() 只填缓冲、不触发 write()：内容真正进内核要等 with
-                # 结束的 close()，而那已在 finally 解锁之后。故紧跟 truncate()——
-                # 它发 ftruncate 前会先 flush 写缓冲，把 write() 收进 flock 临界区内。
-                f.truncate()
-                return result
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-
-    def _init_state(self):
-        """Ensure state file is initialized. LOCK_EX serializes concurrent inits."""
-        fd = os.open(self.state_path, os.O_CREAT | os.O_RDWR, 0o644)
-        with os.fdopen(fd, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                if f.read().strip():
-                    return
-                json.dump({"current_index": 0, "disabled": {}, "success_count": 0}, f)
-                f.truncate()
-                _dbg(f"init: created state file {self.state_path}")
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-
-    # ── Disabled key helpers ────────────────────────────────────────
-
-    @staticmethod
-    def _parse_expiry(v):
-        """Parse expiry value (str or number) to epoch seconds."""
-        if isinstance(v, (int, float)):
-            return v
-        from datetime import datetime, timezone, timedelta
-        return datetime.strptime(v, "%Y-%m-%d %H:%M").replace(
-            tzinfo=timezone(timedelta(hours=8))
-        ).timestamp()
-
-    @staticmethod
-    def _format_expiry(epoch):
-        """Format epoch seconds to 'YYYY-MM-DD HH:MM' (CST/UTC+8)."""
-        from datetime import datetime, timezone, timedelta
-        cst = timezone(timedelta(hours=8))
-        return datetime.fromtimestamp(epoch, tz=cst).strftime("%Y-%m-%d %H:%M")
-
-    def _active_disabled(self, data):
-        """Return set of currently-disabled key indices (read-only filter)."""
-        disabled_map = data.get("disabled", {})
-        if not disabled_map:
-            return set()
-        now = time.time()
-        return {int(k) for k, v in disabled_map.items() if self._parse_expiry(v) > now}
-
-    def _purge_expired(self, data):
-        """Remove expired entries from disabled map. Modifies data in place."""
-        disabled_map = data.get("disabled", {})
-        if not disabled_map:
-            return
-        now = time.time()
-        expired = [k for k, v in disabled_map.items() if self._parse_expiry(v) <= now]
-        for k in expired:
-            del disabled_map[k]
-
-    # ── Public API ──────────────────────────────────────────────────
-
-    def current_key(self):
-        """Get current key from config using index from state."""
-        keys = self._all_keys()
-        if not keys:
-            return ""
-        if not os.path.exists(self.state_path):
-            return keys[0]
-        data = self._read_state()
-        idx = data.get("current_index", 0)
-        return keys[idx % len(keys)]
-
-    def init(self):
-        """Initialize state file from config, return current key."""
-        keys = self._all_keys()
-        if not keys:
-            return ""
-        self._init_state()
-        key = self.current_key()
-        _dbg(f"init: key[{self._read_state().get('current_index', 0)}]={key[:8]}...")
-        return key
-
-    def rotate(self):
-        """Atomically advance to next non-disabled key, return new key."""
-        keys = self._all_keys()
-        if not keys:
-            return ""
-
-        def _rotate(data):
-            self._purge_expired(data)
-            disabled = self._active_disabled(data)
-            if len(disabled) >= len(keys):
-                _dbg(f"rotate: all {len(keys)} keys disabled")
-                return ""
-            cur = data.get("current_index", 0)
-            new_idx = (cur + 1) % len(keys)
-            while new_idx in disabled:
-                new_idx = (new_idx + 1) % len(keys)
-            data["current_index"] = new_idx
-            _dbg(f"rotate: {cur}→{new_idx} key={keys[new_idx][:8]}... disabled={disabled}")
-            return keys[new_idx]
-
-        return self._modify_state(_rotate)
-
-    def size(self):
-        """Return total key count."""
-        return len(self._all_keys())
-
-    def disable(self, key_str):
-        """Disable key by value with TTL. Returns the key that was disabled."""
-        keys = self._all_keys()
-        try:
-            idx = keys.index(key_str)
-        except ValueError:
-            _dbg(f"disable: key {key_str[:8]}... not found in config")
-            return ""
-
-        def _disable(data):
-            self._purge_expired(data)
-            expiry = time.time() + DISABLE_TTL
-            data.setdefault("disabled", {})[str(idx)] = self._format_expiry(expiry)
-            _dbg(f"disable: key[{idx}]={key_str[:8]}... until={self._format_expiry(expiry)}")
-            return key_str
-
-        return self._modify_state(_disable)
-
-    def available_size(self):
-        """Return number of non-disabled keys."""
-        total = len(self._all_keys())
-        if not os.path.exists(self.state_path):
-            return total
-        data = self._read_state()
-        active = total - len(self._active_disabled(data))
-        _dbg(f"available_size: {active}/{total}")
-        return active
-
-    def on_success(self):
-        """Check proactive rotation. Returns new key if rotated, else empty string."""
-        rotate_every = self.config.get("rotate_every", 5)
-
-        def _on_success(data):
-            self._purge_expired(data)
-            count = data.get("success_count", 0) + 1
-            if count < rotate_every:
-                data["success_count"] = count
-                _dbg(f"on_success: count={count}/{rotate_every}")
-                return ""
-            data["success_count"] = 0
-            # Rotate within the same lock
-            disabled = self._active_disabled(data)
-            if len(disabled) >= len(self._all_keys()):
-                return ""
-            keys = self._all_keys()
-            cur = data.get("current_index", 0)
-            new_idx = (cur + 1) % len(keys)
-            while new_idx in disabled:
-                new_idx = (new_idx + 1) % len(keys)
-            data["current_index"] = new_idx
-            _dbg(f"on_success: count={count}/{rotate_every}, rotating {cur}→{new_idx} key={keys[new_idx][:8]}...")
-            return keys[new_idx]
-
-        return self._modify_state(_on_success)
-
-
-def classify_error(payload_text, config_path, state_path):
-    """Classify an error from the agent's payload via the active provider module.
-
-    The provider is the active key's provider (KeyPool); interpretation is
-    delegated to the providers package. Returns "action:disable".
-    """
-    provider = None
-    handling = {}
-    if os.path.exists(config_path):
-        pool = KeyPool(config_path, state_path)
-        provider = pool._provider_for_current()
-        handling = (
-            pool.config.get("providers", {}).get(provider or "", {}).get("error_handling", {})
+def main(argv):
+    backend = os.environ.get("AGENT_BACKEND", "claude-code")
+    agent = _BACKEND_TO_AGENT.get(backend, "claude")
+    if backend not in _BACKEND_TO_AGENT:
+        sys.stderr.write(
+            f"runner.py: unknown AGENT_BACKEND '{backend}', defaulting agent='{agent}'\n"
         )
-    from providers import classify as provider_classify
-    return provider_classify(provider, payload_text, handling)
-
-
-def retry_plan(action, config_path, state_path):
-    """Generate retry plan using current available key count from state.
-
-    Falls back to single-key downgrade when config is absent.
-    Returns empty list when all keys are disabled.
-    """
-    if os.path.exists(config_path):
-        pool = KeyPool(config_path, state_path)
-        pool_size = pool.available_size()
-        if pool_size == 0:
-            _dbg(f"retry_plan: action={action} pool_size=0, no available keys")
-            return []
-    else:
-        pool_size = 1
-    _dbg(f"retry_plan: action={action} pool_size={pool_size}")
-    if action == "rotate_key":
-        return [("primary", pool_size)]
-    elif action == "downgrade":
-        return [("downgrade", pool_size)]
-    else:  # rotate_then_downgrade
-        return [("primary", pool_size), ("downgrade", pool_size)]
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Agent runner core")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    # init
-    p = sub.add_parser("init")
-    p.add_argument("--config", required=True)
-    p.add_argument("--state", required=True)
-
-    # rotate
-    p = sub.add_parser("rotate")
-    p.add_argument("--config", required=True)
-    p.add_argument("--state", required=True)
-
-    # size
-    p = sub.add_parser("size")
-    p.add_argument("--config", required=True)
-    p.add_argument("--state", required=True)
-
-    # on-success
-    p = sub.add_parser("on-success")
-    p.add_argument("--config", required=True)
-    p.add_argument("--state", required=True)
-
-    # disable
-    p = sub.add_parser("disable")
-    p.add_argument("--key", required=True)
-    p.add_argument("--config", required=True)
-    p.add_argument("--state", required=True)
-
-    # available-size
-    p = sub.add_parser("available-size")
-    p.add_argument("--config", required=True)
-    p.add_argument("--state", required=True)
-
-    # classify (reads result text from --text; "-" means stdin)
-    p = sub.add_parser("classify")
-    p.add_argument("--text", required=True)
-    p.add_argument("--config", required=True)
-    p.add_argument("--state", required=True)
-
-    # retry-plan
-    p = sub.add_parser("retry-plan")
-    p.add_argument("--action", required=True)
-    p.add_argument("--config", required=True)
-    p.add_argument("--state", required=True)
-
-    args = parser.parse_args()
-
-    if args.command == "init":
-        if not os.path.exists(args.config):
-            sys.exit(0)
-        pool = KeyPool(args.config, args.state)
-        pool._apply_line(pool.init())
-
-    elif args.command == "rotate":
-        if not os.path.exists(args.config):
-            print("")
-            sys.exit(0)
-        pool = KeyPool(args.config, args.state)
-        pool._apply_line(pool.rotate())
-
-    elif args.command == "size":
-        if not os.path.exists(args.config):
-            print(0)
-            sys.exit(0)
-        pool = KeyPool(args.config, args.state)
-        print(pool.size())
-
-    elif args.command == "on-success":
-        if not os.path.exists(args.config):
-            sys.exit(0)
-        pool = KeyPool(args.config, args.state)
-        pool._apply_line(pool.on_success())
-
-    elif args.command == "disable":
-        if not os.path.exists(args.config) or not os.path.exists(args.state):
-            sys.exit(0)
-        pool = KeyPool(args.config, args.state)
-        disabled_key = pool.disable(args.key)
-        sys.exit(0 if disabled_key else 1)
-
-    elif args.command == "available-size":
-        if not os.path.exists(args.config):
-            print(0)
-            sys.exit(0)
-        pool = KeyPool(args.config, args.state)
-        print(pool.available_size())
-
-    elif args.command == "classify":
-        text = sys.stdin.read() if args.text == "-" else args.text
-        action = classify_error(text, args.config, args.state)
-        print(action)
-
-    elif args.command == "retry-plan":
-        for model, count in retry_plan(args.action, args.config, args.state):
-            print(f"{model} {count}")
+    # Inject --agent right after the subcommand name; argparse accepts
+    # interspersed optionals, so this parses cleanly alongside --config/--state.
+    return dispatch([argv[0], "--agent", agent, *argv[1:]])
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv[1:]))
