@@ -1,0 +1,3 @@
+#!/bin/bash
+SELF="$(readlink -f "$0")"
+PYTHONPATH="$(dirname "$SELF")/src" exec python3 -m llm_provider_manager.cli "$@"
