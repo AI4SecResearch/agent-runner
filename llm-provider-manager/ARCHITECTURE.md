@@ -1,6 +1,6 @@
 # 架构设计
 
-`llm-provider-manager` 是一个 **agent × provider 正交**的 LLM 切换工具。两条轴各自可插拔（仿 [agent-runner](../utils/agent-runner) 的 `backends/` + `providers/` 双轴设计），通用层不硬编码任何 agent 或 provider 名。
+`llm-provider-manager` 是一个 **agent × provider 正交**的 LLM 切换工具。两条轴（agent 轴 + provider 轴）各自可插拔，通用层不硬编码任何 agent 或 provider 名。
 
 ## 1. 架构总览
 
@@ -56,6 +56,7 @@ src/llm_provider_manager/
   env_contract.py        # 通用 shell helper（sh_export 等）
   schema.py              # providers.jsonc 的 typed schema
   use.py                 # use 命令核心 + shell hook + active.env.sh 持久化
+  keypool.py             # 运行时密钥池轮换 + 错误分类（批量消费的库入口 dispatch()）
 ```
 
 ## 3. 与各 agent 的对接
@@ -157,3 +158,25 @@ lpm() {
 | `LLM_PROVIDER_ACTIVE_ENV` | `~/.config/llm-provider-manager/active.env.sh` |
 | `LLM_PROVIDER_CLAUDE_OUT` | `~/.claude/settings.local.json` |
 | `LLM_PROVIDER_OPENCODE_OUT` | `~/.config/opencode/opencode.json` |
+
+## 9. 运行时密钥池（keypool.py）
+
+`use` 是**交互式**地在 shell 里选一个 provider+key；`keypool` 是其**运行时**对应物——给批量任务自动跨密钥池轮转、按错误禁用 key、把错误 payload 分类成恢复动作。它是**库**（入口 `dispatch()`），不是 CLI 子命令。
+
+`KeyPool` 把所有 provider 的 key 拍平成一个池，并按 active agent（`--agent`）过滤：
+
+- 跳过 `agentBlacklist` 含当前 agent 的 key；
+- 跳过对该 agent 不可用的 provider（`Agent.base_url_for(provider)` 返回空，即没有匹配协议的 baseURL）；
+- base_url 由 `Agent.base_url_for(provider)` 选协议（claude→anthropic，opencode→openai）。
+
+状态文件由**调用方提供**（`--state`）：`{current_index, disabled{idx: 过期时间}, success_count}`——运行时状态留在调用方上下文，不进 lpm 的用户配置目录。并发用 `fcntl.flock`（读 `LOCK_SH`、读-改-写 `LOCK_EX`，`json.dump` 后紧跟 `f.truncate()` 把 write 收进锁临界区）。禁用 TTL、轮换阈值取自 `settings.disableTtlHours` / `settings.rotateEvery`。
+
+模型分层：默认 `models[0]`=primary、`models[1]`=downgrade（单元素则两者相同）；可选 `primaryModel`/`downgradeModel`（provider/key 级，见 schema 校验）覆盖。
+
+错误分类复用 §4 的 provider 后端：从状态解析当前 provider → 取其 `errorHandling` 覆盖 → `providers.classify(pid, payload, handling)`。
+
+`dispatch(argv)` 子命令：`init / rotate / on-success / disable / size / available-size / classify / retry-plan`。`init/rotate/on-success` 产出一行 JSON `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）；`classify` 产出 `"action:disable"`；`retry-plan` 产出 `(tier, count)` 行。批量消费者调用这些驱动轮转与重试，例如：
+
+```bash
+python -m llm_provider_manager.keypool init --config providers.jsonc --state /tmp/s.json --agent claude
+```
