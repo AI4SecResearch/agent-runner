@@ -9,8 +9,10 @@ Designed for batch-processing pipelines where an agent (e.g. Claude Code) is inv
 | File | Purpose |
 |------|---------|
 | `runner.sh` | Generic agent invocation: `agent_once`, `_agent_once_with_watchdog`, `agent_with_retry`, `check_agent_result`. Calls 11 `agent_backend_*` ops defined by the active backend. |
+| `runner.py` | Thin adapter: forwards key-pool ops (init/rotate/disable/classify/retry-plan) to the vendored lpm (`llm_provider_manager.keypool`). |
 | `backends/<name>.sh` | Backend implementing the 11-op interface for a specific agent CLI (e.g. `claude-code.sh`, `opencode.sh`). |
 | `progress.sh` | Iteration progress: `progress_read`, `progress_write`, `progress_iterations` |
+| `llm-provider-manager/` | Vendored [llm-provider-manager](llm-provider-manager/) (git subtree) — provider/key config, key-pool rotation, error classification. |
 
 ## Quick start
 
@@ -40,7 +42,8 @@ progress_iterations my-task 10 my_callback
 | `SANDBOX` | (unset) | Set to `"1"` to use `--dangerously-skip-permissions` |
 | `AGENT_STALL_TIMEOUT` | `300` | Seconds of no output before killing a stalled process |
 | `AGENT_TIMEOUT` | `0` | Hard total timeout in seconds; `0` = unlimited |
-| `KEY_POOL_CONFIG` | `<repo>/api-keys.json` | Path to key-pool config |
+| `KEY_POOL_CONFIG` | `<workspace>/providers.jsonc` | Path to the lpm key-pool config (providers.jsonc) |
+| `LPM_SRC` | vendored `llm-provider-manager/src` | Override the lpm copy the adapter imports (e.g. point at a dev checkout) |
 
 ## Backends
 
@@ -63,33 +66,28 @@ The runner is agent-agnostic; all agent-specific behavior lives in
 
 ### Error handling codes
 
-Error codes are matched as `[NNN]` (3 digits, HTTP status — emitted by opencode) or `[NNNN]` (4 digits, upstream-specific — emitted by claude-code's zhipu path). Each provider module ships a default `error_handling` table; `api-keys.json`'s optional `error_handling` overrides it per deployment:
+Error codes are matched as `[NNN]` (3 digits, HTTP status — emitted by opencode) or `[NNNN]` (4 digits, upstream-specific — emitted by claude-code's zhipu path). Each provider module (in vendored lpm's `providers/`) ships a default error-handling table; `providers.jsonc`'s optional `errorHandling` overrides it per deployment:
 
-- claude-code + zhipu uses upstream codes (e.g., `"1305"`, `"1308"`) — defaults live in `providers/zhipu.py`.
+- claude-code + zhipu uses upstream codes (e.g., `"1305"`, `"1308"`) — defaults live in vendored `llm-provider-manager/src/llm_provider_manager/providers/zhipu.py`.
 - opencode + bailian has no upstream code; the runner falls back to HTTP status codes (e.g., `"401"`, `"429"`).
 
-## Key pool config (`api-keys.json`)
+## Key pool config (`providers.jsonc`)
 
-```json
+Provider/key config is [llm-provider-manager](llm-provider-manager/)'s `providers.jsonc` (vendored); see its [README](llm-provider-manager/README.md) / [ARCHITECTURE.md](llm-provider-manager/ARCHITECTURE.md) for the full schema. Sketch:
+
+```jsonc
 {
-  "rotate_every": 5,
-  "providers": {
-    "zhipu": {
-      "keys": ["xxxxx", "yyyyy", "zzzzz"],
-      "base_url": "https://open.bigmodel.cn/api/anthropic",
-      "models": ["glm-5-turbo", "glm-4.7"]
-    }
-  }
+  "settings": { "rotateEvery": 5, "disableTtlHours": 5 },
+  "providers": [
+    { "id": "zhipu", "type": "symmetric",
+      "baseURLs": { "anthropic": "https://open.bigmodel.cn/api/anthropic" },
+      "keys": [ { "id": "main", "key": "…" } ],
+      "models": [ {"id":"glm-5-turbo",…}, {"id":"glm-4.7",…} ] }
+  ]
 }
 ```
 
-Per-provider fields:
-- `keys` (required): list of API keys.
-- `base_url` (optional): API base url. claude-code reads it via `ANTHROPIC_BASE_URL` (anthropic protocol); opencode ignores it (endpoint/protocol live in `opencode.json`).
-- `models` (optional): ordered model list — `[0]` is the primary tier, `[1]` the downgrade tier (a single-element list makes both the same). Optional `primary_model` / `downgrade_model` override the positional defaults. When omitted, the key pool leaves the backend's `PRIMARY_MODEL` / `DOWNGRADE_MODEL` defaults in place.
-- `error_handling` (optional): map of `[NNN]`/`[NNNN]` codes → action, overriding the provider module's built-in defaults. Actions: `rotate_key`, `downgrade`, `rotate_then_downgrade`. `_default` is the fallback.
-
-The key pool rotates across all providers' keys as one flat pool; rotating into a different provider re-applies that provider's `base_url` + models (cross-provider failover). The API key env var stays backend-declared.
+Key points: `baseURLs` is a protocol→url map (the keypool picks by active agent); `models[0]`/`[1]` are primary/downgrade (overridable via `primaryModel`/`downgradeModel`); `errorHandling` overrides each provider module's built-in defaults. The pool rotates across all providers' keys as one flat pool; rotating into a different provider re-applies that provider's base_url + models (cross-provider failover). The API key env var stays backend-declared.
 
 ## Functions
 

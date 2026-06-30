@@ -1,68 +1,69 @@
 # agent-runner 架构设计
 
-`agent-runner` 是一个 **agent-agnostic / provider-agnostic** 的可靠执行层。它把"调用哪个 coding agent（claude-code / opencode / …）"和"背后是哪个 LLM provider"都做成可插拔的后端，而通用的编排逻辑（执行、看门狗、密钥池轮换、错误分类、重试、会话复用、进度跟踪）不绑定任何具体 agent 或 provider。
+`agent-runner` 是一个 **agent-agnostic** 的可靠执行层（执行、看门狗、重试、会话复用、进度跟踪），通用编排逻辑不绑定任何具体 agent。**provider / key / 密钥池 / 错误分类**不在 agent-runner 内——由 vendoring 进来的 [llm-provider-manager](llm-provider-manager/) (lpm) 提供（详见 §1 与 §5）。
 
 ## 1. 架构总览
 
-`agent-runner` 提供**编排层**（`runner.sh`）与三个**策略模块**（Agent backend / Key pool / Provider）。编排层对外暴露一组通用 API（`agent_with_retry`、`agent_once`、`agent_once_session_resume` 等），供上层任务调用。各模块的 `loop.sh`（doc-parse、baseline-vote-mapping 等）是 agent-runner 的**调用方**，不属于 agent-runner——下图用 `═══` 边界线标出范围：
+agent-runner 只保留**编排层**（`runner.sh`）与 **Agent backend**（`backends/*.sh`）。**密钥池 / provider / 错误分类 / 协议选择**由 vendoring 进来的 lpm 提供，`runner.py` 是把它们接起来的薄适配器。编排层对外暴露一组通用 API（`agent_with_retry`、`agent_once`、`agent_once_session_resume` 等），供上层任务调用。各模块的 `loop.sh`（doc-parse、baseline-vote-mapping 等）是 agent-runner 的**调用方**，不属于 agent-runner——下图用 `═══` 边界线标出范围：
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Task  (the consumer; NOT part of agent-runner)              │
-│  module loop.sh: doc-parse, baseline-vote-mapping, ...       │
-└────────────────────────────┬─────────────────────────────────┘
-                             │ calls
-                             ▼
-═════════════════════════════════════════════════════════════════
+┌────────────────────────────────────────────────────────────────┐
+│ Task (consumer; not part of agent-runner)                      │
+│ loop.sh: doc-parse, baseline-vote-mapping, ...                 │
+└───────────────────────────────┬────────────────────────────────┘
+                                │ calls
+                                ▼
+══════════════════════════════════════════════════════════════════
  agent-runner
-═════════════════════════════════════════════════════════════════
-┌──────────────────────────────────────────────────────────────┐
-│  Orchestration   (runner.sh)                                 │
-│  public API: agent_with_retry, agent_once, ...               │
-│  drives the three strategies below                           │
-└──────┬──────────────────────┬──────────────────────┬─────────┘
-       │ execute              │ classify errors      │ auth
-       │                      │                      │ (pre-run)
-┌──────▼──────────┐  ┌────────▼─────────┐  ┌─────────▼──────────┐
-│ Agent backend   │  │ Provider         │  │ Key pool           │
-│ backends/*.sh   │  │ providers/*.py   │  │ runner.py          │
-│                 │  │                  │  │                    │
-│ implements the  │  │ error payload    │  │ key rotation;      │
-│ 11-op interface │  │ -> recovery      │  │ resolve the active │
-│                 │  │ action           │  │ provider           │
-└─────────────────┘  └──────────────────┘  └────────────────────┘
-═════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════
+┌────────────────────────────────────────────────────────────────┐
+│ Orchestration (runner.sh)                                      │
+│ agent_with_retry / agent_once / agent_once_session_resume      │
+└─────────────┬───────────────────────────────┬──────────────────┘
+              │ execute                       │ keypool ops
+              ▼                               ▼
+ ┌────────────────────────┐  ┌────────────────────────────────┐
+ │ Agent backend          │  │ runner.py  (thin adapter)      │
+ │ backends/*.sh          │  │  map AGENT_BACKEND -> agent    │
+ │ 11-op exec interface:  │  │  inject --agent; forward to    │
+ │  invoke / log parse /  │  │  keypool.dispatch              │
+ │  resume / ...          │  └────────────────────────────────┘
+ │ declares env-var names:│                   │ imports
+ │  api_key_env_var       │                   ▼
+ │  base_url_env_var      │  ┌────────────────────────────────┐
+ └────────────────────────┘  │ llm-provider-manager/          │
+                             │ (vendored; git subtree)        │
+                             │  keypool.py  KeyPool+dispatch  │
+                             │  providers/  error classify    │
+                             │  agents/     base_url/proto    │
+                             └────────────────────────────────┘
+══════════════════════════════════════════════════════════════════
 ```
 
-三个策略各司其职（均在 agent-runner 内）：
+职责划分：
 
-- **Agent backend**（`backends/<name>.sh`）：实现 11-op 接口，负责具体 coding agent 的执行与日志解析。由 `$AGENT_BACKEND` 选择（默认 `claude-code`）。
-- **Key pool**（`runner.py`）：管理 API 密钥的轮换与禁用，并解析当前使用的是哪个 provider。
-- **Provider**（`providers/<name>.py`）：把错误 payload 解读为恢复动作（错误码 → 动作），按 provider 区分。
+- **Agent backend**（`backends/<name>.sh`，在 agent-runner 内）：实现 11-op 执行接口（调二进制、解析日志、续接、env-var 名声明）。由 `$AGENT_BACKEND` 选择（默认 `claude-code`）。
+- **密钥池 / provider / 错误分类 / 协议选择**（vendored `llm-provider-manager/`）：lpm 的 `keypool.py` 管轮转/禁用/分类，`providers/` 解读错误码，`agents/` 按 active agent 选 base_url 协议。`runner.py` 是适配器：找到 vendored 的 lpm、把 `$AGENT_BACKEND` 映射成 lpm agent id、注入 `--agent`、转发到 `keypool.dispatch`。
 
-三个策略互不直接调用，都由编排层统一调度；策略之间没有直连，所有数据都经编排层流转。两条主要通路：
+两条主要通路：
 
-- **错误解读**（运行失败时）：Agent backend 产出错误 payload → 编排层 → 按密钥池解析出的 provider 路由到对应 Provider 模块 → 输出恢复动作。
-- **认证/配置**（运行前）：密钥池取出当前 key + 其 provider 的 `base_url`/模型 → 编排层（`_kp_apply`）导出到 Agent backend 声明的环境变量（API key：`agent_backend_api_key_env_var`、base_url：`agent_backend_base_url_env_var`、模型 `PRIMARY_MODEL`/`DOWNGRADE_MODEL`）。
+- **错误解读**（运行失败时）：Agent backend 产出错误 payload → 编排层 → `runner.py` 适配器 → lpm `keypool.classify`（按当前 provider 路由到对应 provider 模块）→ 输出恢复动作。
+- **认证/配置**（运行前）：lpm keypool 取出当前 key + 其 provider 的 `base_url`/模型 → 产出一行 JSON → 编排层 `_kp_apply` 导出到 Agent backend 声明的环境变量（API key：`agent_backend_api_key_env_var`、base_url：`agent_backend_base_url_env_var`、模型 `PRIMARY_MODEL`/`DOWNGRADE_MODEL`）。
 
 ## 2. 文件布局
 
 ```
 utils/agent-runner/
-├── runner.sh            通用编排（纯 bash，不含任何 agent 专有逻辑）
-├── runner.py            密钥池 + 错误分类分发 + 重试计划（Python，fcntl 并发）
-├── progress.sh          断点恢复 / 迭代进度
+├── runner.sh              通用编排（纯 bash，不含任何 agent 专有逻辑）
+├── runner.py              薄适配器：转发密钥池操作到 vendored lpm（keypool.dispatch）
+├── progress.sh            断点恢复 / 迭代进度
 ├── backends/
-│   ├── claude-code.sh   Claude Code 后端（11-op 接口的实现）
-│   └── opencode.sh      OpenCode 后端
-├── providers/
-│   ├── __init__.py      公共入口 classify() + 注册表 + payload 解析
-│   ├── base.py          初步解析 extract_signals()
-│   ├── default.py       通用 code→action 映射（兜底）
-│   └── zhipu.py         zhipu provider（持 DEFAULT error_handling 表，可被 config 覆盖）
-├── example-api-keys.json 密钥池配置示例
-└── README.md / ARCHITECTURE.md
+│   ├── claude-code.sh     Claude Code 后端（11-op 接口的实现）
+│   └── opencode.sh        OpenCode 后端
+└── llm-provider-manager/  vendored lpm（git subtree）：keypool.py / providers/ / agents/ / schema.py …
 ```
+
+> provider/key 配置、密钥池轮换、错误分类都不在 agent-runner 里改——它们属于 vendored 的 `llm-provider-manager/`（一个独立项目，详见其 `ARCHITECTURE.md`）。同步上游 lpm：`git subtree pull --prefix=llm-provider-manager https://gitee.com/raverstern/llm-provider-manager.git master --squash`。
 
 `utils/common.sh`（在**父仓库**中）负责拼装：依次 source `progress.sh` → `runner.sh` → `backends/${AGENT_BACKEND:-claude-code}.sh`。模块的 `loop.sh` 只要 `source common.sh` 即获得全部能力。
 
@@ -118,58 +119,40 @@ agent_with_retry            ← 模块入口：首次尝试 + 失败重试
 
 → 切 provider（跨 provider 轮转）时，base_url + 模型随 key 一起切换；API key 变量名由 backend 声明、与 provider 无关。
 
-## 5. 密钥池核心（runner.py）
+## 5. 密钥池（`runner.py` 适配器 + vendored lpm `keypool.py`）
 
-- **配置** `api-keys.json`：`providers.{name}.{keys, base_url, models, error_handling?}`。
-  - `keys`：该 provider 的 API key 列表；`base_url`：API 的 base url（claude-code 经 `ANTHROPIC_BASE_URL` 走 anthropic 协议；opencode 的 url/协议在 `opencode.json`，此字段对其无效）。
-  - `models`：有序模型列表，positional 推导 `[0]`=primary、`[1]`=downgrade（单元素则两者相同）；可选 `primary_model`/`downgrade_model` 显式覆盖。省略则不导出、用 backend 默认。
-  - `error_handling`（可选）：覆盖 provider 模块自带的 DEFAULT 表；省略则用模块默认。
-  - API key 环境变量不在此处，由 agent 后端声明（`agent_backend_api_key_env_var`）。
-- **状态** `$DATA_DIR/key-pool-state.json`：`{current_index, disabled{idx: 过期时间}, success_count}`。
-- **并发**：`fcntl.flock`——读用 `LOCK_SH`，读-改-写用 `LOCK_EX`。`json.dump` 后紧跟 `f.truncate()`，确保 write 落在锁临界区内（见 `_modify_state` 注释）。
-- **禁用 TTL**：`DISABLE_TTL = 5h`；`disabled` 在每次 rotate/disable 时清理过期项。
+`runner.py` 是个薄适配器（~50 行）：把 lpm 的 `src/` 加进 `sys.path`（默认 vendored 的 `llm-provider-manager/src`；`$LPM_SRC` 可覆盖；`~/.local/share/llm-provider-manager/src` 兜底），把 `$AGENT_BACKEND` 映射成 lpm agent id（`claude-code`→`claude`、`opencode`→`opencode`），注入 `--agent`，转发 `sys.argv` 到 `llm_provider_manager.keypool.dispatch`。
 
-`KeyPool` 主要方法：
+密钥池的**实现**（拍平、轮转、禁用、TTL、并发、分类）全在 vendored lpm 的 `keypool.py`（详见 lpm `ARCHITECTURE.md §9`）。要点：
 
-| 方法 | 作用 |
-|---|---|
-| `init` | 初始化状态文件；产出当前 key + provider 配置的 JSON 行 |
-| `rotate` | 原子推进到下一个未禁用的 key（`LOCK_EX`）；产出 JSON 行 |
-| `on_success` | 成功计数 +1，达 `rotate_every` 阈值则主动轮换；产出 JSON 行 |
-| `disable(key)` | 按值禁用某 key，设 TTL |
-| `size` / `available_size` | 总数 / 未禁用数 |
-| `_provider_cfg_for_current()` / `_provider_for_current()` | 当前 key 索引 → (provider 名, 配置块) / provider 名（错误分类的 dispatch key） |
+- **配置**：lpm 的 `providers.jsonc`——`providers.{id}.{keys, baseURLs, models, errorHandling}` + `settings.{rotateEvery, disableTtlHours}`。路径由 `$KEY_POOL_CONFIG` / `$LLM_PROVIDER_CONFIG` 决定，默认 `<workspace>/providers.jsonc`。
+- **状态** `$DATA_DIR/key-pool-state.json`：`{current_index, disabled{idx: 过期时间}, success_count}`——调用方提供，运行时状态留在执行上下文，不进 lpm 用户配置目录。
+- **并发**：`fcntl.flock`（读 `LOCK_SH`、读-改-写 `LOCK_EX`，`json.dump` 后紧跟 `f.truncate()` 把 write 收进锁临界区）。
+- **跨 provider**：拍平所有 provider 的 key 为一个池；按 active agent 过滤（跳过 `agentBlacklist` 命中的 key、跳过无匹配协议 baseURL 的 provider）；`base_url` 由 lpm 的 `Agent.base_url_for` 按协议选（claude→anthropic，opencode→openai）。
+- **子命令**（`runner.py` 透传给 `keypool.dispatch`）：`init / rotate / on-success / disable / size / available-size / classify / retry-plan`。`init/rotate/on-success` 产出 JSON 行 `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）。
 
-子命令：`init / rotate / on-success / disable / size / available-size / classify / retry-plan`。
+## 6. 错误分类（vendored lpm `providers/`）
 
-## 6. 错误分类（providers/ + runner.py）
-
-**契约**：agent 用 `agent_backend_result_text` 产出一个 **JSON 错误 payload** `{message, code, status}`（结构化地从日志里取，不做语义解读）。provider 层负责解读。
+**契约**：agent 用 `agent_backend_result_text` 产出一个 **JSON 错误 payload** `{message, code, status}`（结构化地从日志取，不做语义解读）。解读在 lpm 的 provider 层。
 
 **流程**：
 
 ```
 agent 失败
-  → agent_backend_result_text(prefix)          产出 {message, code?, status?}（JSON）
-  → runner.sh classify_agent_error            管道给 runner.py classify --text -
-  → runner.py classify_error(payload, cfg, state)
-        provider = KeyPool._provider_for_current()       ← 当前密钥的 provider
-        handling = config[providers][provider][error_handling]   ← 作为覆盖表传入
-        return providers.classify(provider, payload, handling)
-  → providers.classify(provider, payload, handling)
-        payload = _parse_payload(payload_text)            容错（空/非JSON → {message:...}）
-        signals = base.extract_signals(payload)           ← 初步解析
-        module  = REGISTRY.get(provider, default)
-        return module.classify(signals, handling)         → "action:disable"
+  → agent_backend_result_text(prefix)             产出 {message, code?, status?}（JSON）
+  → runner.sh classify_agent_error                管道给 runner.py classify --text -
+  → runner.py 适配器 → lpm keypool.classify
+        provider = 当前 key 所属 provider（从状态解析）
+        handling = 该 provider 的 errorHandling 覆盖
+        → providers.classify(provider, payload, handling)
+            signals = base.extract_signals(payload)   ← [NNN]/[NNNN] 码提取
+            module  = REGISTRY.get(provider, default)
+            → module.classify(signals, handling)      → "action:disable"
 ```
 
-- **`base.extract_signals`**（初步解析，所有 provider 共享）：payload 有 `code` 就用它；否则在 `message` 上正则匹配 `[NNN]`（HTTP 状态）或 `[NNNN]`（上游码，如 zhipu 的 1305）。这样 claude（错误内联在 `.result` 文本里）与 opencode（结构化字段）都能被统一解析。
-- **provider 模块 `classify(signals, error_handling)`**：先 `{**模块 DEFAULT 表, **error_handling}` 合并（config 覆盖默认），再把码映射成动作；`disable = "true" if "rotate" in action`。`default` 模块无内置表，只用传入的覆盖表 + `DEFAULT_ACTION`。
-- **动作**：`rotate_key` / `downgrade` / `rotate_then_downgrade`。
-- **`REGISTRY`**（`providers/__init__.py`）：provider 名 → 模块。未注册的 provider 走 `default`。当前注册 `zhipu`。
-- provider 模块**自带 DEFAULT error_handling 表**（provider 固有知识）；`api-keys.json` 的 `error_handling` 为**可选覆盖**。码的提取逻辑（`base.extract_signals`）也在模块层。
+provider 模块（`zhipu`/`default`/…）、`extract_signals`、`REGISTRY`、码→动作映射、`errorHandling` 覆盖语义都在 vendored lpm 的 `providers/`（详见 lpm `ARCHITECTURE.md §4`）。动作词表：`rotate_key` / `downgrade` / `rotate_then_downgrade`（`disable=true` 当动作含 `rotate`）。
 
-> **agent 无关性**：同一 provider 配置下，claude 风格 payload（码在 message）与 opencode 风格 payload（码在字段）都映射到同一动作——因为解读在 provider 层，与 agent 无关。
+> **agent 无关性**：同一 provider 配置下，claude 风格 payload（码在 message）与 opencode 风格 payload（码在字段）都映射到同一动作——解读在 provider 层，与 agent 无关。
 
 ## 7. 进度跟踪（progress.sh）
 
@@ -181,20 +164,19 @@ agent 失败
 
 ## 8. 配置与环境变量
 
-**`api-keys.json`**（密钥池配置，见 `example-api-keys.json`）：
-```json
+**`providers.jsonc`**（密钥池配置，lpm 格式；见 vendored `llm-provider-manager/providers.jsonc.example` 或 lpm 文档）：
+```jsonc
 {
-  "rotate_every": 5,
-  "providers": {
-    "zhipu": {
-      "keys": ["...", "..."],
-      "base_url": "https://open.bigmodel.cn/api/anthropic",
-      "models": ["glm-5-turbo", "glm-4.7"]
-    }
-  }
+  "settings": { "rotateEvery": 5, "disableTtlHours": 5 },
+  "providers": [
+    { "id": "zhipu", "type": "symmetric",
+      "baseURLs": { "anthropic": "https://open.bigmodel.cn/api/anthropic" },
+      "keys": [ { "id": "main", "key": "…" } ],
+      "models": [ {"id":"glm-5-turbo",…}, {"id":"glm-4.7",…} ] }
+  ]
 }
 ```
-（`error_handling` 可选——zhipu 模块自带默认表，省略即用默认；config 中给出则覆盖。）
+字段（`keys` / `baseURLs` / `models` / `errorHandling` / `primaryModel` / `downgradeModel`、symmetric|asymmetric、`agentBlacklist`）由 lpm 的 schema 定义；`errorHandling` 是 provider 模块内置默认表之上的覆盖。路径由 `$KEY_POOL_CONFIG` / `$LLM_PROVIDER_CONFIG` 决定，默认 `<workspace>/providers.jsonc`。
 
 **环境变量**：
 
@@ -202,7 +184,9 @@ agent 失败
 |---|---|---|
 | `AGENT_BACKEND` | 选择 agent 后端 | `claude-code` |
 | `DATA_DIR` | 运行实例根（必填，由 common.sh 校验） | — |
-| `KEY_POOL_CONFIG` | api-keys.json 路径 | `<agent-runner>/../../api-keys.json` |
+| `KEY_POOL_CONFIG` | providers.jsonc 路径（lpm 配置） | `<workspace>/providers.jsonc` |
+| `LLM_PROVIDER_CONFIG` | 同上的 fallback（`KEY_POOL_CONFIG` 未设时） | — |
+| `LPM_SRC` | 覆盖 vendored lpm（指向另一个 lpm 的 `src/`，如 dev checkout） | vendored `llm-provider-manager/src` |
 | `SANDBOX` | `1` 跳过权限提示 | — |
 | `AGENT_STALL_TIMEOUT` / `AGENT_TIMEOUT` | 看门狗无进展/总超时（秒） | 300 / 0 |
 | `LANDLOCK_CONFIG` / `LANDLOCK_RUNNER` | 用 landlock 包裹 agent 命令 | — |
@@ -258,17 +242,14 @@ step2: agent_once_session_resume(refine_prompt, "refine-…", sid)
 ## 10. 扩展点
 
 ### 10.1 新增一个 agent
-新建 `backends/<name>.sh`，实现 11 个 `agent_backend_*` 函数（参考 opencode.sh），并在 `common.sh` 通过 `AGENT_BACKEND=<name>` 选用。无需改 `runner.sh` / `runner.py` / `providers/`。
+新建 `backends/<name>.sh`，实现 11 个 `agent_backend_*` 函数（参考 opencode.sh），并在 `common.sh` 通过 `AGENT_BACKEND=<name>` 选用。若它对应一个 lpm 里尚未注册的 agent，还需在 vendored lpm 的 `agents/` 注册该 agent + 在 `runner.py` 的 `_BACKEND_TO_AGENT` 加 `"<backend>"→"<lpm-agent-id>"`。否则无需改 `runner.sh` / `runner.py`。
 
 ### 10.2 新增一个 LLM provider
-1. 在 `providers/` 加 `<name>.py`，定义 `DEFAULT_ERROR_HANDLING` 表并实现 `classify(signals, error_handling) -> "action:disable"`（config 的 `error_handling` 作为覆盖表，合并到默认表之上）。
-2. 在 `providers/__init__.py` 的 `REGISTRY` 注册 `"<name>": <module>`。
-3. 在 `api-keys.json` 加该 provider 的 `keys` + `base_url` + `models`（`error_handling` 可选）。
-agent 不需要任何改动——只要它们能把该 provider 的错误码结构化进 payload。
+provider 模块（错误码→动作）属于 vendored lpm 的 `providers/`，**不在 agent-runner 里加**：在 lpm 那边加 `<name>.py` + 注册（见 lpm `ARCHITECTURE.md §6`），`git subtree pull` 同步进 agent-runner，再在 `providers.jsonc` 加该 provider 的 `keys`/`baseURLs`/`models`。agent 不需要任何改动——只要它们能把该 provider 的错误码结构化进 payload。
 
 ## 附：不变量与约定
 
-- **通用层不出现 agent 专有符号**：`runner.sh` / `runner.py` 中不直接出现 `claude`、`opencode`、`--output-format`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL` 等（grep 可验）。模型变量 `PRIMARY_MODEL`/`DOWNGRADE_MODEL` 是 agent 无关的，故可在通用层导出。
+- **通用层不出现 agent 专有符号**：`runner.sh` 的编排逻辑里不出现 `claude`/`opencode`/`--output-format`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 等；这些都在 `backends/` 与 vendored lpm 的 `agents/`。`runner.py` 是适配器，仅含 `$AGENT_BACKEND` → lpm agent id 的映射表（`claude-code`→`claude` 等）这一必要 glue。模型变量 `PRIMARY_MODEL`/`DOWNGRADE_MODEL` 是 agent 无关的，故可在通用层导出。
 - **`$OUTPUT_DIR` 不进后端**：后端只接收 `<prefix>`。
 - **会话续接可降级**：后端不实现 resume 时，`agent_once_session_resume` 退化为全新会话而非报错。
 - **退出码约定**：`agent_once_with_disable` → `0` 成功 / `1` 可重试 / `2` 额度耗尽且无密钥池（放弃）。
