@@ -105,6 +105,7 @@ lpm list <provider>                   # 查看某 provider 的 key/model/error h
 | `keys[].models` | asymmetric | 该 key 可用模型（symmetric 不许写） |
 | `models` | symmetric | provider 级模型列表（asymmetric 不许写） |
 | `errorHandling` | 两者 | 可选；覆盖 provider 模块内置默认的码→动作映射 |
+| `primaryModel` / `downgradeModel` | provider/key | 可选；keypool 轮转/重试用——显式指定主/次模型 id，覆盖默认的 `models[0]`/`[1]` |
 | `default` | 顶层 | 可选；`{agent?, provider, key?}`，`use` 无参时的默认选择 |
 
 ### 校验规则
@@ -166,6 +167,10 @@ lpm list zhipu                      # 列某 provider 的 key/model/error handli
 lpm init-shell-hook --rc ~/.zshrc   # 幂等装 lpm() 函数 + active.env.sh 恢复
 ```
 
+## 作为运行时库（keypool）
+
+除了交互式 `use`，lpm 还提供**运行时密钥池库** `llm_provider_manager.keypool`：给批量任务跨密钥池轮转、按错误禁用 key、把错误 payload 分类成恢复动作。它是库（入口 `dispatch()`），不是 CLI 子命令。`settings.rotateEvery`/`disableTtlHours`、`primaryModel`/`downgradeModel` 即为它配置。详见 [ARCHITECTURE.md](ARCHITECTURE.md) 的「运行时密钥池」一节。
+
 ## 故障排查
 
 - **`warning: ... appears to contain REPLACE-ME placeholders`**：用了 example 没填 key。编辑 `providers.jsonc` 填入真实 key。
@@ -179,7 +184,7 @@ lpm init-shell-hook --rc ~/.zshrc   # 幂等装 lpm() 函数 + active.env.sh 恢
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest -q           # 51 项
+.venv/bin/python -m pytest -q           # 54 项
 .venv/bin/python -m pyflakes src tests  # 零告警
 ```
 
