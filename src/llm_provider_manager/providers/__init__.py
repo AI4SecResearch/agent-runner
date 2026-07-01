@@ -4,7 +4,8 @@ Each provider module knows how to interpret its own error payloads:
   * default_error_handling — built-in code → action map (the provider's
     own defaults; does NOT depend on config files).
   * classify(signals, overrides) — merge config overrides over built-in
-    defaults, look up the extracted code, return ``"action:disable"``.
+    defaults, look up the extracted code, return an atom strategy string
+    (e.g. ``"disable,rotate"``, ``"downgrade"``).
 
 The ``errorHandling`` block in providers.jsonc is an *override layer* on
 top of these built-in defaults — providers classify correctly even with
@@ -61,7 +62,7 @@ def known_provider_ids() -> list[str]:
 def classify(
     provider_id: str, payload_text: str, overrides: dict[str, str]
 ) -> str:
-    """Full pipeline: parse payload → dispatch to backend → 'action:disable'."""
+    """Full pipeline: parse payload → dispatch to backend → atom strategy string."""
     signals = extract_signals(payload_text)
     backend = get_backend(provider_id)
     return backend.classify(signals, overrides)

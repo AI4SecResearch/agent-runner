@@ -32,7 +32,10 @@ class Signals:
 # errors that aren't the key's fault). The model tier is decided by whether
 # ``downgrade`` is present (orthogonal to rotate).
 ATOMS = ("disable", "rotate", "downgrade")
-DEFAULT_ACTION = "disable,rotate,downgrade"
+# Unknown errors (no matching code, falls through to _default) get a cautious
+# rotate only: try a different key, but don't disable the current one (the key
+# may well be fine — the error is unrecognised) or downgrade the model yet.
+DEFAULT_ACTION = "rotate"
 
 
 def _parse_payload(text: str) -> dict:

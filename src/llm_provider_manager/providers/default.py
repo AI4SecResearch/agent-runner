@@ -22,10 +22,8 @@ class DefaultProvider:
         merged.update(overrides)
         merged.setdefault("_default", DEFAULT_ACTION)
         code = signals.code or signals.status
-        action = (
+        return (
             merged.get(code, merged.get("_default", DEFAULT_ACTION))
             if code
             else merged.get("_default", DEFAULT_ACTION)
         )
-        disable = "true" if "disable" in action else "false"
-        return f"{action}:{disable}"
