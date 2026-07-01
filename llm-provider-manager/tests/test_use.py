@@ -194,14 +194,47 @@ def test_init_shell_hook_idempotent(tmp_path: Path):
     rc = tmp_path / ".zshrc"
     rc.write_text("export FOO=bar\n")
     assert use_mod.init_shell_hook(str(rc)) is True
-    assert use_mod.init_shell_hook(str(rc)) is False  # second time no-op
+    assert use_mod.init_shell_hook(str(rc)) is False  # second time no-op (same content)
     content = rc.read_text()
     assert "export FOO=bar" in content
     assert use_mod.HOOK_MARKER_BEGIN in content
     assert "lpm()" in content
-    assert 'command lpm use' in content
+    # hook invokes lpm by absolute path (not the bare name), so it works without
+    # ~/.local/bin on PATH
+    assert "command $HOME/.local/bin/lpm use" in content
+    assert 'command $HOME/.local/bin/lpm "$@"' in content
     assert "source \"$LLM_PROVIDER_ACTIVE_ENV\"" in content
-    assert "lpm use" in content
+    assert "$HOME/.local/bin/lpm use" in content  # the rc-time init call
+
+
+def test_init_shell_hook_replaces_stale_block(tmp_path: Path):
+    """A pre-existing block is removed and re-written with the current template.
+
+    Re-running install must propagate hook upgrades (e.g. a new LPM_BIN path)
+    instead of leaving the old block behind.
+    """
+    rc = tmp_path / ".zshrc"
+    rc.write_text(
+        "export FOO=bar\n\n"
+        f"{use_mod.HOOK_MARKER_BEGIN}\n"
+        "# stale old hook using the bare `lpm` name\n"
+        "lpm() { command lpm \"$@\"; }\n"
+        f"{use_mod.HOOK_MARKER_END}\n"
+        "export BAZ=qux\n"
+    )
+    changed = use_mod.init_shell_hook(str(rc))
+    assert changed is True
+    content = rc.read_text()
+    # surrounding lines preserved
+    assert "export FOO=bar" in content
+    assert "export BAZ=qux" in content
+    # stale block gone, new block present (exactly once)
+    assert "stale old hook" not in content
+    assert content.count(use_mod.HOOK_MARKER_BEGIN) == 1
+    assert content.count(use_mod.HOOK_MARKER_END) == 1
+    assert "command $HOME/.local/bin/lpm" in content
+    # only one lpm() definition remains
+    assert content.count("lpm()") == 1
 
 
 def test_write_active_env_creates_file_with_0600(sample_config_file: Path, tmp_path: Path):

@@ -44,15 +44,24 @@ def test_extract_signals_http_status_3digit():
 
 def test_classify_zhipu_builtin_defaults_no_config():
     # zhipu classifies correctly with empty overrides (built-in defaults)
+    assert providers_mod.classify("zhipu", '{"code": "1301"}', {}) == "rotate,downgrade:false"
     assert providers_mod.classify("zhipu", '{"code": "1305"}', {}) == "downgrade:false"
-    assert providers_mod.classify("zhipu", '{"code": "1308"}', {}) == "rotate_key:true"
-    assert providers_mod.classify("zhipu", '{"code": "1310"}', {}) == "rotate_key:true"
+    assert providers_mod.classify("zhipu", '{"code": "1308"}', {}) == "disable,rotate:true"
+    assert providers_mod.classify("zhipu", '{"code": "1310"}', {}) == "disable,rotate:true"
     # unknown code → _default
-    assert providers_mod.classify("zhipu", '{"code": "9999"}', {}) == "rotate_then_downgrade:true"
+    assert providers_mod.classify("zhipu", '{"code": "9999"}', {}) == "disable,rotate,downgrade:true"
+
+
+def test_classify_zhipu_1301_does_not_disable():
+    # content-safety — rotate+downgrade but the key isn't bad, so disable flag is false
+    result = providers_mod.classify("zhipu", '{"code": "1301"}', {})
+    action, flag = result.rsplit(":", 1)
+    assert "rotate" in action and "downgrade" in action
+    assert flag == "false"
 
 
 def test_classify_zhipu_config_overrides_builtin():
-    # config override changes 1308 from rotate_key to downgrade
+    # config override changes 1308 from disable,rotate to downgrade
     result = providers_mod.classify(
         "zhipu", '{"code": "1308"}', {"1308": "downgrade"})
     assert result == "downgrade:false"
@@ -61,55 +70,57 @@ def test_classify_zhipu_config_overrides_builtin():
 def test_classify_unknown_provider_falls_to_default():
     # unregistered provider → DefaultProvider → _default action
     result = providers_mod.classify("unknown", '{"code": "429"}', {})
-    assert result == "rotate_then_downgrade:true"
+    assert result == "disable,rotate,downgrade:true"
 
 
 def test_classify_bailian_empty_builtin_uses_config():
-    # bailian has empty built-in; config _default=rotate_key → rotate
+    # bailian has empty built-in; config _default=disable,rotate → disable+rotate
     result = providers_mod.classify(
-        "bailian", '{"code": "429"}', {"_default": "rotate_key"})
-    assert result == "rotate_key:true"
+        "bailian", '{"code": "429"}', {"_default": "disable,rotate"})
+    assert result == "disable,rotate:true"
 
 
 def test_classify_bailian_no_config_uses_default_fallback():
-    # bailian with no config → DefaultProvider._default = rotate_then_downgrade
+    # bailian with no config → DefaultProvider._default
     result = providers_mod.classify("bailian", '{"code": "429"}', {})
-    assert result == "rotate_then_downgrade:true"
+    assert result == "disable,rotate,downgrade:true"
 
 
 def test_classify_disable_flag():
-    # rotate_* → disable=true; downgrade → disable=false
+    # disable atom present → disable=true; absent → false
     assert providers_mod.classify("zhipu", '{"code": "1308"}', {}).endswith(":true")
     assert providers_mod.classify("zhipu", '{"code": "1305"}', {}).endswith(":false")
+    assert providers_mod.classify("zhipu", '{"code": "1301"}', {}).endswith(":false")
 
 
 # ── effective_error_handling ──────────────────────────────────────
 
 def test_effective_error_handling_zhipu_no_overrides():
     eff = providers_mod.effective_error_handling("zhipu", {})
+    assert eff["1301"] == "rotate,downgrade"
     assert eff["1305"] == "downgrade"
-    assert eff["1308"] == "rotate_key"
-    assert eff["_default"] == "rotate_then_downgrade"
+    assert eff["1308"] == "disable,rotate"
+    assert eff["_default"] == "disable,rotate,downgrade"
 
 
 def test_effective_error_handling_zhipu_with_overrides():
     eff = providers_mod.effective_error_handling(
-        "zhipu", {"1308": "downgrade", "9999": "rotate_key"})
-    assert eff["1308"] == "downgrade"  # overridden
-    assert eff["1305"] == "downgrade"  # built-in preserved
-    assert eff["9999"] == "rotate_key"  # config-only code added
+        "zhipu", {"1308": "downgrade", "9999": "disable,rotate"})
+    assert eff["1308"] == "downgrade"           # overridden
+    assert eff["1305"] == "downgrade"            # built-in preserved
+    assert eff["9999"] == "disable,rotate"       # config-only code added
 
 
 def test_effective_error_handling_bailian_empty_builtin():
-    eff = providers_mod.effective_error_handling("bailian", {"_default": "rotate_key"})
-    assert eff == {"_default": "rotate_key"}
+    eff = providers_mod.effective_error_handling("bailian", {"_default": "disable,rotate"})
+    assert eff == {"_default": "disable,rotate"}
 
 
 def test_effective_error_handling_always_has_default():
     # even with empty builtin + empty config, _default is guaranteed
     eff = providers_mod.effective_error_handling("bailian", {})
     assert "_default" in eff
-    assert eff["_default"] == "rotate_then_downgrade"
+    assert eff["_default"] == "disable,rotate,downgrade"
 
 
 # ── registry ──────────────────────────────────────────────────────

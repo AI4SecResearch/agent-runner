@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .base import Signals, extract_signals
+from .base import DEFAULT_ACTION, Signals, extract_signals
 
 
 class ProviderBackend(Protocol):
@@ -78,5 +78,5 @@ def effective_error_handling(
     backend = get_backend(provider_id)
     merged = dict(backend.default_error_handling)
     merged.update(overrides)
-    merged.setdefault("_default", "rotate_then_downgrade")
+    merged.setdefault("_default", DEFAULT_ACTION)
     return merged

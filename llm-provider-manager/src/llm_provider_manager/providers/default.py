@@ -8,9 +8,7 @@ under zero config).
 
 from __future__ import annotations
 
-from .base import Signals
-
-DEFAULT_ACTION = "rotate_then_downgrade"
+from .base import DEFAULT_ACTION, Signals
 
 
 class DefaultProvider:
@@ -29,5 +27,5 @@ class DefaultProvider:
             if code
             else merged.get("_default", DEFAULT_ACTION)
         )
-        disable = "true" if "rotate" in action else "false"
+        disable = "true" if "disable" in action else "false"
         return f"{action}:{disable}"

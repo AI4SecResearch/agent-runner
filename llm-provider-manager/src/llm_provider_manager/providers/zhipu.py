@@ -5,12 +5,17 @@ zhipu path emits, and opencode's zhipuai-coding-plan path surfaces via
 ``responseBody.error.code``). These defaults let zhipu classify correctly
 with NO ``errorHandling`` block in providers.jsonc — config is an override
 layer, not a dependency.
+
+Strategies are composable atom strings (see providers/base.py ATOMS):
+``disable`` / ``rotate`` / ``downgrade``. ``disable`` is explicit, so
+content-safety codes (1301/1305) that aren't the key's fault rotate
+and/or downgrade WITHOUT disabling the key.
 """
 
 from __future__ import annotations
 
-from .base import Signals
-from .default import DefaultProvider, DEFAULT_ACTION
+from .base import DEFAULT_ACTION, Signals
+from .default import DefaultProvider
 
 
 class ZhipuProvider(DefaultProvider):
@@ -18,10 +23,11 @@ class ZhipuProvider(DefaultProvider):
 
     id = "zhipu"
     default_error_handling = {
-        "1305": "downgrade",                 # content / sensitive
-        "1308": "rotate_key",                # quota-related
-        "1310": "rotate_key",
-        "_default": "rotate_then_downgrade",
+        "1301": "rotate,downgrade",          # content safety — not the key's fault
+        "1305": "downgrade",                 # traffic overload — same key, smaller model
+        "1308": "disable,rotate",            # quota — disable bad key, move on
+        "1310": "disable,rotate",
+        "_default": "disable,rotate,downgrade",
     }
 
     def classify(self, signals: Signals, overrides: dict[str, str]) -> str:
@@ -33,5 +39,5 @@ class ZhipuProvider(DefaultProvider):
             if code
             else merged.get("_default", DEFAULT_ACTION)
         )
-        disable = "true" if "rotate" in action else "false"
+        disable = "true" if "disable" in action else "false"
         return f"{action}:{disable}"

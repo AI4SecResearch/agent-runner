@@ -101,6 +101,21 @@ class KeyPool:
     def _keys(self):
         return [e[0] for e in self._entries()]
 
+    def _entry_at(self, idx):
+        """Return the (key_value, provider_id, key_id) entry at idx, or None."""
+        entries = self._entries()
+        if not entries:
+            return None
+        return entries[idx % len(entries)]
+
+    @staticmethod
+    def _label(entry):
+        """Compact 'provider/key_id' label for a pool entry (for debug logs)."""
+        if entry is None:
+            return "?"
+        _, pid, kid = entry
+        return f"{pid}/{kid}"
+
     def _current_entry(self):
         entries = self._entries()
         if not entries:
@@ -242,8 +257,9 @@ class KeyPool:
         if not keys:
             return ""
         self._init_state()
+        idx = self._read_state().get("current_index", 0)
         key = self.current_key()
-        _dbg(f"init: key[{self._read_state().get('current_index', 0)}]={key[:8]}...")
+        _dbg(f"init: [{idx}] ({self._label(self._entry_at(idx))}) key={key[:8]}...")
         return key
 
     def rotate(self):
@@ -263,7 +279,8 @@ class KeyPool:
             while new_idx in disabled:
                 new_idx = (new_idx + 1) % len(keys)
             data["current_index"] = new_idx
-            _dbg(f"rotate: {cur}→{new_idx} key={keys[new_idx][:8]}... disabled={disabled}")
+            _dbg(f"rotate: {cur}→{new_idx} ({self._label(self._entry_at(new_idx))}) "
+                 f"key={keys[new_idx][:8]}... disabled={disabled}")
             return keys[new_idx]
 
         return self._modify_state(_rotate)
@@ -278,7 +295,7 @@ class KeyPool:
         try:
             idx = keys.index(key_str)
         except ValueError:
-            _dbg(f"disable: key {key_str[:8]}... not found in pool")
+            _dbg(f"disable: key={key_str[:8]}... not found in pool")
             return ""
 
         ttl = self.config.settings.disable_ttl_hours * 3600
@@ -287,7 +304,8 @@ class KeyPool:
             self._purge_expired(data)
             expiry = time.time() + ttl
             data.setdefault("disabled", {})[str(idx)] = self._format_expiry(expiry)
-            _dbg(f"disable: key[{idx}]={key_str[:8]}... until={self._format_expiry(expiry)}")
+            _dbg(f"disable: [{idx}] ({self._label(self._entry_at(idx))}) "
+                 f"key={key_str[:8]}... until={self._format_expiry(expiry)}")
             return key_str
 
         return self._modify_state(_disable)
@@ -323,7 +341,8 @@ class KeyPool:
             while new_idx in disabled:
                 new_idx = (new_idx + 1) % len(keys)
             data["current_index"] = new_idx
-            _dbg(f"on_success: count={count}/{rotate_every}, rotating {cur}→{new_idx} key={keys[new_idx][:8]}...")
+            _dbg(f"on_success: count={count}/{rotate_every}, rotating {cur}→{new_idx} "
+                 f"({self._label(self._entry_at(new_idx))}) key={keys[new_idx][:8]}...")
             return keys[new_idx]
 
         return self._modify_state(_on_success)
@@ -346,26 +365,46 @@ def classify_error(payload_text, config_path, state_path, *, agent_id):
     return providers_mod.classify(provider_id, payload_text, handling)
 
 
-def retry_plan(action, config_path, state_path, *, agent_id):
-    """Generate retry plan using current available key count from state.
+def react(payload_text, config_path, state_path, *, agent_id):
+    """Decide ONE recovery step for the given error (reactive retry).
 
-    Falls back to single-key downgrade when config is absent.
-    Returns empty list when all keys are disabled.
+    The reactive counterpart to the old pre-planned ``retry_plan``: instead of
+    laying out the whole retry sequence up front, the runner calls this after
+    each failure and applies just the returned step, then re-classifies the
+    next error. Returns either an atom strategy string (e.g. ``"disable,rotate"``,
+    ``"downgrade"``) or ``"stop"`` when no recovery is possible.
+
+    Stop rules (conservative, avoids infinite loops):
+      * pool exhausted (available=0) AND strategy needs rotate → no key to move to.
+      * no key pool AND strategy needs rotate → strip rotate; if the remainder
+        has no actionable atoms either → stop.
+      * strategy carries no actionable atom at all (e.g. bare ``disable`` with
+        an empty pool) → stop.
     """
-    if os.path.exists(config_path):
+    action_flag = classify_error(payload_text, config_path, state_path, agent_id=agent_id)
+    action = action_flag.rsplit(":", 1)[0]
+
+    has_pool = os.path.exists(config_path)
+    available = 0
+    if has_pool:
         pool = KeyPool(config_path, state_path, agent_id=agent_id)
-        n = pool.available_size()
-        if n == 0:
-            _dbg(f"retry_plan: action={action} pool_size=0, no available keys")
-            return []
-    else:
-        n = 1
-    _dbg(f"retry_plan: action={action} pool_size={n}")
-    if action == "rotate_key":
-        return [("primary", n)]
-    if action == "downgrade":
-        return [("downgrade", n)]
-    return [("primary", n), ("downgrade", n)]  # rotate_then_downgrade
+        available = pool.available_size()
+
+    # No key pool → disable/rotate are meaningless (nothing to disable, nothing
+    # to rotate to); only downgrade (same key, smaller model) can help.
+    if not has_pool:
+        action = ",".join(a for a in action.split(",") if a == "downgrade")
+    # Pool present but exhausted → can't rotate either; downgrade still possible.
+    elif "rotate" in action and available == 0:
+        action = ",".join(a for a in action.split(",") if a != "rotate")
+
+    actionable = any(a in ("rotate", "downgrade") for a in action.split(",") if a)
+    if not actionable:
+        _dbg(f"react: action={action_flag} available={available} → stop")
+        return "stop"
+
+    _dbg(f"react: action={action_flag} available={available} → {action}")
+    return action
 
 
 def _resolve_agent(agent_id, config_path):
@@ -398,11 +437,13 @@ def dispatch(argv) -> int:
         common(sub.add_parser(name))
     p = sub.add_parser("disable"); common(p); p.add_argument("--key", required=True)
     p = sub.add_parser("classify"); common(p); p.add_argument("--text", required=True)
-    p = sub.add_parser("retry-plan"); common(p); p.add_argument("--action", required=True)
+    p = sub.add_parser("react"); common(p); p.add_argument("--text", required=True)
 
     args = parser.parse_args(argv)
     agent_id = _resolve_agent(args.agent, args.config)
     has_config = os.path.exists(args.config)
+    if not has_config:
+        _dbg(f"no config at {args.config}; {args.command} is a no-op")
 
     def pool():
         return KeyPool(args.config, args.state, agent_id=agent_id)
@@ -431,9 +472,9 @@ def dispatch(argv) -> int:
     elif args.command == "classify":
         text = sys.stdin.read() if args.text == "-" else args.text
         print(classify_error(text, args.config, args.state, agent_id=agent_id))
-    elif args.command == "retry-plan":
-        for model, count in retry_plan(args.action, args.config, args.state, agent_id=agent_id):
-            print(f"{model} {count}")
+    elif args.command == "react":
+        text = sys.stdin.read() if args.text == "-" else args.text
+        print(react(text, args.config, args.state, agent_id=agent_id))
     return 0
 
 

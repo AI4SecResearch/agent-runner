@@ -30,6 +30,7 @@ lpm use <provider> <key>              # 默认 agent + 指定 provider/key
 lpm use --agent opencode <provider>   # 切换 opencode 的 provider
 lpm list                              # 查看可选 provider
 lpm list <provider>                   # 查看某 provider 的 key/model/error handling
+lpm status                            # 查看各 agent 当前实际生效的配置
 ```
 
 之后启动 `claude` 或 `opencode` 即用上当前选择。新终端自动恢复上次切换。
@@ -38,7 +39,7 @@ lpm list <provider>                   # 查看某 provider 的 key/model/error h
 
 顶层 `providers.jsonc`（JSONC，支持 `//` 与 `/* */` 注释）：
 
-```jsonc
+```json
 {
   "default": { "agent": "claude", "provider": "zhipu", "key": "grq" },  // use 无参时的默认
   "providers": [ /* 模板 A 或 B */ ]
@@ -47,7 +48,7 @@ lpm list <provider>                   # 查看某 provider 的 key/model/error h
 
 ### 模板 A — symmetric（所有 key 共享同一组模型）
 
-```jsonc
+```json
 {
   "id": "zhipu",
   "type": "symmetric",
@@ -66,14 +67,14 @@ lpm list <provider>                   # 查看某 provider 的 key/model/error h
   ],
   "errorHandling": {              // 可选；覆盖 provider 模块的内置默认
     "1305": "downgrade",
-    "_default": "rotate_then_downgrade"
+    "_default": "disable,rotate,downgrade"
   }
 }
 ```
 
 ### 模板 B — asymmetric（不同 key 可用模型不同）
 
-```jsonc
+```json
 {
   "id": "bailian",
   "type": "asymmetric",
@@ -84,7 +85,7 @@ lpm list <provider>                   # 查看某 provider 的 key/model/error h
     { "id": "grq", "key": "sk-bailian-aaa",
       "models": [ { "id": "glm-5.2", "displayName": "GLM-5.2", "context": 1000000, "output": 131072 } ] }
   ],
-  "errorHandling": { "_default": "rotate_key" }   // 可选
+  "errorHandling": { "_default": "disable,rotate" }   // 可选
 }
 ```
 
@@ -104,7 +105,7 @@ lpm list <provider>                   # 查看某 provider 的 key/model/error h
 | `keys[].agentBlacklist` | 两者 | 可选；禁止该 key 用于指定 agent |
 | `keys[].models` | asymmetric | 该 key 可用模型（symmetric 不许写） |
 | `models` | symmetric | provider 级模型列表（asymmetric 不许写） |
-| `errorHandling` | 两者 | 可选；覆盖 provider 模块内置默认的码→动作映射 |
+| `errorHandling` | 两者 | 可选；覆盖 provider 模块内置默认的码→动作映射。值是逗号组合的原子串：`disable`（禁用当前 key）、`rotate`（换下一个 key）、`downgrade`（换次级模型）。如 `"disable,rotate"`、`"rotate,downgrade"`。`disable` 是显式原子——不写就不禁用 key（内容安全类错误可只 `rotate,downgrade` 而不浪费 key） |
 | `primaryModel` / `downgradeModel` | provider/key | 可选；keypool 轮转/重试用——显式指定主/次模型 id，覆盖默认的 `models[0]`/`[1]` |
 | `default` | 顶层 | 可选；`{agent?, provider, key?}`，`use` 无参时的默认选择 |
 
@@ -167,6 +168,53 @@ lpm list zhipu                      # 列某 provider 的 key/model/error handli
 lpm init-shell-hook --rc ~/.zshrc   # 幂等装 lpm() 函数 + active.env.sh 恢复
 ```
 
+### `status`
+
+查看**当前终端、当前目录**下各 agent **实际生效**的配置。区别于 `list`（看配置文件里的可选项），`status` 看的是"这个 shell 里 agent 真正会用什么"。
+
+它读三层，优先级高→低：
+
+1. **项目/用户配置文件里的字面量**——`./opencode.json`、`.claude/settings{.local,}.json`、`~/.claude/settings.local.json` 等。`lpm agent --inline` 烘焙的真实 key/model 在此，**会覆盖** env 变量。
+2. **进程环境变量**——`lpm use` 导出的值（继承自父 shell）。
+3. **active.env.sh**——仅作 drift 对比基准（不是"实际配置"来源）。
+
+```bash
+lpm status
+```
+
+输出示例：
+
+```
+agent: claude
+  status:        active
+  provider:      zhipu
+  key:           backup
+  model:         glm-5.2
+  effective:     env
+  env:
+    ANTHROPIC_BASE_URL           = https://zhipu/anthropic
+    ANTHROPIC_AUTH_TOKEN         = sk-zhi…up   (drift: active.env.sh=sk-zhi…ain)
+    ANTHROPIC_DEFAULT_OPUS_MODEL = glm-5.2
+
+agent: opencode
+  status:        active
+  provider:      bailian
+  key:           account-b
+  model:         glm-4.6
+  effective:     config-file:./opencode.json   ← 项目配置覆盖了 env
+  env:
+    LLM_KEY_BAILIAN_ACCOUNT_B = sk-bai…ard-b   (overridden by ./opencode.json)
+    LLM_DEFAULT_MODEL         = bailian-account-b/glm-4.6  (overridden by ./opencode.json)
+
+active.env.sh: ~/.config/llm-provider-manager/active.env.sh
+```
+
+上面两个 agent 各示一种典型情况：claude 的 token 与 `active.env.sh` 记录不一致 → **drift**；opencode 的值由项目 `./opencode.json` 覆盖了 env → **override**（不算 drift）。
+
+- `effective` 标注值来自哪层（`env` / `config-file:<path>` / `none`）。
+- **`drift`**（漂移）= 本终端当前 env 的值与 `active.env.sh` 记录的值不一致。常见原因：另一个终端 `lpm use` 改写了 `active.env.sh`，但本终端没 `source`；或手动 `export` 改了某个变量。后果是新开终端会 `source` 到**旧值**，与本终端不同步。消除方法：在本终端再跑一次 `lpm use`（或 `source "$LLM_PROVIDER_ACTIVE_ENV"`）。注意：项目配置文件覆盖 env 是**正常的**（标 `overridden by`），不算 drift。
+- 真实 API key 在输出中脱敏（只显示首尾）。
+
 ## 作为运行时库（keypool）
 
 除了交互式 `use`，lpm 还提供**运行时密钥池库** `llm_provider_manager.keypool`：给批量任务跨密钥池轮转、按错误禁用 key、把错误 payload 分类成恢复动作。它是库（入口 `dispatch()`），不是 CLI 子命令。`settings.rotateEvery`/`disableTtlHours`、`primaryModel`/`downgradeModel` 即为它配置。详见 [ARCHITECTURE.md](ARCHITECTURE.md) 的「运行时密钥池」一节。
@@ -177,14 +225,14 @@ lpm init-shell-hook --rc ~/.zshrc   # 幂等装 lpm() 函数 + active.env.sh 恢
 - **`error: no provider given and no 'default' configured`**：`use` 无参且未配 `default`。在 providers.jsonc 加 `default`，或 `lpm use <provider>`。
 - **`error: unknown agent 'xxx'`**：`--agent` 传了未注册的 agent id。
 - **Claude 没用上 provider**：确认 `lpm use` 已执行（`echo $ANTHROPIC_AUTH_TOKEN`）；确认当前 provider 有 `anthropic` baseURL 且 key 未 claude-blacklist。
-- **opencode provider 报 apiKey 空**：该 key 被 opencode-blacklist；`lpm list` 查看；换 provider 或换 key。
+- **`lpm status` 显示的与预期不符**：看 `effective` 字段——若为 `config-file:./opencode.json` 等，说明项目私有配置文件覆盖了 env（`lpm agent --inline` 烘焙的）；若标注 `drift`，说明本终端 env 与 `active.env.sh` 不一致，重新 `lpm use` 或 `source` 一次即可。
 - **`lpm: command not found`**：跑安装脚本，或手动 `ln -sf ~/.local/share/llm-provider-manager/llm-provider-manager ~/.local/bin/lpm`。
 - **新终端没恢复上次选择**：确认 shell rc 有 hook 块（`lpm init-shell-hook --rc ~/.zshrc`）；确认 `active.env.sh` 存在（`lpm use` 一次后生成）。
 
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest -q           # 54 项
+.venv/bin/python -m pytest -q           # 77 项
 .venv/bin/python -m pyflakes src tests  # 零告警
 ```
 
