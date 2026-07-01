@@ -143,18 +143,26 @@ def write_active_env(plan: UsePlan, path: str | None = None) -> str:
 HOOK_MARKER_BEGIN = "# >>> llm-provider-manager >>>"
 HOOK_MARKER_END = "# <<< llm-provider-manager <<<"
 
+# Absolute path to the lpm wrapper, injected into the hook template below.
+# The hook invokes lpm by this path rather than the bare `lpm` name so it
+# keeps working when ~/.local/bin is absent from PATH (non-interactive
+# shells, scripts, cron, sub-shells with a reset PATH, …). `lpm()` is still
+# defined by name for interactive typing; only its internal forwarding (and
+# the rc-time init call) use the absolute path.
+LPM_BIN = "$HOME/.local/bin/lpm"
+
 HOOK_TEMPLATE = """\
 {begin}
 # restore last selection (or initialise from config 'default')
 export LLM_PROVIDER_ACTIVE_ENV="$HOME/.config/llm-provider-manager/active.env.sh"
-[ -f "$LLM_PROVIDER_ACTIVE_ENV" ] || eval "$(lpm use 2>/dev/null)"
+[ -f "$LLM_PROVIDER_ACTIVE_ENV" ] || eval "$({bin} use 2>/dev/null)"
 source "$LLM_PROVIDER_ACTIVE_ENV" 2>/dev/null
 # lpm: intercepts 'use' to source active.env.sh after running; all else passes through
 lpm() {{
     if [ "$1" = "use" ]; then
-        command lpm use "${{@:2}}" && source "$LLM_PROVIDER_ACTIVE_ENV"
+        command {bin} use "${{@:2}}" && source "$LLM_PROVIDER_ACTIVE_ENV"
     else
-        command lpm "$@"
+        command {bin} "$@"
     fi
 }}
 {end}
@@ -162,19 +170,38 @@ lpm() {{
 
 
 def build_hook_block() -> str:
-    return HOOK_TEMPLATE.format(begin=HOOK_MARKER_BEGIN, end=HOOK_MARKER_END)
+    return HOOK_TEMPLATE.format(begin=HOOK_MARKER_BEGIN, end=HOOK_MARKER_END, bin=LPM_BIN)
 
 
 def init_shell_hook(rc_path: str) -> bool:
-    """Idempotently add the hook block to a shell rc file.
+    """Install or refresh the hook block in a shell rc file.
 
-    Returns True if the file was modified, False if already present.
+    Re-runs are idempotent AND self-updating: an existing block (text between
+    the markers, inclusive) is removed and re-written with the current
+    template, so bumping the hook (e.g. a new LPM_BIN path) propagates on the
+    next ``lpm init-shell-hook`` / install instead of leaving stale blocks
+    behind. Returns True if the file was modified, False if the block was
+    already up to date.
     """
     rc = Path(rc_path).expanduser()
     block = build_hook_block()
     content = rc.read_text(encoding="utf-8") if rc.exists() else ""
-    if HOOK_MARKER_BEGIN in content:
-        return False
+
+    # Replace an existing block (markers inclusive) with the current template.
+    if HOOK_MARKER_BEGIN in content and HOOK_MARKER_END in content:
+        pre, _, rest = content.partition(HOOK_MARKER_BEGIN)
+        _, _, post = rest.partition(HOOK_MARKER_END)
+        new_content = pre.rstrip("\n") + "\n\n" + block
+        if post.strip():
+            new_content += "\n" + post.lstrip("\n")
+        new_content = new_content.rstrip("\n") + "\n"
+        if new_content == content:
+            return False
+        rc.parent.mkdir(parents=True, exist_ok=True)
+        rc.write_text(new_content, encoding="utf-8")
+        return True
+
+    # No existing block — append a fresh one.
     new_content = content
     if new_content and not new_content.endswith("\n"):
         new_content += "\n"

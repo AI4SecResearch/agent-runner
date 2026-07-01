@@ -33,7 +33,7 @@ def sample_config_dict() -> dict:
                     {"id": "glm-5.2", "displayName": "GLM-5.2", "context": 1000000, "output": 131072},
                     {"id": "glm-5-turbo", "displayName": "GLM-5 Turbo", "context": 128000, "output": 16384},
                 ],
-                "errorHandling": {"1308": "rotate_key", "_default": "rotate_then_downgrade"},
+                "errorHandling": {"1308": "disable,rotate", "_default": "disable,rotate,downgrade"},
             },
             {
                 "id": "bailian",
@@ -47,7 +47,7 @@ def sample_config_dict() -> dict:
                     {"id": "account-b", "key": "sk-bailian-b",
                      "models": [{"id": "glm-4.6", "displayName": "GLM-4.6", "context": 128000, "output": 16384}]},
                 ],
-                "errorHandling": {"_default": "rotate_key"},
+                "errorHandling": {"_default": "disable,rotate"},
             },
         ],
     }

@@ -24,6 +24,17 @@ class Signals:
     message: str
 
 
+# ── recovery action vocabulary ────────────────────────────────────
+# Strategies are composable: a comma-joined string of these atoms, applied
+# left-to-right in one retry step. ``disable`` (mark current key bad for TTL)
+# is a first-class atom, not an implicit side-effect of ``rotate`` — so a
+# strategy can rotate to a fresh key WITHOUT disabling (e.g. content-safety
+# errors that aren't the key's fault). The model tier is decided by whether
+# ``downgrade`` is present (orthogonal to rotate).
+ATOMS = ("disable", "rotate", "downgrade")
+DEFAULT_ACTION = "disable,rotate,downgrade"
+
+
 def _parse_payload(text: str) -> dict:
     """Tolerant parse: empty/non-JSON → {'message': <text>}."""
     if not text or not text.strip():

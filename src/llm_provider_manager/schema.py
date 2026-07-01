@@ -20,9 +20,11 @@ Protocol = str  # "anthropic" | "openai" | other
 
 KNOWN_PROTOCOLS = ("anthropic", "openai")
 
-# Action vocabulary (mirrors agent-runner/runner.py).
-Actions = Literal["rotate_key", "downgrade", "rotate_then_downgrade"]
-DEFAULT_ACTION: Actions = "rotate_then_downgrade"
+# Recovery action vocabulary: composable atom strings defined in
+# providers/base.py (ATOMS = disable/rotate/downgrade). errorHandling values
+# in providers.jsonc are comma-joined atom strings, e.g. "disable,rotate".
+# The canonical default lives in providers.base.DEFAULT_ACTION (not here) so
+# the vocabulary has a single source next to the classify logic that consumes it.
 
 
 def _known_agents() -> list[str]:

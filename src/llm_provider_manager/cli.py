@@ -19,6 +19,7 @@ import unicodedata
 from . import agents as agents_mod
 from . import config as config_mod
 from . import providers as providers_mod
+from . import status as status_mod
 from . import use as use_mod
 
 # Default path to the user's provider config (overridable via env/flag).
@@ -221,15 +222,32 @@ def _show_error_handling(p) -> None:
         print(f"    {code} → {action}  [{src}]")
 
 
+# ── status ─────────────────────────────────────────────────────────
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show what each agent is *actually* using in this shell/dir.
+
+    Reads the live process env (inherited from the parent shell) and any
+    project/user agent config files, not just ``active.env.sh`` — so it
+    reflects the real current terminal state, including overrides baked in
+    by ``lpm agent --inline``.
+    """
+    cfg = _load_config(args.config)
+    statuses = status_mod.probe_all(cfg)
+    sys.stdout.write(status_mod.render_status(cfg, statuses))
+    return 0
+
+
 # ── init-shell-hook ────────────────────────────────────────────────
 
 def cmd_init_shell_hook(args: argparse.Namespace) -> int:
     rc_path = _expand(args.rc)
     changed = use_mod.init_shell_hook(rc_path)
     if changed:
-        print(f"added hook to {rc_path}", file=sys.stderr)
+        # covers both fresh install and refreshing a stale/older block
+        print(f"installed hook in {rc_path}", file=sys.stderr)
     else:
-        print(f"hook already present in {rc_path}", file=sys.stderr)
+        print(f"hook already up to date in {rc_path}", file=sys.stderr)
     return 0
 
 
@@ -296,6 +314,19 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("provider", nargs="?", default=None,
                    help="provider id to show details for (omit to list all providers)")
     l.set_defaults(func=cmd_list)
+
+    # status
+    s = sub.add_parser(
+        "status",
+        help="show what each agent is actually using in this shell/dir",
+        description="Show the *effective* current configuration of each agent "
+                    "in this terminal. Reads the live process env (what `lpm use` "
+                    "exported) AND any project/user agent config files (which may "
+                    "override env, e.g. an `lpm agent --inline` render). Compares "
+                    "against active.env.sh and flags drift. Unlike `list` (which "
+                    "shows the config) this reflects the real current terminal state.",
+    )
+    s.set_defaults(func=cmd_status)
 
     # init-shell-hook
     h = sub.add_parser("init-shell-hook",

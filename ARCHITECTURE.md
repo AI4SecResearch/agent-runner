@@ -7,7 +7,7 @@
 ```
 +----------------------------------------------------------+
 |  CLI (cli.py)                                            |
-|  use / generate / list -- dispatch via registries        |
+|  use / generate / list / status - registry dispatch      |
 +--------------------------+-------------------------------+
                            |
               +------------+-------------+
@@ -51,11 +51,12 @@ src/llm_provider_manager/
     zhipu.py             #   ZhipuProvider（内置 1305/1308/1310 码默认动作）
     bailian.py           #   BailianProvider（内置留空，待填充）
     opencsitool.py       #   OpencsitoolProvider（同上）
-  cli.py                 # 通用编排层：use / generate / list
+  cli.py                 # 通用编排层：use / generate / list / status
   config.py              # JSONC 加载 + 权限检查
   env_contract.py        # 通用 shell helper（sh_export 等）
   schema.py              # providers.jsonc 的 typed schema
   use.py                 # use 命令核心 + shell hook + active.env.sh 持久化
+  status.py              # status 命令核心：三层反解 + drift 检测
   keypool.py             # 运行时密钥池轮换 + 错误分类（批量消费的库入口 dispatch()）
 ```
 
@@ -81,27 +82,31 @@ src/llm_provider_manager/
 
 | provider 模块 | 内置码 | 说明 |
 |---|---|---|
-| `default.py` | （空） | 兜底；`_default=rotate_then_downgrade` |
-| `zhipu.py` | 1305/1308/1310 | GLM 上游码 |
+| `default.py` | （空） | 兜底；`_default=disable,rotate,downgrade` |
+| `zhipu.py` | 1301/1305/1308/1310 | GLM 上游码 |
 | `bailian.py` | （空，待填充） | 当前靠配置或兜底 |
 | `opencsitool.py` | （空，待填充） | 同上 |
 
-动作词表：`rotate_key` / `downgrade` / `rotate_then_downgrade`。`classify` 返回 `"action:disable"`（`disable=true` 当动作含 `rotate`）。
+动作词表（原子，逗号组合）：`disable` / `rotate` / `downgrade`。策略是有序原子串，如 `disable,rotate`、`rotate,downgrade`。`disable` 是一等原子——出现才禁用 key（不再像旧版那样隐含在 `rotate` 里），所以内容安全类错误（1301/1305）可以换 key/降级而**不**禁用 key。`classify` 返回 `"strategy:disable_flag"`（`disable_flag=true` 当策略含 `disable`）。zhipu 内置：1301→`rotate,downgrade`、1305→`downgrade`、1308/1310→`disable,rotate`、`_default`→`disable,rotate,downgrade`。
+
+反应式重试（§9）：消费者每步调 `react` 子命令拿单步策略，执行后重新分类下一个错误，而非一次性预算完整计划。
 
 ## 5. Shell hook 机制
 
-`init-shell-hook` 在 shell rc 里加一段带标记的块：
+`init-shell-hook` 在 shell rc 里加一段带标记的块（重跑时**先删旧块再写新块**，故 hook 升级会自动传播）：
 
 ```sh
 # >>> llm-provider-manager >>>
-export LLM_PROVIDER_ACTIVE_ENV="~/.config/llm-provider-manager/active.env.sh"
-[ -f "$LLM_PROVIDER_ACTIVE_ENV" ] || eval "$(lpm use 2>/dev/null)"
+# restore last selection (or initialise from config 'default')
+export LLM_PROVIDER_ACTIVE_ENV="$HOME/.config/llm-provider-manager/active.env.sh"
+[ -f "$LLM_PROVIDER_ACTIVE_ENV" ] || eval "$($HOME/.local/bin/lpm use 2>/dev/null)"
 source "$LLM_PROVIDER_ACTIVE_ENV" 2>/dev/null
+# lpm: intercepts 'use' to source active.env.sh after running; all else passes through
 lpm() {
     if [ "$1" = "use" ]; then
-        command lpm use "${@:2}" && source "$LLM_PROVIDER_ACTIVE_ENV"
+        command $HOME/.local/bin/lpm use "${@:2}" && source "$LLM_PROVIDER_ACTIVE_ENV"
     else
-        command lpm "$@"
+        command $HOME/.local/bin/lpm "$@"
     fi
 }
 # <<< llm-provider-manager <<<
@@ -109,17 +114,37 @@ lpm() {
 
 - **新 shell**：`source active.env.sh` 恢复上次选择；无文件时从 config `default` 初始化。
 - **`lpm use`**：跑 CLI 写 `active.env.sh` + `source` 进当前 shell（立即生效 + 持久化）。
-- **`lpm list`/`lpm generate` 等**：透传给 CLI。
+- **`lpm list`/`lpm status` 等**：透传给 CLI。
 
 `lpm()` 函数拦截 `use` 子命令做副作用（source），其余子命令透传给 `command lpm`（绕过函数）。与 `nvm`/`rbenv` 同模式。
+
+hook 内部用**绝对路径** `$HOME/.local/bin/lpm` 而非裸 `lpm` 调用 CLI——这样即便 `~/.local/bin` 不在 PATH（非交互 shell、脚本、cron、PATH 被重置的子 shell 等），rc 时的初始化与 `lpm()` 内部转发仍能找到二进制。`lpm()` 仍以名字定义，交互式敲 `lpm` 照常命中函数。
+
+## 5.5. status：当前终端的实际配置
+
+`status` 是 `use` 的逆操作：`use` 写一个选择进 env + active.env.sh；`status` 读回"**当前终端、当前目录**下各 agent 实际生效的是什么"。它**不**信任单一来源，而是按三层优先级合并：
+
+| 层 | 来源 | 说明 |
+|---|---|---|
+| 1（高） | 项目/用户 agent 配置文件字面量 | `./opencode.json`、`.claude/settings{.local,}.json`、`~/.claude/settings.local.json` 等。`lpm agent --inline` 烘焙的真实 key/model 在此，**覆盖** env。只取字面量值——`{env:...}` 占位符（`--template` 产物）不算覆盖，它延迟到层 2。 |
+| 2 | 进程 env（`os.environ`） | `lpm use` 导出的值，继承自父 shell。这是"当前终端"的真相。 |
+| 3（基准） | `active.env.sh` | **不是**配置来源，仅作 drift 对比基准：当层 2 的值与本文件记录不一致时标注 drift（如另一终端 `lpm use` 改了文件但本终端未 source）。 |
+
+**正交性**：每层"该查哪些 env 变量/哪些文件/怎么反解出 provider/key/model"的知识都在 `agents/` 包里（`probe` / `probe_config_file` / `config_probe_paths`），通用层 `status.py` 只做编排——遍历注册表、合并覆盖（把覆盖值并进 env 后**复用 agent 自己的 `probe`** 重新反解，避免匹配逻辑重复）、算 drift、渲染。通用层不出现 `ANTHROPIC_*` / `LLM_KEY_*` 名。
+
+**反解策略**：
+- Claude：provider 按 `base_urls["anthropic"] == ANTHROPIC_BASE_URL` 匹配；key 按 `key.key == ANTHROPIC_AUTH_TOKEN` 匹配；model 直接读 env。
+- opencode：`LLM_DEFAULT_MODEL`（`<entryId>/<modelId>`）的 entryId 直接给 provider(+keyid)——`provider` 形 = symmetric/单 key，`provider-keyid` 形 = 多 key asymmetric（与 `render_config` 的 `opencode_entry_id` 对称）。各 `LLM_KEY_*` 收集为佐证；blacklist key 的空字符串属正常。
+
+**范围（MVP）**：只查 `<cwd>` 下项目文件 + 用户默认输出路径，不向上遍历父目录（可预测）。输出人类可读（无 `--json`）。真实 key 脱敏（只显示首尾）。
 
 ## 6. 扩展点
 
 ### 新增一个 agent
 
-1. 在 `agents/` 加 `<name>.py`，实现 `Agent` 协议（`id`/`preferred_protocols`/`base_url_for`/`is_usable`/`exports_for`/`render_config`/`default_config_path`/`config_path_env_var`）。
+1. 在 `agents/` 加 `<name>.py`，实现 `Agent` 协议（`id`/`preferred_protocols`/`base_url_for`/`is_usable`/`exports_for`/`render_config`/`probe`/`probe_config_file`/`config_probe_paths`/`default_config_path`/`config_path_env_var`）。
 2. 在 `agents/__init__.py` 的 `_build_registry()` 加一行。
-3. 无需改 `cli.py`/`use.py`/`schema.py`——注册表自动发现。
+3. 无需改 `cli.py`/`use.py`/`status.py`/`schema.py`——注册表自动发现。`status` 借新增的 `probe*` 方法自动支持新 agent。
 
 ### 新增一个 provider
 
@@ -175,7 +200,7 @@ lpm() {
 
 错误分类复用 §4 的 provider 后端：从状态解析当前 provider → 取其 `errorHandling` 覆盖 → `providers.classify(pid, payload, handling)`。
 
-`dispatch(argv)` 子命令：`init / rotate / on-success / disable / size / available-size / classify / retry-plan`。`init/rotate/on-success` 产出一行 JSON `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）；`classify` 产出 `"action:disable"`；`retry-plan` 产出 `(tier, count)` 行。批量消费者调用这些驱动轮转与重试，例如：
+`dispatch(argv)` 子命令：`init / rotate / on-success / disable / size / available-size / classify / react`。`init/rotate/on-success` 产出一行 JSON `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）；`classify` 产出 `"strategy:disable"`；`react` 产出单步原子策略串（如 `disable,rotate`、`downgrade`）或 `stop`——批量消费者每步调用它驱动**反应式**重试（每步重新分类新错误），例如：
 
 ```bash
 python -m llm_provider_manager.keypool init --config providers.jsonc --state /tmp/s.json --agent claude
