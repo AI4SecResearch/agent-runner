@@ -14,7 +14,7 @@
 # Env vars (agent-agnostic; the key pool may override per provider):
 #   SANDBOX             "1" → skip permission prompts (--dangerously-skip-permissions)
 #   PRIMARY_MODEL       Primary model id (default: glm-5-turbo). The key pool exports the
-#                       active provider's model when api-keys.json declares one.
+#                       active provider's model when providers.jsonc declares one.
 #   DOWNGRADE_MODEL     Downgrade-tier model id (default: glm-4.7)
 #   ANTHROPIC_BASE_URL  base_url (read by the `claude` binary). The key pool exports
 #                       the active provider's base_url; claude-code speaks anthropic only.
