@@ -33,7 +33,7 @@ def sample_config_dict() -> dict:
                     {"id": "glm-5.2", "displayName": "GLM-5.2", "context": 1000000, "output": 131072},
                     {"id": "glm-5-turbo", "displayName": "GLM-5 Turbo", "context": 128000, "output": 16384},
                 ],
-                "errorHandling": {"1308": "disable,rotate", "_default": "disable,rotate,downgrade"},
+                "errorHandling": {"1308": "disable,rotate", "_default": "rotate"},
             },
             {
                 "id": "bailian",

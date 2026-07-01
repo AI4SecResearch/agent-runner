@@ -27,17 +27,15 @@ class ZhipuProvider(DefaultProvider):
         "1305": "downgrade",                 # traffic overload — same key, smaller model
         "1308": "disable,rotate",            # quota — disable bad key, move on
         "1310": "disable,rotate",
-        "_default": "disable,rotate,downgrade",
+        "_default": "rotate",                # unknown — cautiously try another key
     }
 
     def classify(self, signals: Signals, overrides: dict[str, str]) -> str:
         merged = dict(self.default_error_handling)
         merged.update(overrides)
         code = signals.code or signals.status
-        action = (
+        return (
             merged.get(code, merged.get("_default", DEFAULT_ACTION))
             if code
             else merged.get("_default", DEFAULT_ACTION)
         )
-        disable = "true" if "disable" in action else "false"
-        return f"{action}:{disable}"

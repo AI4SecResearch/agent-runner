@@ -85,19 +85,19 @@ def test_react_stops_when_pool_exhausted_and_rotate_needed(tmp_path: Path):
     assert step == "stop"
 
 
-def test_react_no_pool_keeps_only_downgrade(tmp_path: Path):
-    # no config → no pool. Without a pool, disable/rotate are meaningless (no
-    # key to disable, none to rotate to); only downgrade can help. Both 1308
-    # and 1305 (unrecognised without a provider → _default) collapse to
-    # "downgrade".
+def test_react_no_pool_default_only_rotates_then_stops(tmp_path: Path):
+    # no config → no pool. Unrecognised codes fall to DefaultProvider._default
+    # (= rotate); without a pool rotate is meaningless → stripped → nothing
+    # actionable → stop.
     bogus = str(tmp_path / "nope.jsonc")
-    assert react('{"code":"1308"}', bogus, str(tmp_path / "s.json"), agent_id="claude") == "downgrade"
-    assert react('{"code":"1305"}', bogus, str(tmp_path / "s.json"), agent_id="claude") == "downgrade"
+    assert react('{"code":"1308"}', bogus, str(tmp_path / "s.json"), agent_id="claude") == "stop"
+    assert react('{"code":"9999"}', bogus, str(tmp_path / "s.json"), agent_id="claude") == "stop"
 
 
 def test_react_no_pool_pure_disable_error_stops(tmp_path: Path):
-    # if a strategy had NO downgrade atom (hypothetical), no pool → nothing
-    # actionable → stop. Construct via a provider whose _default is disable,rotate.
+    # A strategy with NO rotate/downgrade atom is not actionable. Construct a
+    # provider whose _default is disable,rotate, exhaust its pool so rotate is
+    # stripped, leaving bare disable → stop.
     cfg = _write_cfg(tmp_path, [{
         "id": "p", "type": "symmetric", "displayName": "P", "defaultKey": "k",
         "baseURLs": {"anthropic": "https://p/a"},
@@ -105,15 +105,11 @@ def test_react_no_pool_pure_disable_error_stops(tmp_path: Path):
         "models": [{"id": "m", "displayName": "M", "context": 1, "output": 1}],
         "errorHandling": {"_default": "disable,rotate"},
     }])
-    # but with a pool it has 1 key → disable,rotate is actionable. To force the
-    # "no actionable" path we point at a missing config so _default applies AND
-    # no pool: _default (disable,rotate,downgrade) → strip to downgrade only,
-    # which IS actionable. So instead, exhaust the pool then hit a disable,rotate.
     state = _init_state(tmp_path, cfg)
     from llm_provider_manager.keypool import dispatch
     dispatch(["disable", "--config", str(cfg), "--state", str(state),
               "--agent", "claude", "--key", "sk-k"])
-    # pool now exhausted; _default=disable,rotate → rotate stripped → disable only
+    # pool exhausted; _default=disable,rotate → rotate stripped → disable only
     # → not actionable → stop
     assert react('{"code":"9999"}', str(cfg), str(state), agent_id="claude") == "stop"
 
@@ -121,6 +117,6 @@ def test_react_no_pool_pure_disable_error_stops(tmp_path: Path):
 def test_react_unknown_code_falls_to_default(tmp_path: Path):
     cfg = _zhipu_cfg(tmp_path)
     state = _init_state(tmp_path, cfg)
-    # unknown code → _default = disable,rotate,downgrade
+    # unknown code → _default = rotate (cautious: try another key, no disable)
     step = react('{"code":"9999"}', str(cfg), str(state), agent_id="claude")
-    assert step == "disable,rotate,downgrade"
+    assert step == "rotate"

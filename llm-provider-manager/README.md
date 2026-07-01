@@ -67,7 +67,7 @@ lpm status                            # 查看各 agent 当前实际生效的配
   ],
   "errorHandling": {              // 可选；覆盖 provider 模块的内置默认
     "1305": "downgrade",
-    "_default": "disable,rotate,downgrade"
+    "_default": "rotate"          // 未知错误：只换 key，不 disable/降级
   }
 }
 ```

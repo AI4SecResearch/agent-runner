@@ -22,7 +22,7 @@
 |  opencode.py           |  |  default.py     fallback     |
 |                        |  |  zhipu.py       builtin codes|
 |  per-agent:            |  |  bailian.py     (empty)      |
-|    preferred_protocols |  |  opencsitool.py (empty)      |
+|    preferred_protocols |  |  opencsitool.py (quota)      |
 |    exports_for         |  |                              |
 |    render_config       |  |  per-provider:               |
 |                        |  |    default_error_handling    |
@@ -47,10 +47,10 @@ src/llm_provider_manager/
   providers/             # 轴 2：provider 后端（错误分类）
     __init__.py          #   ProviderBackend 协议 + REGISTRY + classify/effective_error_handling
     base.py              #   Signals + extract_signals（共享 payload 预解析）
-    default.py           #   DefaultProvider（兜底；_default=rotate_then_downgrade）
+    default.py           #   DefaultProvider（兜底；_default=rotate）
     zhipu.py             #   ZhipuProvider（内置 1305/1308/1310 码默认动作）
     bailian.py           #   BailianProvider（内置留空，待填充）
-    opencsitool.py       #   OpencsitoolProvider（同上）
+    opencsitool.py       #   OpencsitoolProvider（预算/429 文本匹配 → disable,rotate）
   cli.py                 # 通用编排层：use / generate / list / status
   config.py              # JSONC 加载 + 权限检查
   env_contract.py        # 通用 shell helper（sh_export 等）
@@ -82,12 +82,12 @@ src/llm_provider_manager/
 
 | provider 模块 | 内置码 | 说明 |
 |---|---|---|
-| `default.py` | （空） | 兜底；`_default=disable,rotate,downgrade` |
+| `default.py` | （空） | 兜底；`_default=rotate` |
 | `zhipu.py` | 1301/1305/1308/1310 | GLM 上游码 |
 | `bailian.py` | （空，待填充） | 当前靠配置或兜底 |
-| `opencsitool.py` | （空，待填充） | 同上 |
+| `opencsitool.py` | budget/429（文本匹配） | 预算耗尽 → `disable,rotate`；其余落 `_default` |
 
-动作词表（原子，逗号组合）：`disable` / `rotate` / `downgrade`。策略是有序原子串，如 `disable,rotate`、`rotate,downgrade`。`disable` 是一等原子——出现才禁用 key（不再像旧版那样隐含在 `rotate` 里），所以内容安全类错误（1301/1305）可以换 key/降级而**不**禁用 key。`classify` 返回 `"strategy:disable_flag"`（`disable_flag=true` 当策略含 `disable`）。zhipu 内置：1301→`rotate,downgrade`、1305→`downgrade`、1308/1310→`disable,rotate`、`_default`→`disable,rotate,downgrade`。
+动作词表（原子，逗号组合）：`disable` / `rotate` / `downgrade`。策略是有序原子串，如 `disable,rotate`、`rotate,downgrade`。`disable` 是一等原子——出现才禁用 key（不再像旧版那样隐含在 `rotate` 里），所以内容安全类错误（1301/1305）可以换 key/降级而**不**禁用 key。`classify` 返回原子策略串本身（如 `disable,rotate`、`downgrade`）。zhipu 内置：1301→`rotate,downgrade`、1305→`downgrade`、1308/1310→`disable,rotate`、`_default`→`rotate`（未知错误只换 key，不赌 key 坏或该降级）。
 
 反应式重试（§9）：消费者每步调 `react` 子命令拿单步策略，执行后重新分类下一个错误，而非一次性预算完整计划。
 
@@ -200,7 +200,7 @@ hook 内部用**绝对路径** `$HOME/.local/bin/lpm` 而非裸 `lpm` 调用 CLI
 
 错误分类复用 §4 的 provider 后端：从状态解析当前 provider → 取其 `errorHandling` 覆盖 → `providers.classify(pid, payload, handling)`。
 
-`dispatch(argv)` 子命令：`init / rotate / on-success / disable / size / available-size / classify / react`。`init/rotate/on-success` 产出一行 JSON `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）；`classify` 产出 `"strategy:disable"`；`react` 产出单步原子策略串（如 `disable,rotate`、`downgrade`）或 `stop`——批量消费者每步调用它驱动**反应式**重试（每步重新分类新错误），例如：
+`dispatch(argv)` 子命令：`init / rotate / on-success / disable / size / available-size / classify / react`。`init/rotate/on-success` 产出一行 JSON `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）；`classify` 与 `react` 均产出原子策略串（如 `disable,rotate`、`downgrade`），`react` 额外可产出 `stop`——批量消费者每步调用它驱动**反应式**重试（每步重新分类新错误），例如：
 
 ```bash
 python -m llm_provider_manager.keypool init --config providers.jsonc --state /tmp/s.json --agent claude

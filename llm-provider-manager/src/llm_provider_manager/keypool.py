@@ -352,7 +352,8 @@ def classify_error(payload_text, config_path, state_path, *, agent_id):
     """Classify an error payload via the active provider module.
 
     The provider is the active key's provider (resolved from keypool state);
-    interpretation is delegated to the providers package. Returns "action:disable".
+    interpretation is delegated to the providers package. Returns an atom
+    strategy string (e.g. "disable,rotate", "downgrade").
     """
     provider_id = None
     handling: dict[str, str] = {}
@@ -381,8 +382,7 @@ def react(payload_text, config_path, state_path, *, agent_id):
       * strategy carries no actionable atom at all (e.g. bare ``disable`` with
         an empty pool) → stop.
     """
-    action_flag = classify_error(payload_text, config_path, state_path, agent_id=agent_id)
-    action = action_flag.rsplit(":", 1)[0]
+    action = classify_error(payload_text, config_path, state_path, agent_id=agent_id)
 
     has_pool = os.path.exists(config_path)
     available = 0
@@ -400,10 +400,10 @@ def react(payload_text, config_path, state_path, *, agent_id):
 
     actionable = any(a in ("rotate", "downgrade") for a in action.split(",") if a)
     if not actionable:
-        _dbg(f"react: action={action_flag} available={available} → stop")
+        _dbg(f"react: action={action} available={available} → stop")
         return "stop"
 
-    _dbg(f"react: action={action_flag} available={available} → {action}")
+    _dbg(f"react: action={action} available={available}")
     return action
 
 

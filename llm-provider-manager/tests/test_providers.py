@@ -44,53 +44,52 @@ def test_extract_signals_http_status_3digit():
 
 def test_classify_zhipu_builtin_defaults_no_config():
     # zhipu classifies correctly with empty overrides (built-in defaults)
-    assert providers_mod.classify("zhipu", '{"code": "1301"}', {}) == "rotate,downgrade:false"
-    assert providers_mod.classify("zhipu", '{"code": "1305"}', {}) == "downgrade:false"
-    assert providers_mod.classify("zhipu", '{"code": "1308"}', {}) == "disable,rotate:true"
-    assert providers_mod.classify("zhipu", '{"code": "1310"}', {}) == "disable,rotate:true"
-    # unknown code → _default
-    assert providers_mod.classify("zhipu", '{"code": "9999"}', {}) == "disable,rotate,downgrade:true"
+    assert providers_mod.classify("zhipu", '{"code": "1301"}', {}) == "rotate,downgrade"
+    assert providers_mod.classify("zhipu", '{"code": "1305"}', {}) == "downgrade"
+    assert providers_mod.classify("zhipu", '{"code": "1308"}', {}) == "disable,rotate"
+    assert providers_mod.classify("zhipu", '{"code": "1310"}', {}) == "disable,rotate"
+    # unknown code → _default (rotate only, no disable)
+    assert providers_mod.classify("zhipu", '{"code": "9999"}', {}) == "rotate"
 
 
 def test_classify_zhipu_1301_does_not_disable():
-    # content-safety — rotate+downgrade but the key isn't bad, so disable flag is false
+    # content-safety — rotate+downgrade but the key isn't bad, so no disable atom
     result = providers_mod.classify("zhipu", '{"code": "1301"}', {})
-    action, flag = result.rsplit(":", 1)
-    assert "rotate" in action and "downgrade" in action
-    assert flag == "false"
+    assert "rotate" in result and "downgrade" in result
+    assert "disable" not in result
 
 
 def test_classify_zhipu_config_overrides_builtin():
     # config override changes 1308 from disable,rotate to downgrade
     result = providers_mod.classify(
         "zhipu", '{"code": "1308"}', {"1308": "downgrade"})
-    assert result == "downgrade:false"
+    assert result == "downgrade"
 
 
 def test_classify_unknown_provider_falls_to_default():
-    # unregistered provider → DefaultProvider → _default action
+    # unregistered provider → DefaultProvider → _default action (rotate only)
     result = providers_mod.classify("unknown", '{"code": "429"}', {})
-    assert result == "disable,rotate,downgrade:true"
+    assert result == "rotate"
 
 
 def test_classify_bailian_empty_builtin_uses_config():
     # bailian has empty built-in; config _default=disable,rotate → disable+rotate
     result = providers_mod.classify(
         "bailian", '{"code": "429"}', {"_default": "disable,rotate"})
-    assert result == "disable,rotate:true"
+    assert result == "disable,rotate"
 
 
 def test_classify_bailian_no_config_uses_default_fallback():
-    # bailian with no config → DefaultProvider._default
+    # bailian with no config → DefaultProvider._default (rotate only)
     result = providers_mod.classify("bailian", '{"code": "429"}', {})
-    assert result == "disable,rotate,downgrade:true"
+    assert result == "rotate"
 
 
-def test_classify_disable_flag():
-    # disable atom present → disable=true; absent → false
-    assert providers_mod.classify("zhipu", '{"code": "1308"}', {}).endswith(":true")
-    assert providers_mod.classify("zhipu", '{"code": "1305"}', {}).endswith(":false")
-    assert providers_mod.classify("zhipu", '{"code": "1301"}', {}).endswith(":false")
+def test_classify_disable_atom_present_or_absent():
+    # disable is encoded by the `disable` atom being in the strategy, not a flag
+    assert "disable" in providers_mod.classify("zhipu", '{"code": "1308"}', {})
+    assert "disable" not in providers_mod.classify("zhipu", '{"code": "1305"}', {})
+    assert "disable" not in providers_mod.classify("zhipu", '{"code": "1301"}', {})
 
 
 # ── effective_error_handling ──────────────────────────────────────
@@ -100,7 +99,7 @@ def test_effective_error_handling_zhipu_no_overrides():
     assert eff["1301"] == "rotate,downgrade"
     assert eff["1305"] == "downgrade"
     assert eff["1308"] == "disable,rotate"
-    assert eff["_default"] == "disable,rotate,downgrade"
+    assert eff["_default"] == "rotate"
 
 
 def test_effective_error_handling_zhipu_with_overrides():
@@ -120,7 +119,32 @@ def test_effective_error_handling_always_has_default():
     # even with empty builtin + empty config, _default is guaranteed
     eff = providers_mod.effective_error_handling("bailian", {})
     assert "_default" in eff
-    assert eff["_default"] == "disable,rotate,downgrade"
+    assert eff["_default"] == "rotate"
+
+
+# ── opencsitool: budget / 429 pattern matching ────────────────────
+
+def test_classify_opencsitool_budget_exceeded_disables_and_rotates():
+    # real-world opencsitool payload: free text, no [code]/JSON status field
+    msg = ("API Error: Request rejected (429) · Budget has been exceeded! "
+           "Current cost: 20071198.0, Max budget: 20000000.0")
+    assert providers_mod.classify(
+        "opencsitool", f'{{"message":"{msg}"}}', {}) == "disable,rotate"
+
+
+def test_classify_opencsitool_plain_429_disables_and_rotates():
+    # HTTP 429 in the text (without the budget keyword) still counts as quota-class
+    assert providers_mod.classify(
+        "opencsitool", '{"message":"Request rejected (429)"}', {}) == "disable,rotate"
+    # or as a structured status field
+    assert providers_mod.classify(
+        "opencsitool", '{"status":"429","message":"rate limited"}', {}) == "disable,rotate"
+
+
+def test_classify_opencsitool_other_error_falls_to_default():
+    # an unrecognised error → DefaultProvider._default (rotate only)
+    assert providers_mod.classify(
+        "opencsitool", '{"message":"something else went wrong"}', {}) == "rotate"
 
 
 # ── registry ──────────────────────────────────────────────────────
