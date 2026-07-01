@@ -198,8 +198,10 @@ _agent_once_with_watchdog() {
     return 0
 }
 
-# 运行 agent_once_with_watchdog 并检查结果，处理额度耗尽
-# 返回: 0=成功  1=失败(可重试)  2=额度耗尽且无key pool(放弃)
+# 运行 agent_once_with_watchdog 并检查结果。
+# 返回: 0=成功  1=失败(可重试)
+# （历史名：disable 决策现已上移到 react 驱动的 agent_with_retry 循环，
+# 此函数只做"执行 + 检查结果"，不再内部 disable。函数名保留以减少改动面。）
 agent_once_with_disable() {
     local prompt="$1"
     local log_name="$2"
@@ -208,18 +210,6 @@ agent_once_with_disable() {
     _agent_once_with_watchdog "$prompt" "$log_name" "$@" \
         && check_agent_result "$log_name" \
         && return 0
-
-    local classify_result=$(classify_agent_error "$log_name")
-    local should_disable="${classify_result##*:}"
-
-    if [ "$should_disable" = "true" ]; then
-        if [ -f "$(_kp_config)" ]; then
-            key_pool_disable
-        else
-            echo "          ⚠️ 额度耗尽且无 key pool: $log_name" >&2
-            return 2
-        fi
-    fi
 
     return 1
 }
@@ -239,13 +229,15 @@ agent_once_session_resume() {
     fi
 }
 
-# ── Retry orchestration (bash loop, Python-driven plan) ───────────
+# ── Retry orchestration (reactive: one step per failure) ─────────
 
 # 用法: agent_with_retry <prompt> <log_name> [extra_args...]
 # 返回 0=成功  1=均失败
 #
-# Python 生成重试计划 (retry-plan)，bash 通用循环执行。
-# 恢复策略由 providers.jsonc 中 provider 的 errorHandling 配置决定。
+# 反应式重试：不预先制定完整计划，而是每次失败后调 `react` 子命令拿到
+# 单步恢复策略（逗号组合的原子 disable/rotate/downgrade，或 stop），执行
+# 该步后再试；下次失败重新 react，按【新错误】重新决策。策略由 providers.jsonc
+# 中 provider 的 errorHandling 决定。
 agent_with_retry() {
     local prompt="$1"
     local log_name="$2"
@@ -257,48 +249,56 @@ agent_with_retry() {
     agent_once_with_disable "$prompt" "$log_name" "$@"
     case $? in
         0) key_pool_on_success; return 0;;
-        2) return 1;;
     esac
 
-    local classify_result=$(classify_agent_error "$log_name")
-    local action="${classify_result%%:*}"
-
-    # ── No key pool: only downgrade available ──
-    if [ ! -f "$(_kp_config)" ]; then
-        action="downgrade"
-    fi
-
     # ── Extract session_id from primary attempt for resumption ──
-    local session_id=$(agent_backend_session_id "$OUTPUT_DIR/$log_name")
+    local base_log="$log_name"
+    local session_id=$(agent_backend_session_id "$OUTPUT_DIR/$base_log")
 
-    # ── Execute retry plan from Python ──
+    # ── Reactive loop ──
     local attempt=0
+    local cur_log="$base_log"   # most recent failure's log name (react reads it)
+    # 兜底上限：防 react 与池状态不同步导致死循环。正常靠 react 返回 stop 终止。
+    # n=可用 key 数；+2 给降级档留余量。无 key pool 时 n=0 → 2 次。
+    local n=$(key_pool_available_size 2>/dev/null || echo 0)
+    local max_attempts=$(( n + 2 ))
+    [ "$max_attempts" -gt 0 ] || max_attempts=2
 
-    local model count
-    while IFS=' ' read -r model count; do
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        # 把上次失败喂给 react，拿单步策略（对新错误重新分类）
+        local step
+        step=$(agent_backend_result_text "$OUTPUT_DIR/$cur_log" \
+               | python3 "$_runner_py" react --text - \
+                 --config "$(_kp_config)" --state "$(_kp_state)")
+        if [ "$step" = "stop" ]; then
+            echo "          ⚠️ 资源耗尽（无可用 key/模型）: $cur_log" >&2
+            return 1
+        fi
+
+        # 执行策略里的原子
+        case ",$step," in *,disable,*) key_pool_disable;; esac
+        case ",$step," in *,rotate,*)  key_pool_rotate;; esac
+        local model=primary
+        case ",$step," in *,downgrade,*) model=downgrade;; esac
+
+        attempt=$((attempt + 1))
+        local name="${base_log}-r${attempt}"
         local model_args=$(agent_backend_model_args "$model")
+        echo "          ⚠️ 重试 $attempt/$max_attempts ($model / $step): $base_log" >&2
 
-        local i
-        for ((i=0; i<count; i++)); do
-            key_pool_rotate
-            attempt=$((attempt + 1))
-            local name="${log_name}-r${attempt}"
+        if [ -n "$session_id" ]; then
+            agent_once_session_resume "继续" "$name" "$session_id" $model_args
+        else
+            agent_once_with_disable "$prompt" "$name" $model_args
+        fi
 
-            if [ -n "$session_id" ]; then
-                echo "          ⚠️ 续接会话 $((i+1))/$count ($model): $log_name" >&2
-                agent_once_session_resume "继续" "$name" "$session_id" $model_args
-            else
-                echo "          ⚠️ 重试 $((i+1))/$count ($model): $log_name" >&2
-                agent_once_with_disable "$prompt" "$name" $model_args
-            fi
+        case $? in
+            0) [ "$model" != "downgrade" ] && key_pool_on_success; return 0;;
+        esac
+        # 失败 → 下次循环 react 读这次重试的日志
+        cur_log="$name"
+    done
 
-            case $? in
-                0) [ "$model" != "downgrade" ] && key_pool_on_success; return 0;;
-                2) return 1;;
-            esac
-        done
-    done < <(python3 "$_runner_py" retry-plan --action "$action" --config "$(_kp_config)" --state "$(_kp_state)")
-
-    echo "          ⚠️ 所有模型和 key 均已耗尽: $log_name" >&2
+    echo "          ⚠️ 重试次数达上限 ($max_attempts): $log_name" >&2
     return 1
 }
