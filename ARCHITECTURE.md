@@ -91,22 +91,26 @@ utils/agent-runner/
 
 ## 4. 通用编排（runner.sh）
 
-函数自底向上分层包装：
+函数自底向上分层包装（每层叠加一项能力）：
 
 ```
-agent_with_retry            ← 模块入口：首次尝试 + 失败重试
-  └─ agent_once_with_disable    看门狗执行 + 结果检查 + 额度耗尽处理
-       └─ _agent_once_with_watchdog  后台执行 + 早退/超时/无进展监控
-            └─ agent_once            组装 argv 并调 agent_backend_invoke
+agent_with_retry / agent_once_session_resume   ← 公开入口
+  └─ _agent_once_with_disable    + 失败时禁用当前 key（仅 session_resume 用）
+       └─ _agent_once_with_check     + 业务面结果检查（agent_with_retry 用）
+            └─ _agent_once_with_watchdog  后台执行 + 早退/超时/无进展监控
+                 └─ agent_once            组装 argv 并调 agent_backend_invoke
 ```
+
+disable 决策的位置是两条公开入口的分水岭：`agent_with_retry` 自带 reactive 重试循环，disable/rotate/downgrade 由循环顶部调 `react` 统一决定，故其单次执行用 `_agent_once_with_check`（**不**自行 disable）；`agent_once_session_resume` 是单次入口（无外层循环替它决策），失败时自行 disable，故用 `_agent_once_with_disable`。
 
 | 函数 | 职责 |
 |---|---|
 | `agent_once <prompt> <log_name> [extra…]` | 组装 argv：`agent_backend_perm_args` + （调用方未给 `--model` 时注入 `agent_backend_model_args primary`）+ 调用方透传参数 → `agent_backend_invoke`。这保证**只有一个 `--model`**（调用方覆盖 primary）。 |
-| `_agent_once_with_watchdog` | 后台跑 `agent_once`；轮询：`agent_backend_is_complete` 命中则早退；否则检测总超时（`AGENT_TIMEOUT`）与无进展超时（`AGENT_STALL_TIMEOUT`，看 jsonl 文件增长）；超时则按"先杀子进程再杀父 shell"的顺序清理。 |
-| `agent_once_with_disable` | 跑 watchdog + `check_agent_result`（=`agent_backend_result_ok`）；失败则 `classify_agent_error`，若返回的 `disable` 标志为真则 `key_pool_disable`；返回码 0/1/2（2=额度耗尽且无密钥池，放弃）。 |
-| `agent_once_session_resume <prompt> <log_name> <sid> [extra…]` | 续接会话：取 `agent_backend_resume_args <sid>`；非空则带续接 flag 跑 `agent_once_with_disable`，为空则**退化为全新会话**（用原 prompt 重跑）。模块多步流（doc-parse 的 TOC→精修）用它。 |
-| `agent_with_retry <prompt> <log_name> [extra…]` | 顶层入口。① `key_pool_init` 导出当前密钥；② 首次 `agent_once_with_disable`（primary 模型）；③ 失败则 `classify_agent_error` 取 action；④ `runner.py retry-plan` 生成 `(tier, count)` 计划；⑤ 逐轮：`key_pool_rotate` + 按 tier 选模型 + （若有 session_id）`agent_once_session_resume "继续"`，否则重试。 |
+| `_agent_once_with_watchdog` | 后台跑 `agent_once`；轮询：`agent_backend_is_complete` 命中则早退；否则检测总超时（`AGENT_TIMEOUT`）与无进展超时（`AGENT_STALL_TIMEOUT`，看 jsonl 文件增长）；超时则按"先杀子进程再杀父 shell"的顺序清理。返回 0=正常结束 / 1=超时 kill（进程面，不判业务结果）。 |
+| `_agent_once_with_check` | watchdog + `check_agent_result`（=`agent_backend_result_ok`）。返回 0=成功 / 1=失败（可重试）。**不碰 key pool**——disable 由调用方负责。 |
+| `_agent_once_with_disable` | `_agent_once_with_check` + 失败处理：`classify_agent_error` 取 `disable` 标志，为真则 `key_pool_disable`。返回 0/1/2（2=额度耗尽且无密钥池，放弃）。仅 `agent_once_session_resume` 用。 |
+| `agent_once_session_resume <prompt> <log_name> <sid> [extra…]` | 单次续接入口：取 `agent_backend_resume_args <sid>`，带续接 flag 跑 `_agent_once_with_disable`（后端不支持续接时续接参数为空，退化为全新会话）。模块多步流（doc-parse 的 TOC→精修）和跨进程会话（baseline-vote-mapping）用它。 |
+| `agent_with_retry <prompt> <log_name> [extra…]` | 顶层重试入口，**反应式**：① `key_pool_init` 导出当前密钥；② 首次 `_agent_once_with_check`（primary）；③ 失败则进入循环——每次把上次失败喂给 `runner.py react`，拿单步策略（`disable,rotate`/`downgrade`/…/`stop`），按策略执行 `key_pool_disable`/`key_pool_rotate`/选模型后用 `_agent_once_with_check` 再试（有 session_id 则续接、提示词"继续"，否则用原 prompt 开新会话）；下次失败重新 `react`，按新错误决策。`n+2` 次（n=可用 key 数）或 `react` 返回 `stop` 时停。 |
 
 ### 4.1 密钥池（`runner.sh` 包装 + `runner.py` 核心）
 
@@ -129,7 +133,7 @@ agent_with_retry            ← 模块入口：首次尝试 + 失败重试
 - **状态** `$DATA_DIR/key-pool-state.json`：`{current_index, disabled{idx: 过期时间}, success_count}`——调用方提供，运行时状态留在执行上下文，不进 lpm 用户配置目录。
 - **并发**：`fcntl.flock`（读 `LOCK_SH`、读-改-写 `LOCK_EX`，`json.dump` 后紧跟 `f.truncate()` 把 write 收进锁临界区）。
 - **跨 provider**：拍平所有 provider 的 key 为一个池；按 active agent 过滤（跳过 `agentBlacklist` 命中的 key、跳过无匹配协议 baseURL 的 provider）；`base_url` 由 lpm 的 `Agent.base_url_for` 按协议选（claude→anthropic，opencode→openai）。
-- **子命令**（`runner.py` 透传给 `keypool.dispatch`）：`init / rotate / on-success / disable / size / available-size / classify / retry-plan`。`init/rotate/on-success` 产出 JSON 行 `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）。
+- **子命令**（`runner.py` 透传给 `keypool.dispatch`）：`init / rotate / on-success / disable / size / available-size / classify / react`。`init/rotate/on-success` 产出 JSON 行 `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）；`react` 给一次失败 payload，产出单步恢复策略（逗号组合的原子 `disable`/`rotate`/`downgrade`，或 `stop`）。
 
 ## 6. 错误分类（vendored lpm `providers/`）
 
@@ -147,10 +151,10 @@ agent 失败
         → providers.classify(provider, payload, handling)
             signals = base.extract_signals(payload)   ← [NNN]/[NNNN] 码提取
             module  = REGISTRY.get(provider, default)
-            → module.classify(signals, handling)      → "action:disable"
+            → module.classify(signals, handling)      → "策略:disable标志"（如 "disable,rotate:true"）
 ```
 
-provider 模块（`zhipu`/`default`/…）、`extract_signals`、`REGISTRY`、码→动作映射、`errorHandling` 覆盖语义都在 vendored lpm 的 `providers/`（详见 lpm `ARCHITECTURE.md §4`）。动作词表：`rotate_key` / `downgrade` / `rotate_then_downgrade`（`disable=true` 当动作含 `rotate`）。
+provider 模块（`zhipu`/`default`/…）、`extract_signals`、`REGISTRY`、码→动作映射、`errorHandling` 覆盖语义都在 vendored lpm 的 `providers/`（详见 lpm `ARCHITECTURE.md §4`）。动作词表是**可组合的原子串**（逗号分隔）：`disable`（禁用当前 key）、`rotate`（换下一个 key）、`downgrade`（换次级模型）。`disable` 是一等原子——出现才禁用 key，不再隐含在 `rotate` 里，故内容安全类错误（1301/1305）可只 `rotate,downgrade`/`downgrade` 而不浪费 key。`classify` 返回 `"策略:disable标志"`（标志为 true 当策略含 `disable`）。zhipu 内置：1301→`rotate,downgrade`、1305→`downgrade`、1308/1310→`disable,rotate`、`_default`→`disable,rotate,downgrade`。
 
 > **agent 无关性**：同一 provider 配置下，claude 风格 payload（码在 message）与 opencode 风格 payload（码在字段）都映射到同一动作——解读在 provider 层，与 agent 无关。
 
@@ -203,7 +207,7 @@ provider 模块（`zhipu`/`default`/…）、`extract_signals`、`REGISTRY`、�
 module loop.sh
   → agent_with_retry(prompt, log_name)
        key_pool_init ──▶ _kp_apply: export <auth_env_var>=<key>（+ base_url / PRIMARY_MODEL / DOWNGRADE_MODEL）
-       agent_once_with_disable
+       _agent_once_with_check
          _agent_once_with_watchdog
            agent_once ──▶ agent_backend_invoke ──▶ claude/opencode ──▶ $prefix.jsonl
            (is_complete 早退 / 超时监控)
@@ -212,20 +216,24 @@ module loop.sh
        return 0
 ```
 
-### 9.2 失败 → 重试
+### 9.2 失败 → 反应式重试
 ```
-agent_once_with_disable 返回失败
-  classify_agent_error ──▶ runner.py classify ──▶ providers.classify ──▶ "rotate_then_downgrade:true"
-  (disable=true) key_pool_disable
-  runner.py retry-plan(action) ──▶ [("primary",n),("downgrade",m)]
-  for each (tier, count):
-      key_pool_rotate ──▶ _kp_apply 重应用当前 provider 的 base_url + 模型 + key
-      session_id = agent_backend_session_id(log)          # 从首次尝试的日志取
-      agent_once_session_resume("继续", name, sid, agent_backend_model_args(tier))
-        # 会话是客户端本地历史、与 provider 无关：跨 provider 续接也沿用旧会话 + 新 provider 配置
-        └─ 或全新会话（后端不支持 resume 时）
-      成功则 return 0
+_agent_once_with_check 返回失败（首次尝试，primary）
+  session_id = agent_backend_session_id(log)          # 从首次尝试的日志取，供后续续接
+  loop（最多 n+2 次，n=可用 key 数）:
+      把上次失败喂给 react ──▶ runner.py react ──▶ providers.classify（按当前 provider 路由）
+         ──▶ 单步策略串（如 "disable,rotate" / "downgrade" / "stop"）
+      若 "stop" → 资源耗尽，return 1
+      按策略执行原子：
+         含 disable → key_pool_disable
+         含 rotate  → key_pool_rotate ──▶ _kp_apply 重应用当前 provider 的 base_url + 模型 + key
+         模型档     → 含 downgrade 用 DOWNGRADE_MODEL，否则 PRIMARY_MODEL
+      续接分支：后端支持且有 session_id → _agent_once_with_check "继续" name --resume <sid> <model_args>
+                否则                     → _agent_once_with_check prompt name <model_args>   # 原提示词，新会话
+      成功（且非 downgrade 档）→ key_pool_on_success; return 0
+      失败 → 回循环顶，对【新失败】重新 react（新 key 触发新错误码 → 新策略）
 ```
+> 反应式的关键：每步重新分类当前错误，而非用首次错误预算整条计划。所以"换 key 后遇到不同错误"能得到匹配的恢复（如 1301 换 key 后变 1308，自动从 rotate,downgrade 切到 disable,rotate）。disable 决策在循环顶部统一做，单次执行（`_agent_once_with_check`）不重复 disable。
 
 ### 9.3 多步会话复用（模块级，如 doc-parse）
 ```
@@ -252,5 +260,5 @@ provider 模块（错误码→动作）属于 vendored lpm 的 `providers/`，**
 - **通用层不出现 agent 专有符号**：`runner.sh` 的编排逻辑里不出现 `claude`/`opencode`/`--output-format`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 等；这些都在 `backends/` 与 vendored lpm 的 `agents/`。`runner.py` 是适配器，仅含 `$AGENT_BACKEND` → lpm agent id 的映射表（`claude-code`→`claude` 等）这一必要 glue。模型变量 `PRIMARY_MODEL`/`DOWNGRADE_MODEL` 是 agent 无关的，故可在通用层导出。
 - **`$OUTPUT_DIR` 不进后端**：后端只接收 `<prefix>`。
 - **会话续接可降级**：后端不实现 resume 时，`agent_once_session_resume` 退化为全新会话而非报错。
-- **退出码约定**：`agent_once_with_disable` → `0` 成功 / `1` 可重试 / `2` 额度耗尽且无密钥池（放弃）。
+- **退出码约定**：`_agent_once_with_check` → `0` 成功 / `1` 失败（可重试）；`_agent_once_with_disable` 多一个 `2`=额度耗尽且无密钥池（放弃）；`agent_with_retry` → `0` 成功 / `1` 均失败；`agent_once_session_resume` 透传 `_agent_once_with_disable` 的 0/1/2。
 - **管道退出状态不被依赖**：`agent_once` 的 pipeline 返回的是 `jq` 的状态（无 `set -o pipefail`）；成功与否一律由 `agent_backend_result_ok` 读日志判定。

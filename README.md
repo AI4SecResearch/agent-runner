@@ -8,8 +8,8 @@ Designed for batch-processing pipelines where an agent (e.g. Claude Code) is inv
 
 | File | Purpose |
 |------|---------|
-| `runner.sh` | Generic agent invocation: `agent_once`, `_agent_once_with_watchdog`, `agent_with_retry`, `check_agent_result`. Calls 11 `agent_backend_*` ops defined by the active backend. |
-| `runner.py` | Thin adapter: forwards key-pool ops (init/rotate/disable/classify/retry-plan) to the vendored lpm (`llm_provider_manager.keypool`). |
+| `runner.sh` | Generic agent invocation: `agent_with_retry`, `agent_once_session_resume`, `agent_once`. Calls 11 `agent_backend_*` ops defined by the active backend. |
+| `runner.py` | Thin adapter: forwards key-pool ops (init/rotate/disable/classify/react) to the vendored lpm (`llm_provider_manager.keypool`). |
 | `backends/<name>.sh` | Backend implementing the 11-op interface for a specific agent CLI (e.g. `claude-code.sh`, `opencode.sh`). |
 | `progress.sh` | Iteration progress: `progress_read`, `progress_write`, `progress_iterations` |
 | `llm-provider-manager/` | Vendored [llm-provider-manager](llm-provider-manager/) (git subtree) — provider/key config, key-pool rotation, error classification. |
@@ -107,7 +107,11 @@ Run the agent in the background with a watchdog that monitors JSONL file growth.
 
 **`agent_with_retry <prompt> <log_name> [extra_args...]`**
 
-Run with watchdog, then retry with a fallback model on failure. Returns 0 if any attempt succeeded, 1 if all attempts failed.
+Run with watchdog; on failure, retry reactively — after each failed attempt, lpm's `react` classifies that attempt's error and returns a one-step recovery strategy (comma-joined atoms: `disable`/`rotate`/`downgrade`, or `stop`), which the loop applies before the next attempt. The next failure is classified anew, so a fresh key that hits a different error code gets a fitting recovery. Returns 0 if any attempt succeeded, 1 if all failed.
+
+**`agent_once_session_resume <prompt> <log_name> <session_id> [extra_args...]`**
+
+Run once, resuming an existing session if the backend supports it (else fall back to a fresh session with `$prompt`). As a single-shot entry point (no outer retry loop), it disables the current key itself when the error calls for it. Returns 0 on success, 1 on retryable failure, 2 if the key is exhausted and no key pool is configured.
 
 ### progress.sh
 
