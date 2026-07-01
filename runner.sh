@@ -104,7 +104,7 @@ check_agent_result() {
 }
 
 # 用法: classify_agent_error <log_name>
-# 输出 "<action>:<disable_flag>"
+# 输出原子策略串（如 "disable,rotate"、"downgrade"）。
 classify_agent_error() {
     local text=$(agent_backend_result_text "$OUTPUT_DIR/$1")
     printf '%s' "$text" | python3 "$_runner_py" classify --text - \
@@ -226,17 +226,19 @@ _agent_once_with_disable() {
 
     _agent_once_with_check "$prompt" "$log_name" "$@" && return 0
 
-    local classify_result=$(classify_agent_error "$log_name")
-    local should_disable="${classify_result##*:}"
-
-    if [ "$should_disable" = "true" ]; then
-        if [ -f "$(_kp_config)" ]; then
-            key_pool_disable
-        else
-            echo "          ⚠️ 额度耗尽且无 key pool: $log_name" >&2
-            return 2
-        fi
-    fi
+    # classify returns a bare atom strategy (e.g. "disable,rotate", "downgrade");
+    # disable when the `disable` atom is present (same test as the react loop).
+    local strategy=$(classify_agent_error "$log_name")
+    case ",$strategy," in
+        *,disable,*)
+            if [ -f "$(_kp_config)" ]; then
+                key_pool_disable
+            else
+                echo "          ⚠️ 额度耗尽且无 key pool: $log_name" >&2
+                return 2
+            fi
+            ;;
+    esac
 
     return 1
 }

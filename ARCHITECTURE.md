@@ -151,10 +151,10 @@ agent 失败
         → providers.classify(provider, payload, handling)
             signals = base.extract_signals(payload)   ← [NNN]/[NNNN] 码提取
             module  = REGISTRY.get(provider, default)
-            → module.classify(signals, handling)      → "策略:disable标志"（如 "disable,rotate:true"）
+            → module.classify(signals, handling)      → 原子策略串（如 "disable,rotate"）
 ```
 
-provider 模块（`zhipu`/`default`/…）、`extract_signals`、`REGISTRY`、码→动作映射、`errorHandling` 覆盖语义都在 vendored lpm 的 `providers/`（详见 lpm `ARCHITECTURE.md §4`）。动作词表是**可组合的原子串**（逗号分隔）：`disable`（禁用当前 key）、`rotate`（换下一个 key）、`downgrade`（换次级模型）。`disable` 是一等原子——出现才禁用 key，不再隐含在 `rotate` 里，故内容安全类错误（1301/1305）可只 `rotate,downgrade`/`downgrade` 而不浪费 key。`classify` 返回 `"策略:disable标志"`（标志为 true 当策略含 `disable`）。zhipu 内置：1301→`rotate,downgrade`、1305→`downgrade`、1308/1310→`disable,rotate`、`_default`→`disable,rotate,downgrade`。
+provider 模块（`zhipu`/`default`/…）、`extract_signals`、`REGISTRY`、码→动作映射、`errorHandling` 覆盖语义都在 vendored lpm 的 `providers/`（详见 lpm `ARCHITECTURE.md §4`）。动作词表是**可组合的原子串**（逗号分隔）：`disable`（禁用当前 key）、`rotate`（换下一个 key）、`downgrade`（换次级模型）。`disable` 是一等原子——出现才禁用 key，不再隐含在 `rotate` 里，故内容安全类错误（1301/1305）可只 `rotate,downgrade`/`downgrade` 而不浪费 key。`classify` 返回原子策略串本身（如 `disable,rotate`、`downgrade`）。zhipu 内置：1301→`rotate,downgrade`、1305→`downgrade`、1308/1310→`disable,rotate`、`_default`→`rotate`（未知错误只换 key）。
 
 > **agent 无关性**：同一 provider 配置下，claude 风格 payload（码在 message）与 opencode 风格 payload（码在字段）都映射到同一动作——解读在 provider 层，与 agent 无关。
 
