@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Agent invocation with reliability features (agent-agnostic).
-# Provides: agent_once, _agent_once_with_watchdog, agent_with_retry, agent_once_session_resume
+# Provides: agent_once, _agent_once_with_watchdog, _agent_once_with_check,
+#           _agent_once_with_disable, agent_with_retry, agent_once_session_resume
 #
 # All agent-specific behavior (binary, flags, output format, log parsing) lives in
 # a backend implementing the 10-op interface (see backends/<name>.sh). The active
@@ -198,11 +199,11 @@ _agent_once_with_watchdog() {
     return 0
 }
 
-# 运行 agent_once_with_watchdog 并检查结果。
+# 执行一次 agent 并做业务面结果检查（watchdog + check_agent_result）。
 # 返回: 0=成功  1=失败(可重试)
-# （历史名：disable 决策现已上移到 react 驱动的 agent_with_retry 循环，
-# 此函数只做"执行 + 检查结果"，不再内部 disable。函数名保留以减少改动面。）
-agent_once_with_disable() {
+# 不碰 key pool —— disable 决策由调用方负责（agent_with_retry 的 react 循环
+# 在循环顶部统一决定，单次执行不重复 disable）。
+_agent_once_with_check() {
     local prompt="$1"
     local log_name="$2"
     shift 2
@@ -214,19 +215,43 @@ agent_once_with_disable() {
     return 1
 }
 
-# 恢复会话执行；若后端不支持恢复（agent_backend_resume_args 为空），则退化为全新会话。
+# 在 _agent_once_with_check 之上加 disable 副作用：失败时按错误分类决定
+# 是否禁用当前 key。供"单次执行、无外层重试循环管 disable"的入口使用
+# （即 agent_once_session_resume —— 外部业务直接调它时，坏 key 仍被踢掉）。
+# 返回: 0=成功  1=失败(可重试)  2=额度耗尽且无 key pool(放弃)
+_agent_once_with_disable() {
+    local prompt="$1"
+    local log_name="$2"
+    shift 2
+
+    _agent_once_with_check "$prompt" "$log_name" "$@" && return 0
+
+    local classify_result=$(classify_agent_error "$log_name")
+    local should_disable="${classify_result##*:}"
+
+    if [ "$should_disable" = "true" ]; then
+        if [ -f "$(_kp_config)" ]; then
+            key_pool_disable
+        else
+            echo "          ⚠️ 额度耗尽且无 key pool: $log_name" >&2
+            return 2
+        fi
+    fi
+
+    return 1
+}
+
+# 恢复会话执行一次；若后端不支持续接则退化为全新会话。失败时按错误分类
+# 禁用当前 key（单次入口自带 disable，因为没有外层重试循环代为决策）。
 # 用法: agent_once_session_resume <prompt> <log_name> <session_id> [extra_args...]
+# 返回: 0=成功  1=失败  2=额度耗尽且无 key pool(放弃)
 agent_once_session_resume() {
     local prompt="$1"
     local log_name="$2"
     local sid="$3"
     shift 3
     local resume_args=$(agent_backend_resume_args "$sid")
-    if [ -n "$resume_args" ]; then
-        agent_once_with_disable "$prompt" "$log_name" $resume_args "$@"
-    else
-        agent_once_with_disable "$prompt" "$log_name" "$@"
-    fi
+    _agent_once_with_disable "$prompt" "$log_name" $resume_args "$@"
 }
 
 # ── Retry orchestration (reactive: one step per failure) ─────────
@@ -246,7 +271,8 @@ agent_with_retry() {
     key_pool_init
 
     # ── Primary attempt (current key, primary model) ──
-    agent_once_with_disable "$prompt" "$log_name" "$@"
+    # 用 _agent_once_with_check（不带 disable）：disable 由下方 react 循环统一决策。
+    _agent_once_with_check "$prompt" "$log_name" "$@"
     case $? in
         0) key_pool_on_success; return 0;;
     esac
@@ -286,10 +312,14 @@ agent_with_retry() {
         local model_args=$(agent_backend_model_args "$model")
         echo "          ⚠️ 重试 $attempt/$max_attempts ($model / $step): $base_log" >&2
 
-        if [ -n "$session_id" ]; then
-            agent_once_session_resume "继续" "$name" "$session_id" $model_args
+        # 执行 + 业务检查（不带 disable —— react 循环顶部已统一决策）。
+        # 续接分支：后端支持且 session_id 在 → 用 --resume + 提示词"继续"接着跑；
+        # 否则用原 $prompt 开新会话重跑。
+        local resume_args=$(agent_backend_resume_args "$session_id")
+        if [ -n "$resume_args" ]; then
+            _agent_once_with_check "继续" "$name" $resume_args $model_args
         else
-            agent_once_with_disable "$prompt" "$name" $model_args
+            _agent_once_with_check "$prompt" "$name" $model_args
         fi
 
         case $? in
