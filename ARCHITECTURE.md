@@ -45,12 +45,11 @@ src/llm_provider_manager/
     claude.py            #   ClaudeAgent：preferred_protocols=("anthropic",)
     opencode.py          #   OpencodeAgent：preferred_protocols=("openai","anthropic")
   providers/             # 轴 2：provider 后端（错误分类）
-    __init__.py          #   ProviderBackend 协议 + REGISTRY + classify/effective_error_handling
-    base.py              #   Signals + extract_signals（共享 payload 预解析）
-    default.py           #   DefaultProvider（兜底；_default=rotate）
-    zhipu.py             #   ZhipuProvider（内置 1305/1308/1310 码默认动作）
-    bailian.py           #   BailianProvider（内置留空，待填充）
-    opencsitool.py       #   OpencsitoolProvider（预算/429 文本匹配 → disable,rotate）
+    __init__.py          #   ATOMS/DEFAULT_ACTION + ProviderBackend 协议 + REGISTRY + classify/effective_error_handling
+    default.py           #   DefaultProvider（兜底；不解析 payload，直接 _default=rotate）
+    zhipu.py             #   ZhipuProvider + 自带 payload 解析（[NNNN] 码 → Signals）
+    bailian.py           #   BailianProvider（纯继承 default）
+    opencsitool.py       #   OpencsitoolProvider（自带文本匹配：预算/429 → disable,rotate）
   cli.py                 # 通用编排层：use / generate / list / status
   config.py              # JSONC 加载 + 权限检查
   env_contract.py        # 通用 shell helper（sh_export 等）
@@ -78,14 +77,14 @@ src/llm_provider_manager/
 
 ## 4. Provider 后端（错误分类）
 
-每个 provider 模块**内置** `default_error_handling`（码→动作映射），**不依赖配置文件**。`providers.jsonc` 的 `errorHandling` 是覆盖层，合并到内置默认之上。provider 在零配置时仍能正确分类。
+每个 provider 模块**内置** `default_error_handling`（码→动作映射），**不依赖配置文件**。`providers.jsonc` 的 `errorHandling` 是覆盖层，合并到内置默认之上。provider 在零配置时仍能正确分类。**框架对 payload 盲眼**——`classify()` 把原始 payload 文本透传给 backend，解析方式由各 provider 自定：
 
-| provider 模块 | 内置码 | 说明 |
-|---|---|---|
-| `default.py` | （空） | 兜底；`_default=rotate` |
-| `zhipu.py` | 1301/1305/1308/1310 | GLM 上游码 |
-| `bailian.py` | （空，待填充） | 当前靠配置或兜底 |
-| `opencsitool.py` | budget/429（文本匹配） | 预算耗尽 → `disable,rotate`；其余落 `_default` |
+| provider 模块 | payload 解析 | 内置码 | 说明 |
+|---|---|---|---|
+| `default.py` | 不解析 | （空） | 兜底；直接返回 `_default=rotate` |
+| `zhipu.py` | `[NNNN]` 方括号码 / JSON `code`/`status` | 1301/1305/1308/1310 | GLM 上游码 |
+| `bailian.py` | （继承 default） | （空，待填充） | 当前靠配置或兜底 |
+| `opencsitool.py` | 自文本匹配 budget/429 | budget/429 | 预算耗尽 → `disable,rotate`；其余落 `_default` |
 
 动作词表（原子，逗号组合）：`disable` / `rotate` / `downgrade`。策略是有序原子串，如 `disable,rotate`、`rotate,downgrade`。`disable` 是一等原子——出现才禁用 key（不再像旧版那样隐含在 `rotate` 里），所以内容安全类错误（1301/1305）可以换 key/降级而**不**禁用 key。`classify` 返回原子策略串本身（如 `disable,rotate`、`downgrade`）。zhipu 内置：1301→`rotate,downgrade`、1305→`downgrade`、1308/1310→`disable,rotate`、`_default`→`rotate`（未知错误只换 key，不赌 key 坏或该降级）。
 
@@ -148,7 +147,7 @@ hook 内部用**绝对路径** `$HOME/.local/bin/lpm` 而非裸 `lpm` 调用 CLI
 
 ### 新增一个 provider
 
-1. 在 `providers/` 加 `<name>.py`，实现 `ProviderBackend` 协议（`id`/`default_error_handling`/`classify`）。可直接继承 `DefaultProvider` 复用通用逻辑。
+1. 在 `providers/` 加 `<name>.py`，实现 `ProviderBackend` 协议（`id`/`default_error_handling`/`classify`）。`classify` 自行解析 payload（框架不做预解析）；可继承 `DefaultProvider` 拿到"直接返回 `_default`"的兜底行为，再按需 override。
 2. 在 `providers/__init__.py` 的 `_build_registry()` 加一行。
 3. 在 `providers.jsonc` 加该 provider 的配置（`errorHandling` 可选——覆盖内置默认）。
 

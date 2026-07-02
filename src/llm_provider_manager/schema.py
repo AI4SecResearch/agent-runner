@@ -21,9 +21,9 @@ Protocol = str  # "anthropic" | "openai" | other
 KNOWN_PROTOCOLS = ("anthropic", "openai")
 
 # Recovery action vocabulary: composable atom strings defined in
-# providers/base.py (ATOMS = disable/rotate/downgrade). errorHandling values
+# providers/__init__.py (ATOMS = disable/rotate/downgrade). errorHandling values
 # in providers.jsonc are comma-joined atom strings, e.g. "disable,rotate".
-# The canonical default lives in providers.base.DEFAULT_ACTION (not here) so
+# The canonical default lives in providers.DEFAULT_ACTION (not here) so
 # the vocabulary has a single source next to the classify logic that consumes it.
 
 
