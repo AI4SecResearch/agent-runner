@@ -49,21 +49,27 @@ agent_backend_invoke() {
 }
 
 # Has the agent emitted its terminal event? (watchdog early-exit)
-# OpenCode emits step_finish on success or error on failure; both end the turn.
+# OpenCode emits a step_finish at the end of every model step: an intermediate
+# tool-handoff step has part.reason=="tool-calls" (agent continues), only
+# part.reason=="stop" (or null/absent) marks the terminal step. An error event
+# also ends the turn. Early-exit on those, not on tool-calls steps.
 # Usage: agent_backend_is_complete <prefix>
 agent_backend_is_complete() {
     local jsonl="${1}.jsonl"
-    [ -f "$jsonl" ] && grep -qE '"type":"(step_finish|error)"' "$jsonl"
+    [ -f "$jsonl" ] && jq -e \
+        'select(.type == "error" or (.type == "step_finish" and (.part.reason == "stop" or .part.reason == null)))' \
+        "$jsonl" >/dev/null 2>&1
 }
 
-# Did the run succeed? Returns 0 if a step_finish is present and no error event.
+# Did the run succeed? Returns 0 if a terminal step_finish (part.reason=="stop"
+# or null) is present and no error event.
 # Note: opencode exits 1 on error, but agent_backend_invoke pipes through tee|jq,
 # so the pipeline's exit status reflects jq, not opencode — must inspect JSONL.
 # Usage: agent_backend_result_ok <prefix>
 agent_backend_result_ok() {
     local jsonl="${1}.jsonl"
     [ -s "$jsonl" ] || return 1
-    jq -se 'any(.[]; .type == "step_finish") and all(.[]; .type != "error")' \
+    jq -se 'any(.[]; .type == "step_finish" and (.part.reason == "stop" or .part.reason == null)) and all(.[]; .type != "error")' \
         "$jsonl" >/dev/null 2>&1
 }
 

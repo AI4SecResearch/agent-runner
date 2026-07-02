@@ -74,8 +74,8 @@ utils/agent-runner/
 | op | 通用层用途 | claude-code 实现 | opencode 实现 |
 |---|---|---|---|
 | `agent_backend_invoke <prompt> <prefix> [argv…]` | 跑一步；写 `$prefix.jsonl`，stdout 打印结果文本 | `claude -p … --output-format stream-json \| tee \| jq .result`（经 `_landlock_wrap`） | `opencode run … --format json \| tee \| jq .text` |
-| `agent_backend_is_complete <prefix>` | 看门狗早退（agent 写完结果即退出，不等进程结束） | grep `"type":"result"` | grep `"type":"(step_finish\|error)"` |
-| `agent_backend_result_ok <prefix>` | 判定成功/失败 | `type==result` 且 `is_error` 为假 | 有 `step_finish` 且无 `error` 事件 |
+| `agent_backend_is_complete <prefix>` | 看门狗早退（agent 写完结果即退出，不等进程结束） | grep `"type":"result"` | `jq`：`.type=="error"` 或（`.type=="step_finish"` 且 `.part.reason=="stop"/null`） |
+| `agent_backend_result_ok <prefix>` | 判定成功/失败 | `type==result` 且 `is_error` 为假 | 有终态 `step_finish`（`.part.reason=="stop"/null`）且无 `error` 事件 |
 | `agent_backend_result_text <prefix>` | 取错误 payload（JSON） | `{"message": .result}` | `{"message", "code"(responseBody.code), "status"(statusCode)}` |
 | `agent_backend_session_id <prefix>` | 读 agent 生成的会话 id（用于续接） | `select(.session_id!=null)` | `select(.sessionID!=null)` |
 | `agent_backend_perm_args` | 权限 flag 片段 | `--dangerously-skip-permissions` / `--permission-mode acceptEdits` | 沙箱下 `--dangerously-skip-permissions`，否则空（交由 opencode.json 配置） |
