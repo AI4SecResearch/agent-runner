@@ -6,7 +6,7 @@ config overrides merge on top. Providers classify correctly with NO config.
 from __future__ import annotations
 
 from llm_provider_manager import providers as providers_mod
-from llm_provider_manager.providers.base import extract_signals
+from llm_provider_manager.providers.zhipu import extract_signals
 
 
 # ── extract_signals ───────────────────────────────────────────────
