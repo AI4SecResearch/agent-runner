@@ -131,22 +131,21 @@ class KeyPool:
         e = self._current_entry()
         return self.config.provider_by_id(e[1]) if e else None
 
-    def _apply_line(self, key_value):
+    def _apply_line(self, entry):
         """Print the JSON line the key-pool wrappers consume, or an empty line.
 
-        ``key_value`` is the selected key (returned by init/rotate/on_success);
-        the provider + key_id are resolved from the current pool index so the
-        base_url/models match the key. Empty arg (or no current entry) → empty
-        line (preserves the ``[ -n "$key" ]`` signal for runner.sh).
+        ``entry`` is a ``(key_value, provider_id, key_id)`` tuple that the
+        caller (init/rotate/on_success) already resolved under the state lock.
+        Deriving the provider here from the current pool index would re-read
+        state outside that lock — a TOCTOU window where a concurrent rotate
+        could pair this key with another provider's base_url/models. An empty
+        or ``None`` entry prints an empty line (the wrappers treat that as a
+        no-op).
         """
-        if not key_value:
+        if not entry:
             print("")
             return
-        entry = self._current_entry()
-        if entry is None:
-            print("")
-            return
-        _, pid, kid = entry
+        key_value, pid, kid = entry
         provider = self.config.provider_by_id(pid)
         base_url = self._agent.base_url_for(provider) or ""
         primary, downgrade = _resolve_models(provider, kid)
@@ -252,36 +251,48 @@ class KeyPool:
         return keys[idx % len(keys)]
 
     def init(self):
-        """Initialize state file from config, return current key."""
-        keys = self._keys()
-        if not keys:
-            return ""
+        """Initialize state file from config, return the current pool entry.
+
+        Returns a ``(key_value, provider_id, key_id)`` entry for the current
+        index, or ``None`` if the pool is empty. The index is read once from
+        state and the entry derived from it directly (no second state read),
+        so the key and its provider cannot drift apart.
+        """
+        entries = self._entries()
+        if not entries:
+            return None
         self._init_state()
         idx = self._read_state().get("current_index", 0)
-        key = self.current_key()
-        _dbg(f"init: [{idx}] ({self._label(self._entry_at(idx))}) key={key[:8]}...")
-        return key
+        entry = self._entry_at(idx)
+        _dbg(f"init: [{idx}] ({self._label(entry)}) key={(entry[0] if entry else '')[:8]}...")
+        return entry
 
     def rotate(self):
-        """Atomically advance to next non-disabled key, return new key."""
+        """Atomically advance to next non-disabled key, return its entry.
+
+        Returns a ``(key_value, provider_id, key_id)`` entry for the new index
+        (resolved under the same LOCK_EX that advanced the index), or ``None``
+        if the pool is empty or every key is disabled.
+        """
         keys = self._keys()
         if not keys:
-            return ""
+            return None
 
         def _rotate(data):
             self._purge_expired(data)
             disabled = self._active_disabled(data)
             if len(disabled) >= len(keys):
                 _dbg(f"rotate: all {len(keys)} keys disabled")
-                return ""
+                return None
             cur = data.get("current_index", 0)
             new_idx = (cur + 1) % len(keys)
             while new_idx in disabled:
                 new_idx = (new_idx + 1) % len(keys)
             data["current_index"] = new_idx
-            _dbg(f"rotate: {cur}→{new_idx} ({self._label(self._entry_at(new_idx))}) "
+            entry = self._entry_at(new_idx)
+            _dbg(f"rotate: {cur}→{new_idx} ({self._label(entry)}) "
                  f"key={keys[new_idx][:8]}... disabled={disabled}")
-            return keys[new_idx]
+            return entry
 
         return self._modify_state(_rotate)
 
@@ -321,7 +332,14 @@ class KeyPool:
         return active
 
     def on_success(self):
-        """Check proactive rotation. Returns new key if rotated, else empty string."""
+        """Check proactive rotation; return the new entry if rotated, else None.
+
+        On a non-rotating success returns ``None`` (no-op signal to the
+        wrapper). When ``success_count`` reaches ``rotate_every``, advances to
+        the next non-disabled key and returns its ``(key_value, provider_id,
+        key_id)`` entry, resolved under the same LOCK_EX that advanced the
+        index so the key and its provider stay consistent.
+        """
         rotate_every = self.config.settings.rotate_every
 
         def _on_success(data):
@@ -330,20 +348,21 @@ class KeyPool:
             if count < rotate_every:
                 data["success_count"] = count
                 _dbg(f"on_success: count={count}/{rotate_every}")
-                return ""
+                return None
             data["success_count"] = 0
             keys = self._keys()
             disabled = self._active_disabled(data)
             if len(disabled) >= len(keys):
-                return ""
+                return None
             cur = data.get("current_index", 0)
             new_idx = (cur + 1) % len(keys)
             while new_idx in disabled:
                 new_idx = (new_idx + 1) % len(keys)
             data["current_index"] = new_idx
+            entry = self._entry_at(new_idx)
             _dbg(f"on_success: count={count}/{rotate_every}, rotating {cur}→{new_idx} "
-                 f"({self._label(self._entry_at(new_idx))}) key={keys[new_idx][:8]}...")
-            return keys[new_idx]
+                 f"({self._label(entry)}) key={keys[new_idx][:8]}...")
+            return entry
 
         return self._modify_state(_on_success)
 
