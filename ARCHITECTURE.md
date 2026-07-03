@@ -85,7 +85,10 @@ utils/agent-runner/
 | `agent_backend_api_key_env_var` | 该 agent 读取 API key 的环境变量名（密钥池导出 key 到此） | `ANTHROPIC_AUTH_TOKEN` | `${OPENCODE_AUTH_ENV_VAR:-Z_AI_API_KEY}` |
 | `agent_backend_base_url_env_var` | 该 agent 读取 base_url 的环境变量名（密钥池导出 base_url 到此）。**空输出 = 该 backend 不从密钥池读 base_url**（opencode 按 model 前缀在 opencode.json 路由） | `ANTHROPIC_BASE_URL` | _(空)_ |
 
-> **关键约束**：后端不读 `$OUTPUT_DIR`——日志路径以 `<prefix>` 参数传入（后端自行追加 `.jsonl`/`.err`）。`<prefix>` = `$OUTPUT_DIR/$log_name`，由通用层构造。
+> **关键约束**：路径语义分层（两层 API 的 `log` 参数含义不同）：
+> - 公开 API（`agent_with_retry`, `agent_once_session_resume` 等）的 `log_name` 是**运行实例相对**——`$OUTPUT_DIR` 下的子路径；
+>   - 通用层内部拼成 `<prefix> = $OUTPUT_DIR/$log_name` 再传给后端。
+> - 底层接口 `agent_backend_*` 接收的 `<prefix>` 是**全路径**，不感知运行实例。
 
 后端在 source 时设置自己的默认值（如 `PRIMARY_MODEL`、`DOWNGRADE_MODEL`，agent 无关；密钥池可按 provider 覆盖），这样具体模型 id 默认值也留在后端内、不污染通用代码。
 
@@ -258,7 +261,7 @@ provider 模块（错误码→动作）属于 vendored lpm 的 `providers/`，**
 ## 附：不变量与约定
 
 - **通用层不出现 agent 专有符号**：`runner.sh` 的编排逻辑里不出现 `claude`/`opencode`/`--output-format`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 等；这些都在 `backends/` 与 vendored lpm 的 `agents/`。`runner.py` 是适配器，仅含 `$AGENT_BACKEND` → lpm agent id 的映射表（`claude-code`→`claude` 等）这一必要 glue。模型变量 `PRIMARY_MODEL`/`DOWNGRADE_MODEL` 是 agent 无关的，故可在通用层导出。
-- **`$OUTPUT_DIR` 不进后端**：后端只接收 `<prefix>`。
+- **`$OUTPUT_DIR` 不进后端**：公开 API 的 `log_name` 相对运行实例，而后端只接收由通用层构造的全路径 `<prefix>`（= `$OUTPUT_DIR/$log_name`）；直接调 `agent_backend_*` 时调用方自己拼全路径，不能只传 `log_name`。
 - **会话续接可降级**：后端不实现 resume 时，`agent_once_session_resume` 退化为全新会话而非报错。
 - **退出码约定**：`_agent_once_with_check` → `0` 成功 / `1` 失败（可重试）；`_agent_once_with_disable` 多一个 `2`=额度耗尽且无密钥池（放弃）；`agent_with_retry` → `0` 成功 / `1` 均失败；`agent_once_session_resume` 透传 `_agent_once_with_disable` 的 0/1/2。
 - **管道退出状态不被依赖**：`agent_once` 的 pipeline 返回的是 `jq` 的状态（无 `set -o pipefail`）；成功与否一律由 `agent_backend_result_ok` 读日志判定。
