@@ -100,17 +100,17 @@ utils/agent-runner/
 agent_with_retry / agent_once_session_resume   ← 公开入口
   └─ _agent_once_with_disable    + 失败时禁用当前 key（仅 session_resume 用）
        └─ _agent_once_with_check     + 业务面结果检查（agent_with_retry 用）
-            └─ _agent_once_with_watchdog  后台执行 + 早退/超时/无进展监控
-                 └─ agent_once            组装 argv 并调 agent_backend_invoke
+             └─ _agent_once_with_watchdog  后台执行 + 早退/超时/无进展监控
+                  └─ _agent_once           组装 argv 并调 agent_backend_invoke
 ```
 
 disable 决策的位置是两条公开入口的分水岭：`agent_with_retry` 自带 reactive 重试循环，disable/rotate/downgrade 由循环顶部调 `react` 统一决定，故其单次执行用 `_agent_once_with_check`（**不**自行 disable）；`agent_once_session_resume` 是单次入口（无外层循环替它决策），失败时自行 disable，故用 `_agent_once_with_disable`。
 
 | 函数 | 职责 |
 |---|---|
-| `agent_once <prompt> <log_name> [extra…]` | 组装 argv：`agent_backend_perm_args` + （调用方未给 `--model` 时注入 `agent_backend_model_args primary`）+ 调用方透传参数 → `agent_backend_invoke`。这保证**只有一个 `--model`**（调用方覆盖 primary）。 |
-| `_agent_once_with_watchdog` | 后台跑 `agent_once`；轮询：`agent_backend_is_complete` 命中则早退；否则检测总超时（`AGENT_TIMEOUT`）与无进展超时（`AGENT_STALL_TIMEOUT`，看 jsonl 文件增长）；超时则按"先杀子进程再杀父 shell"的顺序清理。返回 0=正常结束 / 1=超时 kill（进程面，不判业务结果）。 |
-| `_agent_once_with_check` | watchdog + `check_agent_result`（=`agent_backend_result_ok`）。返回 0=成功 / 1=失败（可重试）。**不碰 key pool**——disable 由调用方负责。 |
+| `_agent_once <prompt> <log_name> [extra…]` | 组装 argv：`agent_backend_perm_args` + （调用方未给 `--model` 时注入 `agent_backend_model_args primary`）+ 调用方透传参数 → `agent_backend_invoke`。这保证**只有一个 `--model`**（调用方覆盖 primary）。 |
+| `_agent_once_with_watchdog` | 后台跑 `_agent_once`；轮询：`agent_backend_is_complete` 命中则早退；否则检测总超时（`AGENT_TIMEOUT`）与无进展超时（`AGENT_STALL_TIMEOUT`，看 jsonl 文件增长）；超时则按"先杀子进程再杀父 shell"的顺序清理。返回 0=正常结束 / 1=超时 kill（进程面，不判业务结果）。 |
+| `_agent_once_with_check` | watchdog + `_check_agent_result`（=`agent_backend_result_ok`）。返回 0=成功 / 1=失败（可重试）。**不碰 key pool**——disable 由调用方负责。 |
 | `_agent_once_with_disable` | `_agent_once_with_check` + 失败处理：`classify_agent_error` 取 `disable` 标志，为真则 `key_pool_disable`。返回 0/1/2（2=额度耗尽且无密钥池，放弃）。仅 `agent_once_session_resume` 用。 |
 | `agent_once_session_resume <prompt> <log_name> <sid> [extra…]` | 单次续接入口：取 `agent_backend_resume_args <sid>`，带续接 flag 跑 `_agent_once_with_disable`（后端不支持续接时续接参数为空，退化为全新会话）。模块多步流（doc-parse 的 TOC→精修）和跨进程会话（baseline-vote-mapping）用它。 |
 | `agent_with_retry <prompt> <log_name> [extra…]` | 顶层重试入口，**反应式**：① `key_pool_init` 导出当前密钥；② 首次 `_agent_once_with_check`（primary）；③ 失败则进入循环——每次把上次失败喂给 `runner.py react`，拿单步策略（`disable,rotate`/`downgrade`/…/`stop`），按策略执行 `key_pool_disable`/`key_pool_rotate`/选模型后用 `_agent_once_with_check` 再试（有 session_id 则续接、提示词"继续"，否则用原 prompt 开新会话）；下次失败重新 `react`，按新错误决策。`n+2` 次（n=可用 key 数）或 `react` 返回 `stop` 时停。 |
@@ -212,9 +212,9 @@ module loop.sh
        key_pool_init ──▶ _kp_apply: export <auth_env_var>=<key>（+ base_url / PRIMARY_MODEL / DOWNGRADE_MODEL）
        _agent_once_with_check
          _agent_once_with_watchdog
-           agent_once ──▶ agent_backend_invoke ──▶ claude/opencode ──▶ $prefix.jsonl
+            _agent_once ──▶ agent_backend_invoke ──▶ claude/opencode ──▶ $prefix.jsonl
            (is_complete 早退 / 超时监控)
-         check_agent_result = agent_backend_result_ok ──▶ 0
+         _check_agent_result = agent_backend_result_ok ──▶ 0
        key_pool_on_success ──▶ 成功计数（可能轮换）
        return 0
 ```
@@ -264,4 +264,4 @@ provider 模块（错误码→动作）属于 vendored lpm 的 `providers/`，**
 - **`$OUTPUT_DIR` 不进后端**：公开 API 的 `log_name` 相对运行实例，而后端只接收由通用层构造的全路径 `<prefix>`（= `$OUTPUT_DIR/$log_name`）；直接调 `agent_backend_*` 时调用方自己拼全路径，不能只传 `log_name`。
 - **会话续接可降级**：后端不实现 resume 时，`agent_once_session_resume` 退化为全新会话而非报错。
 - **退出码约定**：`_agent_once_with_check` → `0` 成功 / `1` 失败（可重试）；`_agent_once_with_disable` 多一个 `2`=额度耗尽且无密钥池（放弃）；`agent_with_retry` → `0` 成功 / `1` 均失败；`agent_once_session_resume` 透传 `_agent_once_with_disable` 的 0/1/2。
-- **管道退出状态不被依赖**：`agent_once` 的 pipeline 返回的是 `jq` 的状态（无 `set -o pipefail`）；成功与否一律由 `agent_backend_result_ok` 读日志判定。
+- **管道退出状态不被依赖**：`_agent_once` 的 pipeline 返回的是 `jq` 的状态（无 `set -o pipefail`）；成功与否一律由 `agent_backend_result_ok` 读日志判定。

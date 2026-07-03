@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Agent invocation with reliability features (agent-agnostic).
-# Provides: agent_once, _agent_once_with_watchdog, _agent_once_with_check,
+# Provides: _agent_once, _agent_once_with_watchdog, _agent_once_with_check,
 #           _agent_once_with_disable, agent_with_retry, agent_once_session_resume
 #
 # All agent-specific behavior (binary, flags, output format, log parsing) lives in
@@ -97,9 +97,9 @@ key_pool_available_size() {
 
 # ── Result check & error classification ───────────────────────────
 
-# 用法: check_agent_result <log_name>
+# 用法: _check_agent_result <log_name>
 # 返回 0=成功  1=失败
-check_agent_result() {
+_check_agent_result() {
     agent_backend_result_ok "$OUTPUT_DIR/$1"
 }
 
@@ -114,10 +114,10 @@ classify_agent_error() {
 # ── Process execution (pure bash, generic) ────────────────────────
 
 # Run a single agent step with standard output routing.
-# Usage: agent_once <prompt> <log_name> [extra_args...]
+# Usage: _agent_once <prompt> <log_name> [extra_args...]
 # Extra args are passed through to the agent; a caller-supplied --model takes
 # precedence over the primary model (exactly one --model is emitted).
-agent_once() {
+_agent_once() {
     local prompt="$1"
     local log_name="$2"
     shift 2
@@ -132,8 +132,8 @@ agent_once() {
     agent_backend_invoke "$prompt" "$prefix" "${argv[@]}"
 }
 
-# 后台执行 agent_once 并监控 jsonl 增长，超时则 kill
-# 用法与 agent_once 一致: _agent_once_with_watchdog <prompt> <log_name> [extra_args...]
+# 后台执行 _agent_once 并监控 jsonl 增长，超时则 kill
+# 用法与 _agent_once 一致: _agent_once_with_watchdog <prompt> <log_name> [extra_args...]
 # 返回 0=正常结束  1=超时被 kill
 _agent_once_with_watchdog() {
     local prompt="$1"
@@ -143,7 +143,7 @@ _agent_once_with_watchdog() {
     local stall_timeout="${AGENT_STALL_TIMEOUT:-300}"
     local max_timeout="${AGENT_TIMEOUT:-0}"
 
-    agent_once "$prompt" "$log_name" "$@" > /dev/null &
+    _agent_once "$prompt" "$log_name" "$@" > /dev/null &
     local job_pid=$!
 
     local start_time last_size last_growth
@@ -199,7 +199,7 @@ _agent_once_with_watchdog() {
     return 0
 }
 
-# 执行一次 agent 并做业务面结果检查（watchdog + check_agent_result）。
+# 执行一次 agent 并做业务面结果检查（watchdog + _check_agent_result）。
 # 返回: 0=成功  1=失败(可重试)
 # 不碰 key pool —— disable 决策由调用方负责（agent_with_retry 的 react 循环
 # 在循环顶部统一决定，单次执行不重复 disable）。
@@ -209,7 +209,7 @@ _agent_once_with_check() {
     shift 2
 
     _agent_once_with_watchdog "$prompt" "$log_name" "$@" \
-        && check_agent_result "$log_name" \
+        && _check_agent_result "$log_name" \
         && return 0
 
     return 1
@@ -243,7 +243,8 @@ _agent_once_with_disable() {
     return 1
 }
 
-# 恢复会话执行一次；若后端不支持续接则退化为全新会话。失败时按错误分类
+# 恢复会话执行一次；若后端不支持续接则退化为全新会话。自初始化 key pool
+# （与 agent_with_retry 对齐），。失败时按错误分类
 # 禁用当前 key（单次入口自带 disable，因为没有外层重试循环代为决策）。
 # 用法: agent_once_session_resume <prompt> <log_name> <session_id> [extra_args...]
 # 返回: 0=成功  1=失败  2=额度耗尽且无 key pool(放弃)
@@ -252,6 +253,7 @@ agent_once_session_resume() {
     local log_name="$2"
     local sid="$3"
     shift 3
+    key_pool_init
     local resume_args=$(agent_backend_resume_args "$sid")
     _agent_once_with_disable "$prompt" "$log_name" $resume_args "$@"
 }

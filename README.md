@@ -94,14 +94,6 @@ Provider/key 配置即 [llm-provider-manager](llm-provider-manager/) 的 `provid
 
 ### runner.sh
 
-**`agent_once <prompt> <log_name> [extra_args...]`**
-
-运行一次 agent CLI。写入 `$OUTPUT_DIR/<log_name>.jsonl`（事件日志）、`$OUTPUT_DIR/<log_name>.err`（stderr），并将结果文本打印到 stdout。
-
-**`check_agent_result <log_name>`**
-
-检查一次已完成的运行是否产生了成功结果。成功返回 0，出错返回 1。
-
 **`agent_with_retry <prompt> <log_name> [extra_args...]`**
 
 带 watchdog 运行；失败时进行反应式重试——每次失败后，lpm 的 `react` 对该次错误做分类并返回一步恢复策略（逗号连接的原子：`disable`/`rotate`/`downgrade`，或 `stop`），由循环在下次尝试前应用。下一次失败会重新分类，因此换上的新 key 若遇到不同的错误码会得到相称的恢复策略。任一次成功即返回 0，全部失败返回 1。
