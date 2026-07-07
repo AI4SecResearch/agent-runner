@@ -4,12 +4,12 @@
 
 ## 1. 架构总览
 
-agent-runner 只保留**编排层**（`runner.sh`）与 **Agent backend**（`backends/*.sh`）。**密钥池 / provider / 错误分类 / 协议选择**由 vendoring 进来的 lpm 提供，`runner.py` 是把它们接起来的薄适配器。编排层对外暴露一组通用 API（`agent_with_retry`、`agent_once`、`agent_once_session_resume` 等），供上层任务调用。各模块的 `loop.sh`（doc-parse、baseline-vote-mapping 等）是 agent-runner 的**调用方**，不属于 agent-runner——下图用 `═══` 边界线标出范围：
+agent-runner 只保留**编排层**（`runner.sh`）与 **Agent backend**（`backends/*.sh`）。**密钥池 / provider / 错误分类 / 协议选择**由 vendoring 进来的 lpm 提供，`runner.py` 是把它们接起来的薄适配器。编排层对外暴露一组通用 API（`agent_with_retry_session_{new,resume,fork}`、别名 `agent_with_retry`、`agent_once_session_resume` 等），供上层任务调用。各模块的 `loop.sh`（doc-parse、baseline-vote-mapping 等）是 agent-runner 的**调用方**，不属于 agent-runner——下图用 `═══` 边界线标出范围：
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │ Task (consumer; not part of agent-runner)                      │
-│ loop.sh: doc-parse, baseline-vote-mapping, ...                 │
+│   loop.sh: doc-parse, baseline-vote-mapping, ...               │
 └───────────────────────────────┬────────────────────────────────┘
                                 │ calls
                                 ▼
@@ -18,7 +18,7 @@ agent-runner 只保留**编排层**（`runner.sh`）与 **Agent backend**（`bac
 ══════════════════════════════════════════════════════════════════
 ┌────────────────────────────────────────────────────────────────┐
 │ Orchestration (runner.sh)                                      │
-│ agent_with_retry / agent_once / agent_once_session_resume      │
+│   agent_with_retry_session_{new,resume,fork}, ...              │
 └─────────────┬───────────────────────────────┬──────────────────┘
               │ execute                       │ keypool ops
               ▼                               ▼
@@ -80,13 +80,13 @@ utils/agent-runner/
 | `agent_backend_session_id <prefix>` | 读 agent 生成的会话 id（用于续接） | `select(.session_id!=null)` | `select(.sessionID!=null)` |
 | `agent_backend_perm_args` | 权限 flag 片段 | `--dangerously-skip-permissions` / `--permission-mode acceptEdits` | 沙箱下 `--dangerously-skip-permissions`，否则空（交由 opencode.json 配置） |
 | `agent_backend_model_args <tier>` | 模型 flag 片段；`tier` = `primary`/`downgrade`/裸 id。读 agent 无关的 `$PRIMARY_MODEL` / `$DOWNGRADE_MODEL`（密钥池按 provider 导出） | `--model $PRIMARY_MODEL` / `$DOWNGRADE_MODEL` / `$1` | `--model $PRIMARY_MODEL` / `$DOWNGRADE_MODEL` / `$1` |
-| `agent_backend_resume_args <id>` | 续接 flag（**空输出 = 不支持续接 → 退化为全新会话**） | `--resume <id>` | `-s <id>` |
-| `agent_backend_fork_args` | 分叉会话 flag | `--fork-session` | `--fork` |
+| `agent_backend_resume_args <id>` | 续接所需的**全部** flag（**空输出 = 不支持续接 → 退化为全新会话**） | `--resume <id>` | `-s <id>` |
+| `agent_backend_fork_args <id>` | 分叉所需的**全部** flag（≈ 续接 flag + 分叉 flag；`<id>` 为空则输出为空 → 退化为全新会话） | `--resume <id> --fork-session` | `-s <id> --fork` |
 | `agent_backend_api_key_env_var` | 该 agent 读取 API key 的环境变量名（密钥池导出 key 到此） | `ANTHROPIC_AUTH_TOKEN` | `${OPENCODE_AUTH_ENV_VAR:-Z_AI_API_KEY}` |
 | `agent_backend_base_url_env_var` | 该 agent 读取 base_url 的环境变量名（密钥池导出 base_url 到此）。**空输出 = 该 backend 不从密钥池读 base_url**（opencode 按 model 前缀在 opencode.json 路由） | `ANTHROPIC_BASE_URL` | _(空)_ |
 
 > **关键约束**：路径语义分层（两层 API 的 `log` 参数含义不同）：
-> - 公开 API（`agent_with_retry`, `agent_once_session_resume` 等）的 `log_name` 是**运行实例相对**——`$OUTPUT_DIR` 下的子路径；
+> - 公开 API（`agent_with_retry_session_{new,resume,fork}`、别名 `agent_with_retry`、`agent_once_session_resume` 等）的 `log_name` 是**运行实例相对**——`$OUTPUT_DIR` 下的子路径；
 >   - 通用层内部拼成 `<prefix> = $OUTPUT_DIR/$log_name` 再传给后端。
 > - 底层接口 `agent_backend_*` 接收的 `<prefix>` 是**全路径**，不感知运行实例。
 
@@ -97,14 +97,21 @@ utils/agent-runner/
 函数自底向上分层包装（每层叠加一项能力）：
 
 ```
-agent_with_retry / agent_once_session_resume   ← 公开入口
-  └─ _agent_once_with_disable    + 失败时禁用当前 key（仅 session_resume 用）
-       └─ _agent_once_with_check     + 业务面结果检查（agent_with_retry 用）
-             └─ _agent_once_with_watchdog  后台执行 + 早退/超时/无进展监控
-                  └─ _agent_once           组装 argv 并调 agent_backend_invoke
+agent_with_retry_session_{new,resume,fork}   ← 可靠入口（各自做主试 + 共享重试）
+  │  主试：_agent_once_with_check + 该 op 的 session_args（""/resume/fork）
+  └─ _agent_retry_loop            反应式重试循环（disable/rotate/downgrade 由 react 统一决策）
+       └─ _agent_once_with_check  单次重试 + 业务面结果检查
+
+agent_once_session_resume        ← 单次续接入口（无外层重试循环）
+  └─ _agent_once_with_disable    + 失败时禁用当前 key
+
+（以上均基于：）
+_agent_once_with_check
+  └─ _agent_once_with_watchdog   后台执行 + 早退/超时/无进展监控
+       └─ _agent_once            组装 argv 并调 agent_backend_invoke
 ```
 
-disable 决策的位置是两条公开入口的分水岭：`agent_with_retry` 自带 reactive 重试循环，disable/rotate/downgrade 由循环顶部调 `react` 统一决定，故其单次执行用 `_agent_once_with_check`（**不**自行 disable）；`agent_once_session_resume` 是单次入口（无外层循环替它决策），失败时自行 disable，故用 `_agent_once_with_disable`。
+disable 决策的位置是两类入口的分水岭：`agent_with_retry_session_{new,resume,fork}` 三者各自跑完主试后进入共享的 `_agent_retry_loop`——disable/rotate/downgrade 由循环顶部调 `react` 统一决定，故主试与每次重试都用 `_agent_once_with_check`（**不**自行 disable）；`agent_once_session_resume` 是单次入口（无外层循环替它决策），失败时自行 disable，故用 `_agent_once_with_disable`。三者各自构造主试的 agent 调用（经 `agent_backend_resume_args`/`fork_args` 拿到完整 session flag），**互不调用**——保证针对不同 agent 的通用性；只有重试循环复用 `_agent_retry_loop`。
 
 | 函数 | 职责 |
 |---|---|
@@ -112,8 +119,12 @@ disable 决策的位置是两条公开入口的分水岭：`agent_with_retry` �
 | `_agent_once_with_watchdog` | 后台跑 `_agent_once`；轮询：`agent_backend_is_complete` 命中则早退；否则检测总超时（`AGENT_TIMEOUT`）与无进展超时（`AGENT_STALL_TIMEOUT`，看 jsonl 文件增长）；超时则按"先杀子进程再杀父 shell"的顺序清理。返回 0=正常结束 / 1=超时 kill（进程面，不判业务结果）。 |
 | `_agent_once_with_check` | watchdog + `_check_agent_result`（=`agent_backend_result_ok`）。返回 0=成功 / 1=失败（可重试）。**不碰 key pool**——disable 由调用方负责。 |
 | `_agent_once_with_disable` | `_agent_once_with_check` + 失败处理：`classify_agent_error` 取 `disable` 标志，为真则 `key_pool_disable`。返回 0/1/2（2=额度耗尽且无密钥池，放弃）。仅 `agent_once_session_resume` 用。 |
-| `agent_once_session_resume <prompt> <log_name> <sid> [extra…]` | 单次续接入口：取 `agent_backend_resume_args <sid>`，带续接 flag 跑 `_agent_once_with_disable`（后端不支持续接时续接参数为空，退化为全新会话）。模块多步流（doc-parse 的 TOC→精修）和跨进程会话（baseline-vote-mapping）用它。 |
-| `agent_with_retry <prompt> <log_name> [extra…]` | 顶层重试入口，**反应式**：① `key_pool_init` 导出当前密钥；② 首次 `_agent_once_with_check`（primary）；③ 失败则进入循环——每次把上次失败喂给 `runner.py react`，拿单步策略（`disable,rotate`/`downgrade`/…/`stop`），按策略执行 `key_pool_disable`/`key_pool_rotate`/选模型后用 `_agent_once_with_check` 再试（有 session_id 则续接、提示词"继续"，否则用原 prompt 开新会话）；下次失败重新 `react`，按新错误决策。`n+2` 次（n=可用 key 数）或 `react` 返回 `stop` 时停。 |
+| `_agent_retry_loop <prompt> <base_log> <session_args>` | 共享反应式重试循环（前置：主试已跑完且失败）。读 `base_log` 取主试记录的 session_id 作续接目标，每次失败喂给 `react` 拿单步策略（`disable,rotate`/`downgrade`/…/`stop`），按策略 `key_pool_disable`/`rotate`/选模型后用 `_agent_once_with_check` 再试：有 session_id 则 `--resume <sid>` + "继续"（**续接**，保留进度、维持 fork 独立性），否则按主试原样**重跑**（`session_args` + `$prompt`——fork 场景即重新 fork 自源会话，绝不裸 resume 共享上下文）。`n+2` 次（n=可用 key 数）或 `react` 返回 `stop` 时停。供下面三个入口复用。 |
+| `agent_once_session_resume <prompt> <log_name> <sid> [extra…]` | 单次续接入口：取 `agent_backend_resume_args <sid>`，带续接 flag 跑 `_agent_once_with_disable`（后端不支持续接时续接参数为空，退化为全新会话）。**无重试**——历史单次入口，保留以兼容外部调用方。 |
+| `agent_with_retry_session_new <prompt> <log_name> [extra…]` | 全新会话的可靠入口：`key_pool_init` → 主试 `_agent_once_with_check`（无 session flag）→ 失败则 `_agent_retry_loop`（session_args=""）。等价于原始 `agent_with_retry`。 |
+| `agent_with_retry_session_resume <prompt> <log_name> <sid> [extra…]` | 续接可靠入口：主试带 `agent_backend_resume_args <sid>`（在同一会话上继续）→ 失败则 `_agent_retry_loop`。多步流（doc-parse 的 TOC→精修）用它替代单次的 `agent_once_session_resume`。 |
+| `agent_with_retry_session_fork <prompt> <log_name> <sid> [extra…]` | 分叉可靠入口：主试带 `agent_backend_fork_args <sid>`（拷贝独立会话再跑）→ 失败则 `_agent_retry_loop`。跨进程会话（baseline-vote-mapping 投票）用它。 |
+| `agent_with_retry <prompt> <log_name> [extra…]` | `agent_with_retry_session_new` 的向后兼容别名（共享子模块外部调用方仍用此名）。 |
 
 ### 4.1 密钥池（`runner.sh` 包装 + `runner.py` 核心）
 
@@ -242,13 +253,14 @@ _agent_once_with_check 返回失败（首次尝试，primary）
 ```
 step1: agent_with_retry(toc_prompt, "toc-…")              # agent 创建会话，id 入日志
        sid = agent_backend_session_id("toc-…")
-step2: agent_once_session_resume(refine_prompt, "refine-…", sid)
+step2: agent_with_retry_session_resume(refine_prompt, "refine-…", sid)
          └─ agent_backend_resume_args(sid) → "--resume <sid>"（或 opencode 的 -s）
+         └─ 主试失败 → _agent_retry_loop 续接同一会话重试（带轮换/降级）
          └─ 退化为全新会话（若后端不支持续接）
 ```
 
 ### 9.4 跨进程会话（baseline-vote-mapping）
-阶段 1 在 xargs 子进程建会话、把 id 落 TSV；阶段 2 在另一批 xargs 子进程读 TSV 取 id、用 `agent_once_session_resume(... $(agent_backend_fork_args))` 分叉投票。会话状态靠模块自己的 TSV 传递（与 agent-runner 接口无关）。
+阶段 1 在 xargs 子进程建会话、把 id 落 TSV；阶段 2 在另一批 xargs 子进程读 TSV 取 id、用 `agent_with_retry_session_fork(vote_prompt, log, sid)` 分叉投票（`agent_backend_fork_args <sid>` 自带 resume+fork 全部 flag）。主试失败 → `_agent_retry_loop` 续接已记录的 fork 会话（维持各票独立性）。会话状态靠模块自己的 TSV 传递（与 agent-runner 接口无关）。
 
 ## 10. 扩展点
 
@@ -262,6 +274,6 @@ provider 模块（错误码→动作）属于 vendored lpm 的 `providers/`，**
 
 - **通用层不出现 agent 专有符号**：`runner.sh` 的编排逻辑里不出现 `claude`/`opencode`/`--output-format`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 等；这些都在 `backends/` 与 vendored lpm 的 `agents/`。`runner.py` 是适配器，仅含 `$AGENT_BACKEND` → lpm agent id 的映射表（`claude-code`→`claude` 等）这一必要 glue。模型变量 `PRIMARY_MODEL`/`DOWNGRADE_MODEL` 是 agent 无关的，故可在通用层导出。
 - **`$OUTPUT_DIR` 不进后端**：公开 API 的 `log_name` 相对运行实例，而后端只接收由通用层构造的全路径 `<prefix>`（= `$OUTPUT_DIR/$log_name`）；直接调 `agent_backend_*` 时调用方自己拼全路径，不能只传 `log_name`。
-- **会话续接可降级**：后端不实现 resume 时，`agent_once_session_resume` 退化为全新会话而非报错。
-- **退出码约定**：`_agent_once_with_check` → `0` 成功 / `1` 失败（可重试）；`_agent_once_with_disable` 多一个 `2`=额度耗尽且无密钥池（放弃）；`agent_with_retry` → `0` 成功 / `1` 均失败；`agent_once_session_resume` 透传 `_agent_once_with_disable` 的 0/1/2。
+- **会话续接可降级**：后端不实现 resume/fork（`agent_backend_resume_args`/`fork_args` 返回空）时，`agent_with_retry_session_{resume,fork}` 与 `agent_once_session_resume` 均退化为全新会话而非报错。
+- **退出码约定**：`_agent_once_with_check` → `0` 成功 / `1` 失败（可重试）；`_agent_once_with_disable` 多一个 `2`=额度耗尽且无密钥池（放弃）；`_agent_retry_loop` 与 `agent_with_retry_session_{new,resume,fork}`（及别名 `agent_with_retry`）→ `0` 成功 / `1` 均失败；`agent_once_session_resume` 透传 `_agent_once_with_disable` 的 0/1/2。
 - **管道退出状态不被依赖**：`_agent_once` 的 pipeline 返回的是 `jq` 的状态（无 `set -o pipefail`）；成功与否一律由 `agent_backend_result_ok` 读日志判定。

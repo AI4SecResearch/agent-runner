@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # Agent invocation with reliability features (agent-agnostic).
-# Provides: _agent_once, _agent_once_with_watchdog, _agent_once_with_check,
-#           _agent_once_with_disable, agent_with_retry, agent_once_session_resume
+# Provides: _agent_once{,_with_{watchdog,check,disable}},
+#           _agent_retry_loop, agent_once_session_resume,
+#           agent_with_retry_session_{new,resume,fork}, agent_with_retry (alias),
 #
 # All agent-specific behavior (binary, flags, output format, log parsing) lives in
 # a backend implementing the 10-op interface (see backends/<name>.sh). The active
@@ -260,34 +261,35 @@ agent_once_session_resume() {
 
 # ── Retry orchestration (reactive: one step per failure) ─────────
 
-# 用法: agent_with_retry <prompt> <log_name> [extra_args...]
-# 返回 0=成功  1=均失败
+# 反应式重试的共享循环。每次失败后调 `react` 子命令拿单步恢复策略（逗号组合
+# 的原子 disable/rotate/downgrade，或 stop），执行该步后再试；下次失败重新 react，
+# 按【新错误】重新决策。策略由 providers.jsonc 中 provider 的 errorHandling 决定。
 #
-# 反应式重试：不预先制定完整计划，而是每次失败后调 `react` 子命令拿到
-# 单步恢复策略（逗号组合的原子 disable/rotate/downgrade，或 stop），执行
-# 该步后再试；下次失败重新 react，按【新错误】重新决策。策略由 providers.jsonc
-# 中 provider 的 errorHandling 决定。
-agent_with_retry() {
+# 本函数只负责【重试循环】，不含主试（primary）。前置条件：调用方已完成
+# key_pool_init 并跑完一次失败的主试（日志 base_log）。session_args 是主试所用
+# 的会话 flag（已由调用方经 agent_backend_* 解析：""=全新 / "--resume S"=续接 /
+# "--resume S --fork-session"=分叉），仅在 redo 分支按原样复用。
+#
+# 重试接续策略：主试的 init 行（含 session_id）在任何 LLM 调用前就写入日志，故
+# 即使因额度失败也几乎总能取到 session_id → 走【续接】分支（--resume <已记录>
+# + "继续"），保留进度且（分叉场景）维持 fork 独立性。仅当确实没记录到 session
+# 时走【按主试重跑】分支——分叉场景即重新 fork 自源会话，绝不裸 resume 共享上下文
+# （会污染其它 fork）。
+#
+# 用法: _agent_retry_loop <prompt> <base_log> <session_args>
+# 返回 0=成功  1=均失败
+_agent_retry_loop() {
     local prompt="$1"
-    local log_name="$2"
-    shift 2
+    local base_log="$2"
+    local session_args="$3"
 
-    key_pool_init
+    # 主试日志里记录的 session_id（续接目标）；取不到则 cont_resume 为空 → 走 redo。
+    local cont_sid cont_resume
+    cont_sid=$(agent_backend_session_id "$OUTPUT_DIR/$base_log")
+    cont_resume=$(agent_backend_resume_args "$cont_sid")
 
-    # ── Primary attempt (current key, primary model) ──
-    # 用 _agent_once_with_check（不带 disable）：disable 由下方 react 循环统一决策。
-    _agent_once_with_check "$prompt" "$log_name" "$@"
-    case $? in
-        0) key_pool_on_success; return 0;;
-    esac
-
-    # ── Extract session_id from primary attempt for resumption ──
-    local base_log="$log_name"
-    local session_id=$(agent_backend_session_id "$OUTPUT_DIR/$base_log")
-
-    # ── Reactive loop ──
     local attempt=0
-    local cur_log="$base_log"   # most recent failure's log name (react reads it)
+    local cur_log="$base_log"   # 最近一次失败的日志名（react 读它）
     # 兜底上限：防 react 与池状态不同步导致死循环。正常靠 react 返回 stop 终止。
     # n=可用 key 数；+2 给降级档留余量。无 key pool 时 n=0 → 2 次。
     local n=$(key_pool_available_size 2>/dev/null || echo 0)
@@ -317,13 +319,13 @@ agent_with_retry() {
         echo "          ⚠️ 重试 $attempt/$max_attempts ($model / $step): $base_log" >&2
 
         # 执行 + 业务检查（不带 disable —— react 循环顶部已统一决策）。
-        # 续接分支：后端支持且 session_id 在 → 用 --resume + 提示词"继续"接着跑；
-        # 否则用原 $prompt 开新会话重跑。
-        local resume_args=$(agent_backend_resume_args "$session_id")
-        if [ -n "$resume_args" ]; then
-            _agent_once_with_check "继续" "$name" $resume_args $model_args
+        if [ -n "$cont_resume" ]; then
+            # 续接：在主试已记录的 session 上"继续"（不再 fork / 不重发 session_args）
+            _agent_once_with_check "继续" "$name" $cont_resume $model_args
         else
-            _agent_once_with_check "$prompt" "$name" $model_args
+            # 无 session 可接续 → 按主试原样重跑
+            # （new 重发 $prompt；resume 重接 S；fork 重新 fork 自 S）
+            _agent_once_with_check "$prompt" "$name" $session_args $model_args
         fi
 
         case $? in
@@ -333,6 +335,68 @@ agent_with_retry() {
         cur_log="$name"
     done
 
-    echo "          ⚠️ 重试次数达上限 ($max_attempts): $log_name" >&2
+    echo "          ⚠️ 重试次数达上限 ($max_attempts): $base_log" >&2
     return 1
+}
+
+# ── Public entry points (new / resume / fork) ─────────────────────
+#
+# 三种会话操作的可靠入口，各自构造【自己的】 agent 调用（互不调用，保证针对
+# 不同 agent 的通用性），重试循环统一复用 _agent_retry_loop。主试统一用
+# _agent_once_with_check（不带 disable）—— disable 由 react 循环顶部统一决策。
+# 成功时 key_pool_on_success（降级档除外）。
+
+# 全新会话（== 原始 agent_with_retry 语义）。
+# 用法: agent_with_retry_session_new <prompt> <log_name> [extra_args...]
+# 返回 0=成功  1=均失败
+agent_with_retry_session_new() {
+    local prompt="$1"
+    local log_name="$2"
+    shift 2
+    key_pool_init
+    _agent_once_with_check "$prompt" "$log_name" "$@"
+    case $? in
+        0) key_pool_on_success; return 0;;
+    esac
+    _agent_retry_loop "$prompt" "$log_name" ""
+}
+
+# 在 session_id 上续接执行（resume：在同一会话上继续，积累上下文）。
+# 用法: agent_with_retry_session_resume <prompt> <log_name> <session_id> [extra_args...]
+# 返回 0=成功  1=均失败
+agent_with_retry_session_resume() {
+    local prompt="$1"
+    local log_name="$2"
+    local sid="$3"
+    shift 3
+    key_pool_init
+    local session_args=$(agent_backend_resume_args "$sid")
+    _agent_once_with_check "$prompt" "$log_name" $session_args "$@"
+    case $? in
+        0) key_pool_on_success; return 0;;
+    esac
+    _agent_retry_loop "$prompt" "$log_name" "$session_args"
+}
+
+# 从 session_id 分叉后执行（fork：拷贝一份独立会话再跑）。
+# agent_backend_fork_args 自带 resume+fork 全部 flag，调用方无需再传 fork flag。
+# 用法: agent_with_retry_session_fork <prompt> <log_name> <session_id> [extra_args...]
+# 返回 0=成功  1=均失败
+agent_with_retry_session_fork() {
+    local prompt="$1"
+    local log_name="$2"
+    local sid="$3"
+    shift 3
+    key_pool_init
+    local session_args=$(agent_backend_fork_args "$sid")
+    _agent_once_with_check "$prompt" "$log_name" $session_args "$@"
+    case $? in
+        0) key_pool_on_success; return 0;;
+    esac
+    _agent_retry_loop "$prompt" "$log_name" "$session_args"
+}
+
+# 向后兼容别名（共享子模块的外部调用方仍用此名）。
+agent_with_retry() {
+    agent_with_retry_session_new "$@"
 }

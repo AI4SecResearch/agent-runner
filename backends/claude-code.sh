@@ -99,10 +99,14 @@ agent_backend_resume_args() {
     [ -n "$1" ] && echo "--resume $1"
 }
 
-# Fork flag fragment (start a divergent session from an existing one).
-# Usage: agent_backend_fork_args
+# All flags the agent needs to FORK from an existing session (resume + fork).
+# Composes the resume fragment with the fork flag, so the caller passes a single
+# source session_id and gets the complete arg set. Empty output when $1 is empty
+# (= no source / unsupported) → caller degrades, same convention as resume_args.
+# Usage: agent_backend_fork_args <session_id>
 agent_backend_fork_args() {
-    echo "--fork-session"
+    local r; r=$(agent_backend_resume_args "$1")
+    [ -n "$r" ] && echo "$r --fork-session"
 }
 
 # The env var this agent reads for its API key (the key pool exports the current

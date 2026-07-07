@@ -8,7 +8,7 @@
 
 | 文件 | 用途 |
 |------|---------|
-| `runner.sh` | 通用 agent 调用：`agent_with_retry`、`agent_once_session_resume`、`agent_once`。调用由当前 backend 定义的 11 个 `agent_backend_*` 操作。 |
+| `runner.sh` | 通用 agent 调用：`agent_with_retry_session_{new,resume,fork}`（别名 `agent_with_retry`）、`agent_once_session_resume`。调用由当前 backend 定义的 11 个 `agent_backend_*` 操作。 |
 | `runner.py` | 薄适配层：将 key-pool 操作（init/rotate/disable/classify/react）转发给 vendored 的 lpm（`llm_provider_manager.keypool`）。 |
 | `backends/<name>.sh` | 针对特定 agent CLI 实现 11 操作接口的 backend（如 `claude-code.sh`、`opencode.sh`）。 |
 | `progress.sh` | 迭代进度：`progress_read`、`progress_write`、`progress_iterations`。 |
@@ -90,17 +90,29 @@ Provider/key 配置即 [llm-provider-manager](llm-provider-manager/) 的 `provid
 
 ## 公开 API
 
-> 仅列对外公开的入口与工具函数。带 `_` 前缀的内部函数（`_agent_once_with_watchdog` / `_agent_once_with_check` / `_agent_once_with_disable` 等）及其分层包装关系见 [ARCHITECTURE.md §4](ARCHITECTURE.md)。
+> 仅列对外公开的入口与工具函数。带 `_` 前缀的内部函数（`_agent_retry_loop` / `_agent_once_with_watchdog` / `_agent_once_with_check` / `_agent_once_with_disable` 等）及其分层包装关系见 [ARCHITECTURE.md §4](ARCHITECTURE.md)。
 
 ### runner.sh
 
-**`agent_with_retry <prompt> <log_name> [extra_args...]`**
+三种会话操作的可靠入口（new / resume / fork），各自构造自己的 agent 调用、互不调用，共享反应式重试循环 `_agent_retry_loop`：
 
-带 watchdog 运行；失败时进行反应式重试——每次失败后，lpm 的 `react` 对该次错误做分类并返回一步恢复策略（逗号连接的原子：`disable`/`rotate`/`downgrade`，或 `stop`），由循环在下次尝试前应用。下一次失败会重新分类，因此换上的新 key 若遇到不同的错误码会得到相称的恢复策略。任一次成功即返回 0，全部失败返回 1。
+**`agent_with_retry_session_new <prompt> <log_name> [extra_args...]`**
+
+开新会话运行。失败时反应式重试——每次失败后 lpm 的 `react` 对该次错误分类并返回一步恢复策略（逗号连接的原子：`disable`/`rotate`/`downgrade`，或 `stop`），由循环在下次尝试前应用；下一次失败重新分类，因此换上的新 key 若遇到不同的错误码会得到相称的策略。任一次成功即返回 0，全部失败返回 1。
+
+**`agent_with_retry_session_resume <prompt> <log_name> <session_id> [extra_args...]`**
+
+在已有 session 上续接运行（在同一会话上继续、积累上下文）。重试时续接同一会话（提示词"继续"）。后端不支持续接时退化为全新会话。返回 0=成功 / 1=均失败。
+
+**`agent_with_retry_session_fork <prompt> <log_name> <session_id> [extra_args...]`**
+
+从已有 session 分叉出独立会话后运行（如基于共享上下文的独立投票）。重试时续接已记录的 fork 会话；若主试未留下任何会话则重新 fork 自源会话（不污染源会话）。返回 0=成功 / 1=均失败。
+
+**`agent_with_retry <prompt> <log_name> [extra_args...]`** —— `agent_with_retry_session_new` 的向后兼容别名。
 
 **`agent_once_session_resume <prompt> <log_name> <session_id> [extra_args...]`**
 
-运行一次，若 backend 支持则续接已有 session（否则回退为以 `$prompt` 开新 session）。作为单次入口（无外层重试循环），当错误需要时会自行 disable 当前 key。成功返回 0，可重试失败返回 1，key 耗尽且未配置 key pool 时返回 2。
+单次续接（无重试）：运行一次，若 backend 支持则续接已有 session（否则回退为开新 session）。错误需要时自行 disable 当前 key。成功返回 0，可重试失败返回 1，key 耗尽且未配置 key pool 时返回 2。
 
 ### progress.sh
 

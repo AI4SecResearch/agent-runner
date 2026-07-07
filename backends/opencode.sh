@@ -122,11 +122,14 @@ agent_backend_resume_args() {
     [ -n "$1" ] && echo "-s $1"
 }
 
-# Fork flag fragment (start a divergent session from an existing one).
-# OpenCode's --fork requires --continue or --session; the caller composes them.
-# Usage: agent_backend_fork_args
+# All flags the agent needs to FORK from an existing session (resume + fork).
+# Composes the resume fragment (-s <sid>) with --fork; OpenCode's --fork requires
+# a session reference, now bundled in. Empty output when $1 is empty → caller
+# degrades, same convention as resume_args.
+# Usage: agent_backend_fork_args <session_id>
 agent_backend_fork_args() {
-    echo "--fork"
+    local r; r=$(agent_backend_resume_args "$1")
+    [ -n "$r" ] && echo "$r --fork"
 }
 
 # The env var this agent reads for its API key. OpenCode reads whatever its
