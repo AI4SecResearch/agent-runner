@@ -1,0 +1,109 @@
+{
+  // ── Top-level user config for lpm ───────────────────────────────
+  // This file contains REAL API keys — keep it 0600 and gitignored.
+
+  // Reserved for future use (e.g. api-keys regeneration). Currently unused.
+  "settings": {
+    "rotateEvery": 5,        // proactive rotate every N successes (0 = off)
+    "disableTtlHours": 5     // recovery TTL (hours) for a disabled key
+  },
+
+  // Default agent + provider + key used when `lpm use` is called with no args.
+  // All three fields are optional:
+  //   agent  — defaults to "claude" (first registered agent)
+  //   key    — defaults to the provider's defaultKey (or its first key)
+  "default": { "agent": "claude", "provider": "zhipu", "key": "main" },
+
+  "providers": [
+    // ── Template A: symmetric ──────────────────────────────────────
+    // All keys share the same model set (declared at provider level).
+    {
+      "id": "zhipu",
+      "type": "symmetric",
+      "displayName": "智谱",
+      "defaultKey": "main",          // optional; defaults to first key
+      "baseURLs": {
+        "anthropic": "https://open.bigmodel.cn/api/anthropic",
+        "openai":    "https://open.bigmodel.cn/api/compatible-mode/v1"
+      },
+      "keys": [
+        { "id": "main",   "key": "sk-REPLACE-ME-zhipu-main" },
+        // agentBlacklist: ban this key for a specific agent.
+        //   lpm use --agent claude    → blocked (no ANTHROPIC_* exported)
+        //   lpm use --agent opencode  → still works (LLM_KEY_* exported)
+        { "id": "backup", "key": "sk-REPLACE-ME-zhipu-backup", "agentBlacklist": ["claude"] }
+      ],
+      "models": [                    // provider-level (symmetric only)
+        { "id": "glm-5.2",     "displayName": "GLM-5.2",     "context": 1000000, "output": 131072 },
+        { "id": "glm-5-turbo", "displayName": "GLM-5 Turbo", "context":  128000, "output": 16384 }
+      ],
+      // Optional: override which model is used for the primary / downgrade
+      // retry tiers (consumed by agent-runner). Defaults to models[0] /
+      // models[1] respectively. Must reference a model id in scope.
+      "primaryModel": "glm-5.2",
+      "downgradeModel": "glm-5-turbo",
+      // Optional: overrides on top of the provider backend's built-in
+      // defaults (see providers/zhipu.py). Remove this block and zhipu
+      // still classifies errors correctly via built-in defaults.
+      "errorHandling": {
+        "1305": "downgrade",           // content / sensitive → downgrade model
+        "1308": "rotate_key",          // quota-related → rotate to next key
+        "1310": "rotate_key",
+        "_default": "rotate_then_downgrade"   // fallback for unknown codes
+      }
+    },
+
+    // ── Template B: asymmetric ─────────────────────────────────────
+    // Each key has its own model set (declared per-key).
+    // opencode entry id = <provider>-<keyid> (e.g. bailian-account-a).
+    {
+      "id": "bailian",
+      "type": "asymmetric",
+      "displayName": "百炼",
+      "defaultKey": "account-a",
+      "baseURLs": {
+        "openai": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        // No "anthropic" → Claude cannot use this provider (blocked).
+      },
+      "keys": [
+        {
+          "id": "account-a",
+          "key": "sk-REPLACE-ME-bailian-a",
+          "models": [               // per-key (asymmetric only)
+            { "id": "glm-5.2", "displayName": "GLM-5.2", "context": 1000000, "output": 131072 }
+          ],
+          // Optional per-key overrides (same semantics as provider-level).
+          "primaryModel": "glm-5.2"
+        },
+        {
+          "id": "account-b",
+          "key": "sk-REPLACE-ME-bailian-b",
+          "models": [
+            { "id": "glm-4.6", "displayName": "GLM-4.6", "context": 128000, "output": 16384 }
+          ]
+        }
+      ],
+      "errorHandling": {
+        "_default": "rotate_key"
+      }
+    },
+
+    // ── A provider with only anthropic baseURL ─────────────────────
+    // opencode skips it (no openai/anthropic-usable baseURL for opencode's
+    // preferred protocol); Claude can use it.
+    {
+      "id": "anthropic-only",
+      "type": "symmetric",
+      "displayName": "Anthropic Only",
+      "baseURLs": {
+        "anthropic": "https://api.anthropic-only.example.com"
+      },
+      "keys": [
+        { "id": "main", "key": "sk-REPLACE-ME-anthropic-only" }
+      ],
+      "models": [
+        { "id": "claude-sonnet-4", "displayName": "Claude Sonnet 4", "context": 200000, "output": 64000 }
+      ]
+    }
+  ]
+}

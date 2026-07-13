@@ -70,7 +70,7 @@ cat <<EOF
 Done! Next steps:
 
   1. Create ~/.config/llm-provider-manager/providers.jsonc
-     (template: $INSTALL_DIR/providers.jsonc.example)
+     (template: $INSTALL_DIR/providers.example.jsonc)
 
   2. Generate agent static configs:
      lpm agent --template all
