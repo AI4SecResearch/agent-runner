@@ -182,7 +182,7 @@ provider 模块（`zhipu`/`default`/…）、`extract_signals`、`REGISTRY`、�
 
 ## 8. 配置与环境变量
 
-**`providers.jsonc`**（密钥池配置，lpm 格式；见 vendored `llm-provider-manager/providers.jsonc.example` 或 lpm 文档）：
+**`providers.jsonc`**（密钥池配置，lpm 格式；见 vendored `llm-provider-manager/providers.example.jsonc` 或 lpm 文档）：
 ```jsonc
 {
   "settings": { "rotateEvery": 5, "disableTtlHours": 5 },

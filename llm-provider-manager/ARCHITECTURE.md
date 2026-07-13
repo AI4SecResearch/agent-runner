@@ -159,7 +159,7 @@ hook 内部用**绝对路径** `$HOME/.local/bin/lpm` 而非裸 `lpm` 调用 CLI
 | `active.env.sh` | ✅ | 0600 + gitignore；仅当前用户可读 |
 | `settings.local.json` (Claude) | ❌ | 可提交/软链 git |
 | `opencode.json` | ❌ | 可提交/软链 git |
-| `providers.jsonc.example` | ❌ | `sk-REPLACE-ME` 占位 |
+| `providers.example.jsonc` | ❌ | `sk-REPLACE-ME` 占位 |
 | `use` 的 stdout | ❌（仅当前 shell 进程） | 不落盘 |
 
 `.gitignore` 已忽略 `providers.jsonc` 和 `active.env.sh`。**切勿**把真实 `providers.jsonc` / `active.env.sh` 提交。

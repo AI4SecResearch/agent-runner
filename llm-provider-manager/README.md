@@ -14,7 +14,7 @@ curl -fsSL https://raw.giteeusercontent.com/raverstern/llm-provider-manager/raw/
 
 ```bash
 # 1. 创建你的 provider 配置并填入真实 key
-#    （模板在 ~/.local/share/llm-provider-manager/providers.jsonc.example）
+#    （模板在 ~/.local/share/llm-provider-manager/providers.example.jsonc）
 $EDITOR ~/.config/llm-provider-manager/providers.jsonc
 
 # 2. 为各 agent 渲染静态配置（无密钥，可提交）
