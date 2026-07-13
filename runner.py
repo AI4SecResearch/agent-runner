@@ -32,7 +32,7 @@ except ImportError:
 
 # agent-runner backend name → lpm agent id. Unknown backend falls back to the
 # lpm registry default (claude) with a stderr warning.
-_BACKEND_TO_AGENT = {"claude-code": "claude", "opencode": "opencode"}
+_BACKEND_TO_AGENT = {"claude-code": "claude", "opencode": "opencode", "codex": "claude"}
 
 
 def main(argv):
