@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-provider-manager"
+version = "0.1.0"
+description = "Switch which LLM (provider + key) a given agent uses in the current shell. Agent × provider orthogonal."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "GONG Ruiqi" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+lpm = "llm_provider_manager.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

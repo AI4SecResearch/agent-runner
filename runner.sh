@@ -1,257 +1,150 @@
 #!/bin/bash
 
-# Agent invocation with reliability features.
-# Provides: agent_once, _agent_once_with_watchdog, agent_with_retry
+# Agent invocation with reliability features (agent-agnostic).
+# Provides: _agent_once{,_with_{watchdog,check,disable}},
+#           _agent_retry_loop, agent_once_session_resume,
+#           agent_with_retry_session_{new,resume,fork}, agent_with_retry (alias),
+#
+# All agent-specific behavior (binary, flags, output format, log parsing) lives in
+# a backend implementing the 10-op interface (see backends/<name>.sh). The active
+# backend is selected by $AGENT_BACKEND (default: claude-code) and sourced from
+# common.sh. This file contains only generic orchestration.
 #
 # Prerequisites: $OUTPUT_DIR must be set by the caller (e.g. via setup_output_dir).
 #
 # Environment variables:
+#   AGENT_BACKEND        Backend name (default: claude-code); sources backends/<name>.sh
 #   SANDBOX              Set to "1" in container to skip permission prompts
-#   CLAUDE_MODEL         Primary model (default: glm-5-turbo)
-#   AGENT_PROVIDER       Agent backend: claude|codex (default: claude)
-#   CODEX_MODEL          Codex model when AGENT_PROVIDER=codex
-#   CODEX_SANDBOX        Codex sandbox mode (default: danger-full-access)
-#   CODEX_WEB_SEARCH     Codex web search mode: cached|live|disabled
-#   CODEX_NETWORK_ACCESS Set to true/1 to enable command network access in workspace-write
-#   CODEX_FORK_SESSION_ARG Codex resume fork flag, when supported by the CLI (empty disables)
-#   CLAUDE_STALL_TIMEOUT Seconds before killing a stalled process (default: 300)
-#   CLAUDE_TIMEOUT       Hard total timeout, 0 = unlimited (default: 0)
-#   KEY_POOL_CONFIG      Path to api-keys.json (default: api-keys.json)
+#   AGENT_STALL_TIMEOUT Seconds before killing a stalled process (default: 300)
+#   AGENT_TIMEOUT       Hard total timeout, 0 = unlimited (default: 0)
+#   KEY_POOL_CONFIG      Path to providers.jsonc (lpm config; default: <workspace>/providers.jsonc)
+#   LLM_PROVIDER_CONFIG  Fallback config path (honored when KEY_POOL_CONFIG unset)
 
 _runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _runner_py="$_runner_dir/runner.py"
 
-_kp_config() { echo "${KEY_POOL_CONFIG:-$_runner_dir/../../api-keys.json}"; }
+_kp_config() { echo "${KEY_POOL_CONFIG:-${LLM_PROVIDER_CONFIG:-$_runner_dir/../../providers.jsonc}}"; }
 _kp_state()  { echo "${DATA_DIR}/key-pool-state.json"; }
-_codex_session_file() { echo "${OUTPUT_DIR}/codex-sessions.tsv"; }
 
 # ── Key pool (delegates to runner.py) ──────────────────────────────
 
+# Tracks the API key env var the last key was exported to, so a changed var name
+# unsets the previous one rather than leaking it into the next invocation.
+_kp_current_env_var=""
+
+# Apply a key-pool JSON line {key, base_url, primary_model, downgrade_model}:
+# export the key to the backend's API key env var, the base_url to the backend's
+# base_url env var, and the resolved models to the agent-agnostic
+# PRIMARY_MODEL / DOWNGRADE_MODEL. Each is exported only when non-empty, so a
+# provider that omits base_url/models leaves the backend defaults in place.
+# No-op when the line is empty (no key / no rotation).
+_kp_apply() {
+    local line="$1"
+    [ -n "$line" ] || return 0
+
+    local key base_url pmodel dmodel
+    key=$(printf '%s' "$line" | jq -r '.key')
+    [ -n "$key" ] || return 0
+    base_url=$(printf '%s' "$line" | jq -r '.base_url // ""')
+    pmodel=$(printf '%s' "$line" | jq -r '.primary_model // ""')
+    dmodel=$(printf '%s' "$line" | jq -r '.downgrade_model // ""')
+
+    # key → API key env var (backend-declared); unset a previously-exported var if
+    # its name changed.
+    local api_key_var; api_key_var=$(agent_backend_api_key_env_var)
+    if [ -n "$api_key_var" ]; then
+        if [ -n "$_kp_current_env_var" ] && [ "$_kp_current_env_var" != "$api_key_var" ]; then
+            unset "$_kp_current_env_var"
+        fi
+        export "$api_key_var=$key"
+        _kp_current_env_var="$api_key_var"
+    fi
+
+    # base_url → base_url env var (backend-declared; empty for backends that
+    # route via their own config rather than an env var). Exported only when
+    # both the var name and the value are non-empty.
+    local base_url_var; base_url_var=$(agent_backend_base_url_env_var)
+    if [ -n "$base_url_var" ] && [ -n "$base_url" ]; then
+        export "$base_url_var=$base_url"
+    fi
+
+    # models → agent-agnostic PRIMARY_MODEL / DOWNGRADE_MODEL. Exported only when
+    # the provider specifies them, so an omitted field keeps the backend default.
+    [ -n "$pmodel" ] && export "PRIMARY_MODEL=$pmodel"
+    [ -n "$dmodel" ] && export "DOWNGRADE_MODEL=$dmodel"
+}
+
 key_pool_init() {
-    [ "${AGENT_PROVIDER:-claude}" = "codex" ] && return 0
-    local key=$(python3 "$_runner_py" init --config "$(_kp_config)" --state "$(_kp_state)")
-    [ -n "$key" ] && export ANTHROPIC_AUTH_TOKEN="$key"
+    _kp_apply "$(python3 "$_runner_py" init --config "$(_kp_config)" --state "$(_kp_state)")"
 }
 
 key_pool_rotate() {
-    [ "${AGENT_PROVIDER:-claude}" = "codex" ] && return 0
-    local key=$(python3 "$_runner_py" rotate --config "$(_kp_config)" --state "$(_kp_state)")
-    [ -n "$key" ] && export ANTHROPIC_AUTH_TOKEN="$key"
+    _kp_apply "$(python3 "$_runner_py" rotate --config "$(_kp_config)" --state "$(_kp_state)")"
 }
 
 key_pool_on_success() {
-    [ "${AGENT_PROVIDER:-claude}" = "codex" ] && return 0
-    local key=$(python3 "$_runner_py" on-success --config "$(_kp_config)" --state "$(_kp_state)")
-    [ -n "$key" ] && export ANTHROPIC_AUTH_TOKEN="$key"
+    _kp_apply "$(python3 "$_runner_py" on-success --config "$(_kp_config)" --state "$(_kp_state)")"
 }
 
 key_pool_disable() {
-    [ "${AGENT_PROVIDER:-claude}" = "codex" ] && return 0
-    python3 "$_runner_py" disable --key "$ANTHROPIC_AUTH_TOKEN" --config "$(_kp_config)" --state "$(_kp_state)"
+    [ -n "$_kp_current_env_var" ] || return 0
+    python3 "$_runner_py" disable --key "${!_kp_current_env_var}" \
+        --config "$(_kp_config)" --state "$(_kp_state)"
 }
 
 key_pool_available_size() {
     python3 "$_runner_py" available-size --config "$(_kp_config)" --state "$(_kp_state)"
 }
 
-# ── Result check & error classification (delegates to runner.py) ──
+# ── Result check & error classification ───────────────────────────
 
-# 用法: check_agent_result <log_name>
+# 用法: _check_agent_result <log_name>
 # 返回 0=成功  1=失败
-check_agent_result() {
-    if [ "${AGENT_PROVIDER:-claude}" = "codex" ]; then
-        [ -s "$OUTPUT_DIR/${1}.out" ]
-        return $?
-    fi
-    python3 "$_runner_py" check-result "$OUTPUT_DIR/${1}.jsonl"
+_check_agent_result() {
+    agent_backend_result_ok "$OUTPUT_DIR/$1"
 }
 
+# 用法: classify_agent_error <log_name>
+# 输出原子策略串（如 "disable,rotate"、"downgrade"）。
 classify_agent_error() {
-    if [ "${AGENT_PROVIDER:-claude}" = "codex" ]; then
-        echo "downgrade:false"
-        return 0
-    fi
-    python3 "$_runner_py" classify "$OUTPUT_DIR/${1}.jsonl" \
+    local text=$(agent_backend_result_text "$OUTPUT_DIR/$1")
+    printf '%s' "$text" | python3 "$_runner_py" classify --text - \
         --config "$(_kp_config)" --state "$(_kp_state)"
 }
 
-# ── Process execution (pure bash) ─────────────────────────────────
+# ── Process execution (pure bash, generic) ────────────────────────
 
-# Run a single agent step with standard output routing
-# Usage: agent_once <prompt> <log_name> [extra_args...]
-#
-# 环境变量:
-#   CLAUDE_MODEL    主模型（默认: glm-5-turbo）
-#   LANDLOCK_CONFIG Landlock 配置文件路径（可选，设置后自动包裹）
-#   LANDLOCK_RUNNER landlock_runner.py 路径（默认: utils/landlock-runner/landlock_runner.py）
-agent_once() {
-    case "${AGENT_PROVIDER:-claude}" in
-        claude) agent_once_claude "$@" ;;
-        codex)  agent_once_codex "$@" ;;
-        *)
-            echo "未知 AGENT_PROVIDER: $AGENT_PROVIDER" >&2
-            return 2
-            ;;
-    esac
-}
-
-agent_once_claude() {
+# Run a single agent step with standard output routing.
+# Usage: _agent_once <prompt> <log_name> [extra_args...]
+# Extra args are passed through to the agent; a caller-supplied --model takes
+# precedence over the primary model (exactly one --model is emitted).
+_agent_once() {
     local prompt="$1"
     local log_name="$2"
     shift 2
     local prefix="$OUTPUT_DIR/$log_name"
-    mkdir -p "$(dirname "$prefix")"
-    local perm_flag
-    if [ "${SANDBOX:-}" = "1" ]; then
-        perm_flag="--dangerously-skip-permissions"
-    else
-        perm_flag="--permission-mode acceptEdits"
-    fi
 
-    local agent_cmd=(claude -p "$prompt" \
-        --output-format stream-json --verbose \
-        $perm_flag \
-        --model "${CLAUDE_MODEL:-glm-5-turbo}" \
-        "$@")
+    local -a argv=( $(agent_backend_perm_args) )
+    local a has_model=0
+    for a in "$@"; do [ "$a" = "--model" ] && has_model=1; done
+    [ "$has_model" -eq 0 ] && argv+=( $(agent_backend_model_args primary) )
+    argv+=( "$@" )
 
-    if [ -n "$LANDLOCK_CONFIG" ] && [ -f "$LANDLOCK_CONFIG" ]; then
-        local runner="${LANDLOCK_RUNNER:-utils/landlock-runner/landlock_runner.py}"
-        agent_cmd=(python3 "$runner" "$LANDLOCK_CONFIG" "${agent_cmd[@]}")
-    fi
-
-    "${agent_cmd[@]}" 2>"$prefix.err" | tee "$prefix.jsonl" | \
-        jq -r 'select(.type=="result") | .result'
+    agent_backend_invoke "$prompt" "$prefix" "${argv[@]}"
 }
 
-_codex_session_lookup() {
-    local logical_id="$1"
-    local session_file
-    session_file="$(_codex_session_file)"
-    [ -f "$session_file" ] || return 1
-    awk -F'\t' -v id="$logical_id" '$1 == id {value=$2} END {if (value) print value}' "$session_file"
-}
-
-_codex_session_record() {
-    local logical_id="$1" thread_id="$2"
-    [ -z "$logical_id" ] && return 0
-    [ -z "$thread_id" ] && return 0
-    local session_file
-    session_file="$(_codex_session_file)"
-    mkdir -p "$(dirname "$session_file")"
-    flock "$session_file" printf "%s\t%s\n" "$logical_id" "$thread_id" >> "$session_file"
-}
-
-_codex_config_args() {
-    if [ -n "${CODEX_WEB_SEARCH:-}" ]; then
-        printf '%s\0%s\0' -c "web_search=\"${CODEX_WEB_SEARCH}\""
-    fi
-    case "${CODEX_NETWORK_ACCESS:-}" in
-        1|true|TRUE|yes|YES)
-            printf '%s\0%s\0' -c 'sandbox_workspace_write.network_access=true'
-            ;;
-    esac
-}
-
-agent_once_codex() {
-    local prompt="$1"
-    local log_name="$2"
-    shift 2
-    local prefix="$OUTPUT_DIR/$log_name"
-    mkdir -p "$(dirname "$prefix")"
-
-    local filtered_args=()
-    local logical_session_id=""
-    local resume_session_id=""
-    local fork_session=0
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --model)
-                shift 2
-                ;;
-            --session-id)
-                logical_session_id="$2"
-                shift 2
-                ;;
-            --resume)
-                resume_session_id="$2"
-                shift 2
-                ;;
-            --fork-session)
-                fork_session=1
-                shift
-                ;;
-            *)
-                filtered_args+=("$1")
-                shift
-                ;;
-        esac
-    done
-
-    local actual_prompt="$prompt"
-    if [[ "$prompt" == /fix-json* ]]; then
-        local file="${prompt#/fix-json }"
-        actual_prompt="请修复 JSON 文件，使其成为严格合法 JSON。只修改该文件，不改变语义。文件路径：$file"
-    fi
-
-    local codex_config_args=()
-    if command -v mapfile >/dev/null 2>&1; then
-        mapfile -d '' -t codex_config_args < <(_codex_config_args)
-    fi
-
-    local codex_cmd=()
-    if [ -n "$resume_session_id" ]; then
-        local actual_session_id
-        actual_session_id="$(_codex_session_lookup "$resume_session_id")"
-        [ -z "$actual_session_id" ] && actual_session_id="$resume_session_id"
-        codex_cmd=(codex exec resume
-            --json
-            -c "sandbox_mode=\"${CODEX_SANDBOX:-danger-full-access}\""
-            --output-last-message "$prefix.out")
-        codex_cmd+=("${codex_config_args[@]}")
-        if [ -n "${CODEX_MODEL:-}" ]; then
-            codex_cmd+=(--model "$CODEX_MODEL")
-        fi
-        local codex_fork_session_arg
-        codex_fork_session_arg="${CODEX_FORK_SESSION_ARG:-}"
-        if [ "$fork_session" = "1" ] && [ -n "$codex_fork_session_arg" ]; then
-            codex_cmd+=("$codex_fork_session_arg")
-        fi
-        codex_cmd+=("${filtered_args[@]}" "$actual_session_id" -)
-    else
-        codex_cmd=(codex exec
-            --json
-            -C "${PROJECT_ROOT:-$PWD}"
-            --sandbox "${CODEX_SANDBOX:-danger-full-access}"
-            --output-last-message "$prefix.out")
-        codex_cmd+=("${codex_config_args[@]}")
-        if [ -n "${CODEX_MODEL:-}" ]; then
-            codex_cmd+=(--model "$CODEX_MODEL")
-        fi
-        codex_cmd+=("${filtered_args[@]}" -)
-    fi
-
-    printf '%s' "$actual_prompt" | "${codex_cmd[@]}" > "$prefix.jsonl" 2> "$prefix.err"
-    local rc=$?
-    if [ $rc -eq 0 ] && [ -n "$logical_session_id" ]; then
-        local thread_id
-        thread_id=$(jq -r 'select(.type == "thread.started") | .thread_id' "$prefix.jsonl" 2>/dev/null | head -1)
-        _codex_session_record "$logical_session_id" "$thread_id"
-    fi
-    return $rc
-}
-
-# 后台执行 agent_once 并监控 jsonl 增长，超时则 kill
-# 用法与 agent_once 一致: _agent_once_with_watchdog <prompt> <log_name> [extra_args...]
+# 后台执行 _agent_once 并监控 jsonl 增长，超时则 kill
+# 用法与 _agent_once 一致: _agent_once_with_watchdog <prompt> <log_name> [extra_args...]
 # 返回 0=正常结束  1=超时被 kill
 _agent_once_with_watchdog() {
     local prompt="$1"
     local log_name="$2"
     shift 2
     local jsonl_file="$OUTPUT_DIR/${log_name}.jsonl"
-    local stall_timeout="${CLAUDE_STALL_TIMEOUT:-300}"
-    local max_timeout="${CLAUDE_TIMEOUT:-0}"
+    local stall_timeout="${AGENT_STALL_TIMEOUT:-300}"
+    local max_timeout="${AGENT_TIMEOUT:-0}"
 
-    agent_once "$prompt" "$log_name" "$@" > /dev/null &
+    _agent_once "$prompt" "$log_name" "$@" > /dev/null &
     local job_pid=$!
 
     local start_time last_size last_growth
@@ -265,8 +158,8 @@ _agent_once_with_watchdog() {
         now=$(date +%s)
         elapsed=$((now - start_time))
 
-        # result/turn.completed 行出现 → agent 已完成输出，立即退出
-        if grep -q -E '"type":"(result|turn.completed)"' "$jsonl_file" 2>/dev/null; then
+        # agent 已完成输出 → 立即退出（由后端判断其原生日志是否出现结果）
+        if agent_backend_is_complete "$OUTPUT_DIR/$log_name"; then
             break
         fi
 
@@ -294,7 +187,7 @@ _agent_once_with_watchdog() {
     done
 
     if [ "$timed_out" -eq 1 ]; then
-        # 先杀子进程（pipeline 中的 claude/tee/jq），再杀父 shell
+        # 先杀子进程（pipeline 中的 agent/tee/jq），再杀父 shell
         # 反过来会导致子 shell 先死，子进程被 init 收养，pkill -P 找不到
         pkill -P "$job_pid" 2>/dev/null
         kill "$job_pid" 2>/dev/null
@@ -307,104 +200,203 @@ _agent_once_with_watchdog() {
     return 0
 }
 
-# 运行 agent_once_with_watchdog 并检查结果，处理额度耗尽
-# 返回: 0=成功  1=失败(可重试)  2=额度耗尽且无key pool(放弃)
-agent_once_with_disable() {
+# 执行一次 agent 并做业务面结果检查（watchdog + _check_agent_result）。
+# 返回: 0=成功  1=失败(可重试)
+# 不碰 key pool —— disable 决策由调用方负责（agent_with_retry 的 react 循环
+# 在循环顶部统一决定，单次执行不重复 disable）。
+_agent_once_with_check() {
     local prompt="$1"
     local log_name="$2"
     shift 2
 
     _agent_once_with_watchdog "$prompt" "$log_name" "$@" \
-        && check_agent_result "$log_name" \
+        && _check_agent_result "$log_name" \
         && return 0
-
-    local classify_result=$(classify_agent_error "$log_name")
-    local should_disable="${classify_result##*:}"
-
-    if [ "$should_disable" = "true" ]; then
-        if [ -f "$(_kp_config)" ]; then
-            key_pool_disable
-        else
-            echo "          ⚠️ 额度耗尽且无 key pool: $log_name" >&2
-            return 2
-        fi
-    fi
 
     return 1
 }
 
-# ── Retry orchestration (bash loop, Python-driven plan) ───────────
-
-# 用法: agent_with_retry <prompt> <log_name> [extra_args...]
-# 返回 0=成功  1=均失败
-#
-# Python 生成重试计划 (retry-plan)，bash 通用循环执行。
-# 恢复策略由 api-keys.json 中 provider 的 error_handling 配置决定。
-agent_with_retry() {
+# 在 _agent_once_with_check 之上加 disable 副作用：失败时按错误分类决定
+# 是否禁用当前 key。供"单次执行、无外层重试循环管 disable"的入口使用
+# （即 agent_once_session_resume —— 外部业务直接调它时，坏 key 仍被踢掉）。
+# 返回: 0=成功  1=失败(可重试)  2=额度耗尽且无 key pool(放弃)
+_agent_once_with_disable() {
     local prompt="$1"
     local log_name="$2"
     shift 2
 
-    key_pool_init
+    _agent_once_with_check "$prompt" "$log_name" "$@" && return 0
 
-    # ── Primary attempt (current key, primary model) ──
-    agent_once_with_disable "$prompt" "$log_name" "$@"
-    case $? in
-        0) key_pool_on_success; return 0;;
-        2) return 1;;
+    # classify returns a bare atom strategy (e.g. "disable,rotate", "downgrade");
+    # disable when the `disable` atom is present (same test as the react loop).
+    local strategy=$(classify_agent_error "$log_name")
+    case ",$strategy," in
+        *,disable,*)
+            if [ -f "$(_kp_config)" ]; then
+                key_pool_disable
+            else
+                echo "          ⚠️ 额度耗尽且无 key pool: $log_name" >&2
+                return 2
+            fi
+            ;;
     esac
 
-    local classify_result=$(classify_agent_error "$log_name")
-    local action="${classify_result%%:*}"
-    local fallback_model="${CODEX_MODEL:-glm-4.7}"
-
-    # ── No key pool: only downgrade available ──
-    if [ ! -f "$(_kp_config)" ]; then
-        action="downgrade"
-    fi
-
-    # ── Extract session id from primary attempt for resumption ──
-    local session_id=""
-    if [ -f "$OUTPUT_DIR/${log_name}.jsonl" ]; then
-        if [ "${AGENT_PROVIDER:-claude}" = "codex" ]; then
-            session_id=$(jq -r 'select(.type == "thread.started") | .thread_id' \
-                "$OUTPUT_DIR/${log_name}.jsonl" 2>/dev/null | head -1)
-        else
-            session_id=$(jq -r 'select(.session_id != null) | .session_id' \
-                "$OUTPUT_DIR/${log_name}.jsonl" 2>/dev/null | head -1)
-        fi
-    fi
-
-    # ── Execute retry plan from Python ──
-    local attempt=0
-
-    local model count
-    while IFS=' ' read -r model count; do
-        local model_flag=""
-        [ "$model" != "primary" ] && model_flag="--model $model"
-        [ "${model}" = "${fallback_model}" ] && echo "          ⚠️ 降级至 ${fallback_model}: $log_name" >&2
-
-        local i
-        for ((i=0; i<count; i++)); do
-            key_pool_rotate
-            attempt=$((attempt + 1))
-            local name="${log_name}-r${attempt}"
-
-            if [ -n "$session_id" ]; then
-                echo "          ⚠️ 续接会话 $((i+1))/$count ($model): $log_name" >&2
-                agent_once_with_disable "继续" "$name" --resume "$session_id" $model_flag
-            else
-                echo "          ⚠️ 重试 $((i+1))/$count ($model): $log_name" >&2
-                agent_once_with_disable "$prompt" "$name" $model_flag
-            fi
-
-            case $? in
-                0) [ "${model}" != "${fallback_model}" ] && key_pool_on_success; return 0;;
-                2) return 1;;
-            esac
-        done
-    done < <(python3 "$_runner_py" retry-plan --action "$action" --config "$(_kp_config)" --state "$(_kp_state)" --fallback-model "$fallback_model")
-
-    echo "          ⚠️ 所有模型和 key 均已耗尽: $log_name" >&2
     return 1
+}
+
+# 恢复会话执行一次；若后端不支持续接则退化为全新会话。自初始化 key pool
+# （与 agent_with_retry 对齐），。失败时按错误分类
+# 禁用当前 key（单次入口自带 disable，因为没有外层重试循环代为决策）。
+# 用法: agent_once_session_resume <prompt> <log_name> <session_id> [extra_args...]
+# 返回: 0=成功  1=失败  2=额度耗尽且无 key pool(放弃)
+agent_once_session_resume() {
+    local prompt="$1"
+    local log_name="$2"
+    local sid="$3"
+    shift 3
+    key_pool_init
+    local resume_args=$(agent_backend_resume_args "$sid")
+    _agent_once_with_disable "$prompt" "$log_name" $resume_args "$@"
+}
+
+# ── Retry orchestration (reactive: one step per failure) ─────────
+
+# 反应式重试的共享循环。每次失败后调 `react` 子命令拿单步恢复策略（逗号组合
+# 的原子 disable/rotate/downgrade，或 stop），执行该步后再试；下次失败重新 react，
+# 按【新错误】重新决策。策略由 providers.jsonc 中 provider 的 errorHandling 决定。
+#
+# 本函数只负责【重试循环】，不含主试（primary）。前置条件：调用方已完成
+# key_pool_init 并跑完一次失败的主试（日志 base_log）。session_args 是主试所用
+# 的会话 flag（已由调用方经 agent_backend_* 解析：""=全新 / "--resume S"=续接 /
+# "--resume S --fork-session"=分叉），仅在 redo 分支按原样复用。
+#
+# 重试接续策略：主试的 init 行（含 session_id）在任何 LLM 调用前就写入日志，故
+# 即使因额度失败也几乎总能取到 session_id → 走【续接】分支（--resume <已记录>
+# + "继续"），保留进度且（分叉场景）维持 fork 独立性。仅当确实没记录到 session
+# 时走【按主试重跑】分支——分叉场景即重新 fork 自源会话，绝不裸 resume 共享上下文
+# （会污染其它 fork）。
+#
+# 用法: _agent_retry_loop <prompt> <base_log> <session_args>
+# 返回 0=成功  1=均失败
+_agent_retry_loop() {
+    local prompt="$1"
+    local base_log="$2"
+    local session_args="$3"
+
+    # 主试日志里记录的 session_id（续接目标）；取不到则 cont_resume 为空 → 走 redo。
+    local cont_sid cont_resume
+    cont_sid=$(agent_backend_session_id "$OUTPUT_DIR/$base_log")
+    cont_resume=$(agent_backend_resume_args "$cont_sid")
+
+    local attempt=0
+    local cur_log="$base_log"   # 最近一次失败的日志名（react 读它）
+    # 兜底上限：防 react 与池状态不同步导致死循环。正常靠 react 返回 stop 终止。
+    # n=可用 key 数；+2 给降级档留余量。无 key pool 时 n=0 → 2 次。
+    local n=$(key_pool_available_size 2>/dev/null || echo 0)
+    local max_attempts=$(( n + 2 ))
+    [ "$max_attempts" -gt 0 ] || max_attempts=2
+
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        # 把上次失败喂给 react，拿单步策略（对新错误重新分类）
+        local step
+        step=$(agent_backend_result_text "$OUTPUT_DIR/$cur_log" \
+               | python3 "$_runner_py" react --text - \
+                 --config "$(_kp_config)" --state "$(_kp_state)")
+        if [ "$step" = "stop" ]; then
+            echo "          ⚠️ 资源耗尽（无可用 key/模型）: $cur_log" >&2
+            return 1
+        fi
+
+        # 执行策略里的原子
+        case ",$step," in *,disable,*) key_pool_disable;; esac
+        case ",$step," in *,rotate,*)  key_pool_rotate;; esac
+        local model=primary
+        case ",$step," in *,downgrade,*) model=downgrade;; esac
+
+        attempt=$((attempt + 1))
+        local name="${base_log}-r${attempt}"
+        local model_args=$(agent_backend_model_args "$model")
+        echo "          ⚠️ 重试 $attempt/$max_attempts ($model / $step): $base_log" >&2
+
+        # 执行 + 业务检查（不带 disable —— react 循环顶部已统一决策）。
+        if [ -n "$cont_resume" ]; then
+            # 续接：在主试已记录的 session 上"继续"（不再 fork / 不重发 session_args）
+            _agent_once_with_check "继续" "$name" $cont_resume $model_args
+        else
+            # 无 session 可接续 → 按主试原样重跑
+            # （new 重发 $prompt；resume 重接 S；fork 重新 fork 自 S）
+            _agent_once_with_check "$prompt" "$name" $session_args $model_args
+        fi
+
+        case $? in
+            0) [ "$model" != "downgrade" ] && key_pool_on_success; return 0;;
+        esac
+        # 失败 → 下次循环 react 读这次重试的日志
+        cur_log="$name"
+    done
+
+    echo "          ⚠️ 重试次数达上限 ($max_attempts): $base_log" >&2
+    return 1
+}
+
+# ── Public entry points (new / resume / fork) ─────────────────────
+#
+# 三种会话操作的可靠入口，各自构造【自己的】 agent 调用（互不调用，保证针对
+# 不同 agent 的通用性），重试循环统一复用 _agent_retry_loop。主试统一用
+# _agent_once_with_check（不带 disable）—— disable 由 react 循环顶部统一决策。
+# 成功时 key_pool_on_success（降级档除外）。
+
+# 全新会话（== 原始 agent_with_retry 语义）。
+# 用法: agent_with_retry_session_new <prompt> <log_name> [extra_args...]
+# 返回 0=成功  1=均失败
+agent_with_retry_session_new() {
+    local prompt="$1"
+    local log_name="$2"
+    shift 2
+    key_pool_init
+    _agent_once_with_check "$prompt" "$log_name" "$@"
+    case $? in
+        0) key_pool_on_success; return 0;;
+    esac
+    _agent_retry_loop "$prompt" "$log_name" ""
+}
+
+# 在 session_id 上续接执行（resume：在同一会话上继续，积累上下文）。
+# 用法: agent_with_retry_session_resume <prompt> <log_name> <session_id> [extra_args...]
+# 返回 0=成功  1=均失败
+agent_with_retry_session_resume() {
+    local prompt="$1"
+    local log_name="$2"
+    local sid="$3"
+    shift 3
+    key_pool_init
+    local session_args=$(agent_backend_resume_args "$sid")
+    _agent_once_with_check "$prompt" "$log_name" $session_args "$@"
+    case $? in
+        0) key_pool_on_success; return 0;;
+    esac
+    _agent_retry_loop "$prompt" "$log_name" "$session_args"
+}
+
+# 从 session_id 分叉后执行（fork：拷贝一份独立会话再跑）。
+# agent_backend_fork_args 自带 resume+fork 全部 flag，调用方无需再传 fork flag。
+# 用法: agent_with_retry_session_fork <prompt> <log_name> <session_id> [extra_args...]
+# 返回 0=成功  1=均失败
+agent_with_retry_session_fork() {
+    local prompt="$1"
+    local log_name="$2"
+    local sid="$3"
+    shift 3
+    key_pool_init
+    local session_args=$(agent_backend_fork_args "$sid")
+    _agent_once_with_check "$prompt" "$log_name" $session_args "$@"
+    case $? in
+        0) key_pool_on_success; return 0;;
+    esac
+    _agent_retry_loop "$prompt" "$log_name" "$session_args"
+}
+
+# 向后兼容别名（共享子模块的外部调用方仍用此名）。
+agent_with_retry() {
+    agent_with_retry_session_new "$@"
 }
