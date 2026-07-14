@@ -7,7 +7,7 @@ name = "llm-provider-manager"
 version = "0.1.0"
 description = "Switch which LLM (provider + key) a given agent uses in the current shell. Agent × provider orthogonal."
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "GPL-2.0-or-later" }
 authors = [{ name = "GONG Ruiqi" }]
 dependencies = []
 
