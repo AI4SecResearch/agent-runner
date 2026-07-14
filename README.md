@@ -1,129 +1,151 @@
-# agent-runner
+# agent-runner (Python)
 
-用于可靠地运行 AI agent CLI 的 Bash 库——具备 watchdog 超时检测、带模型降级能力的重试、进度跟踪与中断恢复等特性。
+A reliable agent-CLI execution layer — **watchdog timeouts, reactive retry with
+model downgrade, multi-provider key-pool rotation, and session reuse** — exposed
+as both a **Python library** and a **process** (`python -m` or a thin `.sh`
+wrapper), so it can serve as a "high-reliability agent" parent process for bash
+pipelines or drop into a Python codebase as a dependency.
 
-面向需要反复调用 agent（如 Claude Code）处理多轮迭代或多文档的批量流水线场景。
+This is a **self-contained, cross-platform rewrite** of the original
+[bash agent-runner](..): the orchestration logic is ported 1:1 (same public
+API names, signatures, exit codes, and invariants) but reimplemented natively
+in Python with **no runtime dependency on bash or `jq`**, and **no coupling to
+the bash project**. The vendored `llm-provider-manager` (lpm) is bundled inside
+(`agent_runner/_vendor/`).
 
-## 文件
+## Two call shapes
 
-| 文件 | 用途 |
-|------|---------|
-| `runner.sh` | 通用 agent 调用：`agent_with_retry_session_{new,resume,fork}`（别名 `agent_with_retry`）、`agent_once_session_resume`。调用由当前 backend 定义的 11 个 `agent_backend_*` 操作。 |
-| `runner.py` | 薄适配层：将 key-pool 操作（init/rotate/disable/classify/react）转发给 vendored 的 lpm（`llm_provider_manager.keypool`）。 |
-| `backends/<name>.sh` | 针对特定 agent CLI 实现 11 操作接口的 backend（如 `claude-code.sh`、`opencode.sh`）。 |
-| `progress.sh` | 迭代进度：`progress_read`、`progress_write`、`progress_iterations`。 |
-| `llm-provider-manager/` | vendored 的 [llm-provider-manager](llm-provider-manager/)（git subtree）——provider/key 配置、key-pool 轮换、错误分类。 |
+**库形态**(Python 上层):
 
-## 快速开始
+```python
+import os, sys
+sys.path.insert(0, "/path/to/agent-runner-py")  # 或:pip install -e .
+
+os.environ["OUTPUT_DIR"] = "/var/run/mytask"     # 必填(日志 + 状态根)
+os.environ["AGENT_BACKEND"] = "claude-code"       # 或 "opencode";默认 claude-code
+
+from agent_runner import agent_with_retry, agent_with_retry_session_resume
+res = agent_with_retry("总结这份文档", "summary")   # 返回 Result
+if res:
+    # 多步会话:用上一步的 session_id 续接
+    agent_with_retry_session_resume("精修 markdown", "refined", res.session_id)
+```
+
+**进程形态**(bash / 任意语言上层 —— 本项目作为一个"高可靠 agent"子进程):
 
 ```bash
-source agent-runner/progress.sh
-source agent-runner/runner.sh
+# 经 .sh 封装(自动设 PYTHONPATH,exec python -m):
+sid=$(agent-runner.sh new "总结这份文档" "summary")   # stdout = session_id
+echo $?    # 0 = 成功,1 = 均失败,2 = 额度耗尽且无密钥池
 
-OUTPUT_DIR="$PWD/output"
-mkdir -p "$OUTPUT_DIR"
-
-agent_with_retry "Summarize this document" "summary"
-progress_iterations my-task 10 my_callback
+# 多步会话:把上一步的 sid 传给 resume
+agent-runner.sh resume "精修 markdown" "refined" "$sid"
 ```
 
-## 前置条件
+进程形态的输出通道分工:
+- `$?` —— 成败(0 / 1 / 2)。
+- **stdout —— session_id 一行**(无则空行),供 `sid=$(...)` 捕获。
+- **stderr —— 诊断**(重试 / 超时 / 资源耗尽通告,给人看)。
+- 结果文本不进 stdout —— 已全量留存于 `$OUTPUT_DIR/<log_name>.jsonl`;库形态则经 `Result.text` 给到调用方。
 
-- 调用任何函数前必须已设置 `$OUTPUT_DIR`
-- `$PATH` 中须有 `jq`
-- `$PATH` 中须有当前 backend 的 CLI（见下文「后端」）
+entry(进程形态取一):`new` / `resume` / `fork` / `once` / `agent_with_retry`
+(全名如 `agent_with_retry_session_new` 亦接受)。`resume`/`fork`/`once` 在
+`log_name` 之后还需 `session_id`;再之后的参数透传给 agent(如 `--model x`)。
 
-## 环境变量
+## What it does
 
-| 变量 | 默认值 | 说明 |
-|----------|---------|-------------|
-| `OUTPUT_DIR` | （必填） | JSONL 日志、错误日志与进度状态的存放目录 |
-| `AGENT_BACKEND` | `claude-code` | backend 名；据此 source `backends/<name>.sh` |
-| `SANDBOX` | （未设置） | 设为 `"1"` 时使用 `--dangerously-skip-permissions` |
-| `AGENT_STALL_TIMEOUT` | `300` | 无输出多少秒后杀死卡住的进程 |
-| `AGENT_TIMEOUT` | `0` | 总硬超时（秒）；`0` = 无限制 |
-| `KEY_POOL_CONFIG` | `<workspace>/providers.jsonc` | lpm key-pool 配置（providers.jsonc）的路径 |
-| `LPM_SRC` | vendored `llm-provider-manager/src` | 覆盖 adapter 所 import 的 lpm 副本（如指向一个 dev checkout） |
+For each invocation it: (1) selects a key + provider config from the pool, (2)
+runs the agent in a backgrounded process group, (3) watches for early completion
+/ stall / hard timeout (killing the whole tree on timeout), (4) on failure
+**reactively** classifies the error and applies one recovery step (disable bad
+key / rotate to next / downgrade model) then retries, re-classifying each new
+failure. Same layered design and 7 invariants as the bash engine — see the
+parent repo's `ARCHITECTURE.md`.
 
-## 后端 (Backends)
+## Configuration (environment variables)
 
-runner 与具体 agent 无关；所有 agent 相关行为都位于 `backends/<name>.sh`。当前 backend 由 `$AGENT_BACKEND` 选定。
+Same surface as the bash engine, so both behave identically under the same config:
 
-### claude-code（默认）
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `OUTPUT_DIR` | (required) | JSONL logs, error logs, run state |
+| `AGENT_BACKEND` | `claude-code` | backend name → `agent_runner.backends` registry |
+| `DATA_DIR` | `OUTPUT_DIR` | key-pool state root (`key-pool-state.json`) |
+| `SANDBOX` | (unset) | `"1"` → `--dangerously-skip-permissions` |
+| `AGENT_STALL_TIMEOUT` | `300` | seconds of no output before killing a stalled process |
+| `AGENT_TIMEOUT` | `0` | hard total timeout (0 = unlimited) |
+| `KEY_POOL_CONFIG` | `<DATA_DIR>/providers.jsonc` | lpm provider/key config path |
+| `LPM_SRC` | bundled `_vendor` | override the lpm copy (e.g. a dev checkout) |
+| `LANDLOCK_CONFIG` / `LANDLOCK_RUNNER` | (unset) | landlock-sandbox the agent (Linux only) |
 
-- 二进制：`claude`
-- 前置：`PRIMARY_MODEL`、`DOWNGRADE_MODEL` 环境变量（key pool 导出当前 provider 的 models；shell 值作为 backend 默认）
-- API key：`ANTHROPIC_AUTH_TOKEN` 环境变量（由 key pool 设置）；base_url 经由 `ANTHROPIC_BASE_URL`（由 key pool 取自 provider 的 `base_url`）
+## Backends
 
-### opencode
+`agent_runner/backends/` — one module per agent CLI implementing the 11-op
+contract (`invoke` / `is_complete` / `result_ok` / `result_text` / `session_id`
+/ perm/model/resume/fork flag fragments / env-var names), using `subprocess` +
+the `json` stdlib (no `jq`). Current backends: `claude_code.py`, `opencode.py`.
+Add a backend = new module + one `REGISTRY` entry; the engine never references a
+concrete agent.
 
-- 二进制：`opencode`（v1.17+）
-- 前置：
-  - `PRIMARY_MODEL`、`DOWNGRADE_MODEL` 环境变量（须为 `provider/model` 形式，如 `bailian/glm-5.2`；key pool 导出当前 provider 的 models）
-  - 在 `~/.config/opencode/opencode.json` 中配置自定义 providers（endpoint URL + protocol 位于此，按 model 的 provider 前缀索引；key pool 中各 provider 的 `base_url` 对 opencode 不起作用）
-- API key：在 `opencode.json` 中配置的环境变量（默认 `Z_AI_API_KEY`）；key pool 将当前 key 导出到 `agent_backend_api_key_env_var`。
+## Cross-platform
 
-### 错误处理码 (Error handling codes)
+- **Paths**: `pathlib` throughout; no hardcoded Unix separators; agent binaries
+  resolved via `PATH`. Output/state live under the caller-supplied `OUTPUT_DIR`
+  (never hardcoded `/tmp`).
+- **Key-pool locking** (`agent_runner/_vendor/.../keypool.py`): the advisory file
+  lock that guards the shared state file is platform-abstracted into `_flock_*`
+  helpers — `fcntl.flock` on POSIX, `msvcrt.locking` (degraded to exclusive) on
+  Windows. Mutual exclusion is preserved on both; only read concurrency drops
+  on Windows. (This helper is written to be lift-and-shift into upstream lpm.)
+- **Watchdog process-tree kill** (`agent_runner/platform.py`): `kill_tree` is
+  abstracted behind a `Platform` interface — POSIX uses process groups
+  (`setsid` + `killpg`); the Windows implementation is a stub (extension point).
+- **landlock**: Linux-only LSM; silently skipped on other platforms.
 
-错误码以 `[NNN]`（3 位，HTTP 状态码——由 opencode 产生）或 `[NNNN]`（4 位，上游特定——由 claude-code 的 zhipu 路径产生）形式匹配。每个 provider 模块（位于 vendored lpm 的 `providers/`）自带一份默认错误处理表；`providers.jsonc` 中可选的 `errorHandling` 可按部署覆盖：
+## Self-containment
 
-- claude-code + zhipu 使用上游码（如 `"1305"`、`"1308"`）——默认值位于 vendored 的 `llm-provider-manager/src/llm_provider_manager/providers/zhipu.py`。
-- opencode + bailian 无上游码；runner 回退到 HTTP 状态码（如 `"401"`、`"429"`）。
+This project has **zero coupling** to the parent bash `agent-runner` repo:
+- No `source`/import of `runner.sh`, `runner.py`, or `backends/*.sh`.
+- lpm is vendored as a source copy at `agent_runner/_vendor/llm_provider_manager/`
+  (stdlib-only). It evolves with this project; upstream lpm changes are synced
+  by re-copying. `$LPM_SRC` can point elsewhere for development.
 
-## Key pool 配置（`providers.jsonc`）
+## Tests
 
-Provider/key 配置即 [llm-provider-manager](llm-provider-manager/) 的 `providers.jsonc`（vendored）；完整 schema 见其 [README](llm-provider-manager/README.md) / [ARCHITECTURE.md](llm-provider-manager/ARCHITECTURE.md)。示例：
-
-```jsonc
-{
-  "settings": { "rotateEvery": 5, "disableTtlHours": 5 },
-  "providers": [
-    { "id": "zhipu", "type": "symmetric",
-      "baseURLs": { "anthropic": "https://open.bigmodel.cn/api/anthropic" },
-      "keys": [ { "id": "main", "key": "…" } ],
-      "models": [ {"id":"glm-5-turbo",…}, {"id":"glm-4.7",…} ] }
-  ]
-}
+```bash
+pip install pytest       # only dev dependency
+cd agent-runner-py
+python -m pytest -q
 ```
 
-要点：`baseURLs` 是 protocol→url 的映射（keypool 按当前 agent 选取）；`models[0]`/`[1]` 为 primary/downgrade（可由 `primaryModel`/`downgradeModel` 覆盖）；`errorHandling` 覆盖各 provider 模块内置的默认值。整个池把所有 provider 的 key 作为一张扁平池轮换；轮换进入另一 provider 时重新套用该 provider 的 base_url + models（跨 provider failover）。API key 的环境变量名仍由 backend 声明。
+- `test_backends_jq_equiv.py` — Python jsonl parsing is byte-equivalent to the
+  bash `jq` filters (cross-checked against the parent repo's bash backends when
+  present; skips otherwise).
+- `test_engine.py` — watchdog early-exit, reactive retry, continue-vs-redo
+  branches, exit codes (mock backend, no real agent).
+- `test_platform.py` — the POSIX process-group spawn + tree-kill contract.
+- `test_cli.py` — `python -m agent_runner` dispatch, arg ordering, exit-code
+  mapping.
 
-## 公开 API
+## Layout
 
-> 仅列对外公开的入口与工具函数。带 `_` 前缀的内部函数（`_agent_retry_loop` / `_agent_once_with_watchdog` / `_agent_once_with_check` / `_agent_once_with_disable` 等）及其分层包装关系见 [ARCHITECTURE.md §4](ARCHITECTURE.md)。
+```
+agent-runner/
+├── agent-runner.sh              # bash → `python -m agent_runner` wrapper (process mode)
+├── pyproject.toml               # package metadata (stdlib-only; pip -e . works)
+├── README.md
+├── agent_runner/                # the importable package
+│   ├── __init__.py              # public API (library mode)
+│   ├── __main__.py              # `python -m agent_runner` (process mode)
+│   ├── engine.py                # orchestration
+│   ├── platform.py              # cross-platform process-tree abstraction
+│   ├── keypool.py / landlock.py
+│   └── backends/{claude_code,opencode,_jsonl}.py
+├── llm-provider-manager/        # vendored lpm (git subtree) — keypool/providers/agents
+└── tests/
+```
 
-### runner.sh
-
-三种会话操作的可靠入口（new / resume / fork），各自构造自己的 agent 调用、互不调用，共享反应式重试循环 `_agent_retry_loop`：
-
-**`agent_with_retry_session_new <prompt> <log_name> [extra_args...]`**
-
-开新会话运行。失败时反应式重试——每次失败后 lpm 的 `react` 对该次错误分类并返回一步恢复策略（逗号连接的原子：`disable`/`rotate`/`downgrade`，或 `stop`），由循环在下次尝试前应用；下一次失败重新分类，因此换上的新 key 若遇到不同的错误码会得到相称的策略。任一次成功即返回 0，全部失败返回 1。
-
-**`agent_with_retry_session_resume <prompt> <log_name> <session_id> [extra_args...]`**
-
-在已有 session 上续接运行（在同一会话上继续、积累上下文）。重试时续接同一会话（提示词"继续"）。后端不支持续接时退化为全新会话。返回 0=成功 / 1=均失败。
-
-**`agent_with_retry_session_fork <prompt> <log_name> <session_id> [extra_args...]`**
-
-从已有 session 分叉出独立会话后运行（如基于共享上下文的独立投票）。重试时续接已记录的 fork 会话；若主试未留下任何会话则重新 fork 自源会话（不污染源会话）。返回 0=成功 / 1=均失败。
-
-**`agent_with_retry <prompt> <log_name> [extra_args...]`** —— `agent_with_retry_session_new` 的向后兼容别名。
-
-**`agent_once_session_resume <prompt> <log_name> <session_id> [extra_args...]`**
-
-单次续接（无重试）：运行一次，若 backend 支持则续接已有 session（否则回退为开新 session）。错误需要时自行 disable 当前 key。成功返回 0，可重试失败返回 1，key 耗尽且未配置 key pool 时返回 2。
-
-### progress.sh
-
-**`progress_read <task_id>`**
-
-读取某任务最后完成的迭代号。无状态时返回 `0`。
-
-**`progress_write <task_id> <iteration>`**
-
-持久化已完成的迭代号。状态存于 `$OUTPUT_DIR/state/<task_id>`。
-
-**`progress_iterations <task_id> <max_iterations> <callback> [callback_args...]`**
-
-对 1..max 各迭代运行回调，跳过已完成的。回调收到 `<iteration> <max_iterations> [args...]`。返回值：0 = 全部完成，1 = 回调失败，2 = 已完成（被跳过）。
+Progress tracking (the orthogonal `progress_read`/`progress_write`/
+`progress_iterations` state machine) is maintained separately; this project
+does not provide it.
+```

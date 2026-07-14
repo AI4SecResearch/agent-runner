@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-runner"
+version = "0.2.0"
+description = "Reliable agent-CLI execution layer: watchdog, reactive retry with model downgrade, key-pool rotation, session reuse, progress tracking. Bash and Python interfaces."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "GONG Ruiqi" }]
+dependencies = []  # stdlib-only; vendored lpm is also stdlib-only
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent_runner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
