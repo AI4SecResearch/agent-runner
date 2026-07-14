@@ -14,7 +14,9 @@ State file (``current_index`` / ``disabled{idx:expiry}`` / ``success_count``) is
 caller-supplied (agent-runner points it at ``$DATA_DIR/key-pool-state.json``) —
 runtime state stays in the EXECUTION context, never in lpm's user-config dir.
 
-Concurrency: LOCK_SH for reads, LOCK_EX for read-modify-write via fcntl.flock.
+Concurrency: LOCK_SH for reads, LOCK_EX for read-modify-write via the
+cross-platform ``_flock_*`` helpers (fcntl.flock on POSIX, msvcrt.locking —
+degraded to exclusive — on Windows). See the platform-lock block below.
 Disabled keys auto-expire after ``Settings.disable_ttl_hours``; clock skew purges
 all.
 
@@ -27,11 +29,50 @@ works for dev/debug via the ``__main__`` guard.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import sys
 import time
+
+# ── cross-platform advisory file locking ────────────────────────────────
+# The state file (current_index / disabled / success_count) is shared across
+# concurrent processes, so reads take a shared lock and read-modify-writes
+# take an exclusive lock. On POSIX that's fcntl.flock(LOCK_SH/LOCK_EX/LOCK_UN).
+# Windows has no flock; its only stdlib option is msvcrt.locking, which is a
+# *byte-range* lock with no shared/exclusive distinction — so on Windows we
+# degrade reads to an exclusive lock (read concurrency drops, but the
+# mutual-exclusion invariant that the correctness of the pool depends on is
+# preserved). These helpers localize the platform choice so the three state-
+# access methods below stay identical across platforms.
+try:
+    import fcntl as _fcntl
+
+    def _flock_sh(f) -> None:
+        _fcntl.flock(f, _fcntl.LOCK_SH)
+
+    def _flock_ex(f) -> None:
+        _fcntl.flock(f, _fcntl.LOCK_EX)
+
+    def _flock_un(f) -> None:
+        _fcntl.flock(f, _fcntl.LOCK_UN)
+
+    _PLATFORM_LOCK = "fcntl"
+except ImportError:  # Windows: fcntl unavailable → msvcrt byte-range lock
+    import msvcrt
+
+    def _flock_sh(f) -> None:
+        # No shared/exclusive distinction on Windows — exclusive everywhere.
+        # Lock the first byte (state files always start with '{', so byte 0
+        # exists); locking a region past EOF is permitted by msvcrt too.
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _flock_ex(f) -> None:
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _flock_un(f) -> None:
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+
+    _PLATFORM_LOCK = "msvcrt"
 
 from . import agents as agents_mod
 from . import config as config_mod
@@ -163,16 +204,16 @@ class KeyPool:
     def _read_state(self):
         """Read state under shared lock."""
         with open(self.state_path) as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
+            _flock_sh(f)
             try:
                 return json.load(f)
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                _flock_un(f)
 
     def _modify_state(self, fn):
         """Read-modify-write under exclusive lock. Returns fn result."""
         with open(self.state_path, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            _flock_ex(f)
             try:
                 data = json.load(f)
                 result = fn(data)
@@ -180,17 +221,17 @@ class KeyPool:
                 json.dump(data, f)
                 # json.dump() 只填缓冲、不触发 write()：内容真正进内核要等 with
                 # 结束的 close()，而那已在 finally 解锁之后。故紧跟 truncate()——
-                # 它发 ftruncate 前会先 flush 写缓冲，把 write() 收进 flock 临界区内。
+                # 它发 ftruncate 前会先 flush 写缓冲，把 write() 收进锁临界区内。
                 f.truncate()
                 return result
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                _flock_un(f)
 
     def _init_state(self):
         """Ensure state file is initialized. LOCK_EX serializes concurrent inits."""
         fd = os.open(self.state_path, os.O_CREAT | os.O_RDWR, 0o644)
         with os.fdopen(fd, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            _flock_ex(f)
             try:
                 if f.read().strip():
                     return
@@ -198,7 +239,7 @@ class KeyPool:
                 f.truncate()
                 _dbg(f"init: created state file {self.state_path}")
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                _flock_un(f)
 
     # ── Disabled key helpers ────────────────────────────────────────
 
