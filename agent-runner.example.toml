@@ -1,0 +1,52 @@
+# agent-runner 配置文件示例
+#
+# 所有配置项都可写进 TOML,也都可经 AR_ 前缀环境变量覆盖(env 优先于本文件)。
+# 找到本文件的位置:1) $AR_CONFIG_FILE  2) ./agent-runner.toml  3) ~/.config/agent-runner/config.toml
+# 复制为 agent-runner.toml 并按需修改。
+
+# ── agent 后端 ──────────────────────────────────────────────────────────
+# 可选值:claude-code(默认)/ opencode
+#backend = "claude-code"
+
+# ── 模型(调用方意愿;须 provider 供应,否则回落 provider 的) ──────────────
+# primary_model 与 downgrade_model 若不在 provider 的可用 models 列表里,
+# 自动回落到 provider 声明的 primaryModel / downgradeModel。
+# 无密钥池时直传给 agent。
+#primary_model = "glm-5.1"
+#downgrade_model = "glm-4.7"
+
+# ── 密钥池(provider/key 配置) ──────────────────────────────────────────
+# providers.jsonc 路径(相对 cwd 或绝对路径)。
+#key_pool_config = "providers.jsonc"
+# 密钥池状态文件(默认 = key_pool_config 同目录下 key-pool-state.json)。
+# 想跨模块/进程共享状态,显式指向同一文件。
+#keypool_state = "/var/run/mytask/key-pool-state.json"
+
+# ── 运行产出根(每次运行不同,通常经 AR_RUN_DIR env 给) ────────────────
+# jsonl/err 日志与产物存放目录。
+#run_dir = "/var/run/mytask"
+
+# ── 沙箱 ────────────────────────────────────────────────────────────────
+# true → --dangerously-skip-permissions
+#sandbox = false
+
+# ── lpm 源(默认用 vendored 副本) ────────────────────────────────────────
+# 指向另一份 lpm 的 src/(如 dev checkout)。空 = 用 vendored。
+#lpm_src = ""
+
+# ── 超时 ────────────────────────────────────────────────────────────────
+[timeouts]
+# 无输出多少秒后视为卡死、杀掉(停滞超时)。
+stall = 300
+# 总运行上限秒数,0 = 不限。
+total = 0
+
+# ── landlock(Linux 专属,可选) ─────────────────────────────────────────
+# landlock 配置文件路径;设置后 agent 命令经 landlock 沙箱包裹。
+#landlock_config = "/path/to/landlock.json"
+# landlock 执行器路径。
+#landlock_runner = "utils/landlock-runner/landlock_runner.py"
+
+# ── opencode 专属 ───────────────────────────────────────────────────────
+# opencode 读 API key 的环境变量名(默认 Z_AI_API_KEY)。
+#opencode_auth_env_var = "Z_AI_API_KEY"

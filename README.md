@@ -21,8 +21,8 @@ the bash project**. The vendored `llm-provider-manager` (lpm) is bundled inside
 import os, sys
 sys.path.insert(0, "/path/to/agent-runner-py")  # 或:pip install -e .
 
-os.environ["OUTPUT_DIR"] = "/var/run/mytask"     # 必填(日志 + 状态根)
-os.environ["AGENT_BACKEND"] = "claude-code"       # 或 "opencode";默认 claude-code
+os.environ["AR_RUN_DIR"] = "/var/run/mytask"     # 必填(产出根)
+os.environ["AR_BACKEND"] = "claude-code"          # 或 "opencode";默认 claude-code
 
 from agent_runner import agent_with_retry, agent_with_retry_session_resume
 res = agent_with_retry("总结这份文档", "summary")   # 返回 Result
@@ -62,21 +62,38 @@ key / rotate to next / downgrade model) then retries, re-classifying each new
 failure. Same layered design and 7 invariants as the bash engine — see the
 parent repo's `ARCHITECTURE.md`.
 
-## Configuration (environment variables)
+## Configuration (TOML file + `AR_` env overrides)
 
-Same surface as the bash engine, so both behave identically under the same config:
+All config items use one uniform mechanism: write them in a TOML file, or override
+with `AR_`-prefixed env vars (env wins). Hard-coded defaults are the fallback.
+Priority: **`AR_` env > TOML > default**. agent-runner doesn't dictate which items
+go where — that's the consumer's choice.
 
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `OUTPUT_DIR` | (required) | JSONL logs, error logs, run state |
-| `AGENT_BACKEND` | `claude-code` | backend name → `agent_runner.backends` registry |
-| `DATA_DIR` | `OUTPUT_DIR` | key-pool state root (`key-pool-state.json`) |
-| `SANDBOX` | (unset) | `"1"` → `--dangerously-skip-permissions` |
-| `AGENT_STALL_TIMEOUT` | `300` | seconds of no output before killing a stalled process |
-| `AGENT_TIMEOUT` | `0` | hard total timeout (0 = unlimited) |
-| `KEY_POOL_CONFIG` | `<DATA_DIR>/providers.jsonc` | lpm provider/key config path |
-| `LPM_SRC` | bundled `_vendor` | override the lpm copy (e.g. a dev checkout) |
-| `LANDLOCK_CONFIG` / `LANDLOCK_RUNNER` | (unset) | landlock-sandbox the agent (Linux only) |
+**TOML lookup** (first existing): `$AR_CONFIG_FILE` → `./agent-runner.toml` →
+`~/.config/agent-runner/config.toml`. A full annotated template is at
+`agent-runner.example.toml`. agent-runner runs fine with no TOML (defaults + env).
+
+| TOML key / `AR_` env | default | purpose |
+|---|---|---|
+| `backend` / `AR_BACKEND` | `claude-code` | agent backend |
+| `primary_model` / `AR_PRIMARY_MODEL` | (none) | caller's preferred model (provider-supply-checked; see below) |
+| `downgrade_model` / `AR_DOWNGRADE_MODEL` | (none) | downgrade-tier model (same) |
+| `key_pool_config` / `AR_KEY_POOL_CONFIG` | (none) | providers.jsonc path |
+| `keypool_state` / `AR_KEYPOOL_STATE` | = key_pool_config's dir | key-pool state file |
+| `run_dir` / `AR_RUN_DIR` | (required) | output root (jsonl/err/artifacts) |
+| `sandbox` / `AR_SANDBOX` | `false` | skip permission prompts |
+| `stall_timeout` / `AR_STALL_TIMEOUT` | `300` | seconds with no output before kill |
+| `total_timeout` / `AR_TOTAL_TIMEOUT` | `0` | hard total timeout (0 = unlimited) |
+| `landlock_config` / `AR_LANDLOCK_CONFIG` | (unset) | landlock sandbox config (Linux) |
+| `landlock_runner` / `AR_LANDLOCK_RUNNER` | `utils/landlock-runner/...` | landlock runner path |
+| `lpm_src` / `AR_LPM_SRC` | vendored copy | lpm source dir override |
+
+**Model selection**: `primary_model`/`downgrade_model` express the caller's wish.
+At runtime the key pool checks if the requested model is in the provider's available
+`models` list (from providers.jsonc). If yes → use it; if not → fall back to the
+provider's declared `primaryModel`/`downgradeModel`. No key pool → pass through to
+the agent as-is. Model names are **never hard-coded** in agent-runner — they come
+from config/provider.
 
 ## Backends
 

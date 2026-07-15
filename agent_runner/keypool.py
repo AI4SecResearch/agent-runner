@@ -21,13 +21,15 @@ import os
 import sys
 
 # ── 定位 lpm 的 src/(三段式查找)───────────────────────────────────────
-# 1. $LPM_SRC(显式覆盖,如指向一份 dev checkout 的上游 lpm)
-# 2. 仓库内 subtree 的 llm-provider-manager/src(默认)——以 git subtree 形式
-#    引入,可经 `git subtree pull/push` 与上游同步,单一来源、不复制。
+# 1. AR_LPM_SRC(经 config 层:TOML/env;显式覆盖,如指向 dev checkout)
+# 2. 仓库内 subtree 的 llm-provider-manager/src(默认)——git subtree 引入,
+#    可经 `git subtree pull/push` 与上游同步,单一来源、不复制。
 # 3. ~/.local/share/llm-provider-manager/src(install.sh 兜底)
+from . import config as _config  # 仅用于读 lpm_src;不触发循环(config 不 import keypool)
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_lpm_src = _config.get("lpm_src", "")
 for _cand in (
-    os.environ.get("LPM_SRC"),
+    _lpm_src,
     os.path.join(_HERE, "..", "llm-provider-manager", "src"),
     os.path.expanduser("~/.local/share/llm-provider-manager/src"),
 ):
@@ -108,14 +110,29 @@ class KeyPool:
             if base_url:
                 os.environ[base_url_var] = base_url
 
-        # models → agent-agnostic PRIMARY_MODEL / DOWNGRADE_MODEL. Exported
-        # only when the provider specifies them, so an omitted field keeps the
-        # backend default.
-        primary, downgrade = _resolve_models_external(provider, kid)
-        if primary:
-            os.environ["PRIMARY_MODEL"] = primary
-        if downgrade:
-            os.environ["DOWNGRADE_MODEL"] = downgrade
+        # 模型选择:AR_* 表调用方意愿,provider 约束供应边界。
+        #   AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL(经 config,TOML/env)若在 provider
+        #   可用 models 列表里 → 用 AR_* 的值(意愿合法);
+        #   否则 → 回落 provider 声明的 primaryModel/downgradeModel;
+        #   provider 也没声明 → 不写(保持现状/空)。
+        # 写入 AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL env,供 backend 经 config 读。
+        ar_primary = _config.get("primary_model", "")
+        ar_downgrade = _config.get("downgrade_model", "")
+        provider_primary, provider_downgrade = _resolve_models_external(provider, kid)
+        available = {m.id for m in provider.models_for_key(kid)}
+
+        chosen_primary = _choose_model(ar_primary, provider_primary, available)
+        chosen_downgrade = _choose_model(ar_downgrade, provider_downgrade, available)
+        wrote = False
+        if chosen_primary:
+            os.environ["AR_PRIMARY_MODEL"] = chosen_primary
+            wrote = True
+        if chosen_downgrade:
+            os.environ["AR_DOWNGRADE_MODEL"] = chosen_downgrade
+            wrote = True
+        if wrote:
+            # backend 经 config.get 读模型;清缓存让它重解析到刚写入的 env。
+            _config.clear_cache()
 
     # ── the subcommands runner.sh wraps ──────────────────────────────────
     def init(self) -> None:
@@ -177,3 +194,13 @@ def _resolve_models_external(provider, key_id: str):
     from llm_provider_manager.keypool import _resolve_models  # type: ignore
 
     return _resolve_models(provider, key_id)
+
+
+def _choose_model(wanted: str, provider_default, available: set[str]) -> str:
+    """模型选择:调用方意愿 wanted 若在 provider 可用列表 → 用它;否则回落
+    provider_default;都没有 → 空串。"""
+    if wanted and wanted in available:
+        return wanted
+    if provider_default:
+        return provider_default
+    return ""

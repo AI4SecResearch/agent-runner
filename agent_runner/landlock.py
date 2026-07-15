@@ -24,11 +24,10 @@ def _supported() -> bool:
 def wrap(cmd: list[str]) -> list[str]:
     if not _supported():
         return cmd
-    cfg = os.environ.get("LANDLOCK_CONFIG", "")
+    from . import config
+    cfg = config.get("landlock_config", "")
     if cfg and os.path.isfile(cfg):
-        runner = os.environ.get(
-            "LANDLOCK_RUNNER", "utils/landlock-runner/landlock_runner.py"
-        )
+        runner = config.get("landlock_runner", "utils/landlock-runner/landlock_runner.py")
         return ["python3", runner, cfg, *cmd]
     return cmd
 

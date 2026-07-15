@@ -24,6 +24,7 @@ import signal
 import time
 from dataclasses import dataclass
 
+from . import config
 from .backends import get_backend
 from .keypool import KeyPool
 
@@ -64,11 +65,10 @@ _kp_current_env_var: str | None = None  # tracked inside KeyPool too; kept for p
 
 
 def _get_backend():
-    """Resolve the active backend from ``$AGENT_BACKEND`` (default claude-code),
-    lazily. Re-resolves on each call so an env change between calls switches
-    backends — same source as bash's common.sh, no configure() needed."""
+    """解析当前 backend(经 config 层,AR_BACKEND env > TOML > 默认 claude-code)。
+    按需懒解析,backend 名变了重新解析。"""
     global _backend, _backend_name
-    name = os.environ.get("AGENT_BACKEND", "claude-code")
+    name = config.get("backend", "claude-code")
     if _backend is None or name != _backend_name:
         _backend = get_backend(name)
         _backend_name = name
@@ -76,20 +76,13 @@ def _get_backend():
 
 
 def _kp_config() -> str:
-    # Default: <DATA_DIR>/providers.jsonc (or <OUTPUT_DIR>/...). Resolved
-    # relative to the caller's runtime root (OUTPUT_DIR/DATA_DIR), NOT this
-    # package's location — the standalone project makes no assumption about
-    # where it's checked out. Callers normally set KEY_POOL_CONFIG explicitly.
-    base = os.environ.get("DATA_DIR") or os.environ.get("OUTPUT_DIR") or "."
-    return os.environ.get(
-        "KEY_POOL_CONFIG",
-        os.environ.get("LLM_PROVIDER_CONFIG", os.path.join(base, "providers.jsonc")),
-    )
+    """密钥池配置路径(经 config 层)。"""
+    return config.get("key_pool_config", "")
 
 
 def _kp_state() -> str:
-    base = os.environ.get("DATA_DIR") or os.environ.get("OUTPUT_DIR") or "."
-    return os.path.join(base, "key-pool-state.json")
+    """密钥池状态文件路径(经 config 层;默认 = key_pool_config 同目录)。"""
+    return config.get("keypool_state", "")
 
 
 def _ensure_keypool() -> KeyPool:
@@ -105,13 +98,13 @@ def _ensure_keypool() -> KeyPool:
 
 def _check_agent_result(log_name: str) -> bool:
     """0=ok / 1=fail — mirrors runner.sh's _check_agent_result."""
-    output = os.environ["OUTPUT_DIR"]
+    output = config.get("run_dir", "")
     return _get_backend().result_ok(f"{output}/{log_name}")
 
 
 def classify_agent_error(log_name: str) -> str:
     """Output an atom strategy string (e.g. "disable,rotate", "downgrade")."""
-    output = os.environ["OUTPUT_DIR"]
+    output = config.get("run_dir", "")
     text = _get_backend().result_text(f"{output}/{log_name}")
     return _ensure_keypool().classify(text)
 
@@ -123,7 +116,7 @@ def _agent_once(prompt: str, log_name: str, extra: list[str]):
     through) → backend.invoke. Guarantees exactly one --model (caller overrides
     primary). Returns the ``Popen`` (NOT waited on) — the watchdog owns the
     lifecycle. Success is never judged from the returncode (see result_ok)."""
-    output = os.environ["OUTPUT_DIR"]
+    output = config.get("run_dir", "")
     prefix = f"{output}/{log_name}"
     backend = _get_backend()
 
@@ -149,11 +142,11 @@ def _agent_once_with_watchdog(prompt: str, log_name: str, extra: list[str]) -> t
     """
     import threading
 
-    output = os.environ["OUTPUT_DIR"]
+    output = config.get("run_dir", "")
     prefix = f"{output}/{log_name}"
     jsonl_path = f"{output}/{log_name}.jsonl"
-    stall_timeout = int(os.environ.get("AGENT_STALL_TIMEOUT", "300"))
-    max_timeout = int(os.environ.get("AGENT_TIMEOUT", "0"))
+    stall_timeout = config.get("stall_timeout", 300)
+    max_timeout = config.get("total_timeout", 0)
     backend = _get_backend()
 
     proc = _agent_once(prompt, log_name, extra)
@@ -228,7 +221,7 @@ def _agent_once_with_check(prompt: str, log_name: str, extra: list[str]) -> Resu
     (重试循环在循环顶部统一决策,单次执行不重复 disable)。
 
     session_id 与结果文本都从成功日志读回(单一真相,与后端是否流式无关)。"""
-    output = os.environ["OUTPUT_DIR"]
+    output = config.get("run_dir", "")
     backend = _get_backend()
     _rc, wd = _agent_once_with_watchdog(prompt, log_name, extra)
     if wd == 1:
@@ -271,7 +264,7 @@ def _agent_retry_loop(prompt: str, base_log: str, session_args: list[str],
     共享上下文,避免污染其它 fork)。成功的那次重试的 Result(含 session_id 与
     结果文本)向上返回。
     """
-    output = os.environ["OUTPUT_DIR"]
+    output = config.get("run_dir", "")
     backend = _get_backend()
     kp = _ensure_keypool()
 

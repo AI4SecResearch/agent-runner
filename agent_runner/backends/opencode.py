@@ -6,9 +6,9 @@ log is parsed, and the flag vocabulary (``--model``/``-s``/``--fork``). The
 engine never references ``opencode`` directly.
 
 Env vars (agent-agnostic; the key pool overrides per provider):
-  SANDBOX            "1" → --dangerously-skip-permissions
-  PRIMARY_MODEL      Primary model id, provider-prefixed (default bailian/glm-5.2)
-  DOWNGRADE_MODEL    Downgrade-tier model id (default bailian/glm-5.1)
+  AR_SANDBOX          → --dangerously-skip-permissions
+  AR_PRIMARY_MODEL    模型 id(provider 前缀形式,如 bailian/glm-5.2;经 config 层)
+  AR_DOWNGRADE_MODEL  降级模型 id
 
 Auth: OpenCode reads the API key from the env var configured in
 ~/.config/opencode/opencode.json (default Z_AI_API_KEY). Endpoint/protocol
@@ -26,14 +26,8 @@ from ..landlock import wrap as _landlock_wrap
 from ._jsonl import ensure_parent as _ensure_parent
 from ._jsonl import first_matching, iter_lines, read_jsonl
 
-# Defaults live in the backend so generic code stays agent-agnostic (mirrors
-# backends/opencode.sh's `:-bailian/glm-5.2` / `:-bailian/glm-5.1`). Resolved
-# inside model_args at call time (NOT at import) so both backends can be
-# loaded in one process without clobbering each other's defaults.
-_DEFAULT_PRIMARY = "bailian/glm-5.2"
-_DEFAULT_DOWNGRADE = "bailian/glm-5.1"
 
-
+# 模型名不在此写死——经 config 层取(AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL)。
 class OpencodeBackend:
     """OpenCode — ``run`` subcommand, ``--format json`` event stream."""
 
@@ -147,17 +141,18 @@ class OpencodeBackend:
 
     # ── flag fragments ────────────────────────────────────────────────────
     def perm_args(self) -> list[str]:
-        # Non-sandbox emits nothing — OpenCode's permission model is in
-        # opencode.json, not a CLI flag.
-        if os.environ.get("SANDBOX") == "1":
+        from .. import config
+        # 非 sandbox 不输出——OpenCode 的权限模型在 opencode.json 里,非 CLI flag。
+        if config.get("sandbox", False):
             return ["--dangerously-skip-permissions"]
         return []
 
     def model_args(self, tier: str) -> list[str]:
+        from .. import config
         if tier == "primary":
-            m = os.environ.get("PRIMARY_MODEL") or _DEFAULT_PRIMARY
+            m = config.get("primary_model", "")
         elif tier == "downgrade":
-            m = os.environ.get("DOWNGRADE_MODEL") or _DEFAULT_DOWNGRADE
+            m = config.get("downgrade_model", "")
         else:
             m = tier
         return ["--model", m] if m else []
@@ -171,7 +166,8 @@ class OpencodeBackend:
 
     # ── env-var names ─────────────────────────────────────────────────────
     def api_key_env_var(self) -> str:
-        return os.environ.get("OPENCODE_AUTH_ENV_VAR", "Z_AI_API_KEY")
+        from .. import config
+        return config.get("opencode_auth_env_var", "Z_AI_API_KEY")
 
     def base_url_env_var(self) -> str:
         # Empty ⇒ key pool skips base_url export: OpenCode routes by the

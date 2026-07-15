@@ -30,8 +30,8 @@
 
     import sys, os
     sys.path.insert(0, "/path/to/agent-runner-py")
-    os.environ["OUTPUT_DIR"] = "/var/run/mytask"
-    os.environ["AGENT_BACKEND"] = "claude-code"   # 或 "opencode";默认 claude-code
+    os.environ["AR_RUN_DIR"] = "/var/run/mytask"
+    os.environ["AR_BACKEND"] = "claude-code"      # 或 "opencode";默认 claude-code
     from agent_runner import agent_with_retry
     res = agent_with_retry("总结这份文档", "summary")
     if res:

@@ -7,10 +7,10 @@ The engine never references ``claude`` directly — same isolation as the bash
 side.
 
 Env vars (agent-agnostic; the key pool overrides per provider):
-  SANDBOX             "1" → --dangerously-skip-permissions
-  PRIMARY_MODEL       Primary model id (default glm-5-turbo; key pool may override)
-  DOWNGRADE_MODEL      Downgrade-tier model id (default glm-4.7)
-  ANTHROPIC_BASE_URL  base_url (read by the `claude` binary)
+  AR_SANDBOX           → --dangerously-skip-permissions
+  AR_PRIMARY_MODEL     模型 id(经 config 层;keypool 按供应校验覆盖)
+  AR_DOWNGRADE_MODEL   降级模型 id
+  ANTHROPIC_BASE_URL   base_url(由 `claude` 二进制读;keypool 写)
 """
 
 from __future__ import annotations
@@ -36,12 +36,8 @@ except Exception:  # pragma: no cover - lpm not yet importable at module load
     _BASE_URL_VAR = "ANTHROPIC_BASE_URL"
 
 
-# Defaults live in the backend so generic code stays agent-agnostic (mirrors
-# backends/claude-code.sh's `:-glm-5-turbo` / `:-glm-4.7`). Resolved inside
-# model_args at call time (NOT at import) so that loading both backends into
-# the same process doesn't let one clobber the other's defaults in env.
-_DEFAULT_PRIMARY = "glm-5-turbo"
-_DEFAULT_DOWNGRADE = "glm-4.7"
+# 模型名不在此写死——经 config 层取(AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL,TOML 或 env),
+# keypool 按供应校验覆盖。无 config 值则 model_args 返回空(由调用方/agent 处理)。
 
 
 class ClaudeCodeBackend:
@@ -143,15 +139,17 @@ class ClaudeCodeBackend:
 
     # ── flag fragments ────────────────────────────────────────────────────
     def perm_args(self) -> list[str]:
-        if os.environ.get("SANDBOX") == "1":
+        from .. import config
+        if config.get("sandbox", False):
             return ["--dangerously-skip-permissions"]
         return ["--permission-mode", "acceptEdits"]
 
     def model_args(self, tier: str) -> list[str]:
+        from .. import config
         if tier == "primary":
-            m = os.environ.get("PRIMARY_MODEL") or _DEFAULT_PRIMARY
+            m = config.get("primary_model", "")
         elif tier == "downgrade":
-            m = os.environ.get("DOWNGRADE_MODEL") or _DEFAULT_DOWNGRADE
+            m = config.get("downgrade_model", "")
         else:
             m = tier  # bare model id
         return ["--model", m] if m else []

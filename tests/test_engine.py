@@ -79,11 +79,13 @@ class MockBackend(ClaudeCodeBackend):
 
 @pytest.fixture(autouse=True)
 def isolate(tmp_path, monkeypatch):
-    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path))
-    monkeypatch.setenv("AGENT_BACKEND", "claude-code")
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("AGENT_STALL_TIMEOUT", "5")
-    monkeypatch.setenv("AGENT_TIMEOUT", "0")
+    monkeypatch.setenv("AR_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("AR_BACKEND", "claude-code")
+    monkeypatch.setenv("AR_STALL_TIMEOUT", "5")
+    monkeypatch.setenv("AR_TOTAL_TIMEOUT", "0")
+    # config 层有缓存;setenv 后清缓存让它重解析。
+    from agent_runner import config as _cfg
+    _cfg.clear_cache()
     # Install the mock backend into the engine's module-level state.
     eng._backend = None
     eng._backend_name = None
@@ -93,6 +95,7 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(eng, "_get_backend", lambda: _MOCK)
     yield
     _MOCK.calls.clear()
+    _cfg.clear_cache()
 
 
 # module-singleton mock backend; reset() before each test to clear the call
@@ -134,11 +137,14 @@ def test_session_new_succeeds_first_try(monkeypatch):
         def react(self, t): return "stop"
         def classify(self, t): return "rotate"
     monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setenv("AR_PRIMARY_MODEL", "test-model")
+    from agent_runner import config as _cfg
+    _cfg.clear_cache()
     rc = eng.agent_with_retry_session_new("prompt", "log1")
     assert rc.rc == 0
     assert len(_MOCK.calls) == 1
     assert _MOCK.calls[0][0] == "prompt"  # the prompt
-    # one --model (primary), no resume args
+    # one --model (primary,来自 AR_PRIMARY_MODEL),无 resume args
     argv = _MOCK.calls[0][2]
     assert argv.count("--model") == 1
 
@@ -282,8 +288,8 @@ def test_once_session_resume_disable_on_failure(monkeypatch):
     monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
     # Make _kp_config point to an existing file so the disable branch fires
     # (otherwise it returns 2 = no key pool).
-    (Path(os.environ["OUTPUT_DIR"]) / "cfg.jsonc").touch()
-    monkeypatch.setattr(eng, "_kp_config", lambda: str(Path(os.environ["OUTPUT_DIR"]) / "cfg.jsonc"))
+    (Path(os.environ["AR_RUN_DIR"]) / "cfg.jsonc").touch()
+    monkeypatch.setattr(eng, "_kp_config", lambda: str(Path(os.environ["AR_RUN_DIR"]) / "cfg.jsonc"))
     rc = eng.agent_once_session_resume("prompt", "log7", "s1")
     assert rc.rc == 1  # failed
     assert disabled["n"] == 1  # self-disabled (no outer loop)
