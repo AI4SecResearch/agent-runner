@@ -55,8 +55,6 @@ SPECS: list[Spec] = [
     Spec("sandbox",        type=bool, default=False),
     Spec("stall_timeout",  type=int,  default=300, toml_path="timeouts.stall"),
     Spec("total_timeout",  type=int,  default=0,   toml_path="timeouts.total"),
-    Spec("landlock_config"),
-    Spec("landlock_runner",         default="utils/landlock-runner/landlock_runner.py"),
     Spec("opencode_auth_env_var",   default="Z_AI_API_KEY"),
     Spec("lpm_src"),
 ]

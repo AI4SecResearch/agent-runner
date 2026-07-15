@@ -193,9 +193,9 @@ def _agent_once_with_watchdog(prompt: str, log_name: str, extra: list[str]) -> t
         time.sleep(10)
 
     if timed_out:
-        # Kill the whole process group (agent + any landlock helper) — the
-        # Popen used start_new_session=True so the agent is its own group
-        # leader; -SIGKILL the group, then reap.
+        # Kill the whole process group (agent + its children) — the Popen
+        # used start_new_session=True so the agent is its own group leader;
+        # -SIGKILL the group, then reap.
         _kill_process_group(proc)
         reader.join(timeout=5)
         sys_stderr_write(f"          ⚠️ 超时({timeout_reason}): {log_name}\n")

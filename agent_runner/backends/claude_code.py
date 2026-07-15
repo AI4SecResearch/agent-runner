@@ -18,7 +18,6 @@ from __future__ import annotations
 import os
 import subprocess
 
-from ..landlock import wrap as _landlock_wrap
 from ._jsonl import ensure_parent as _ensure_parent
 from ._jsonl import first_matching, iter_lines, read_jsonl
 
@@ -57,19 +56,18 @@ class ClaudeCodeBackend:
         """
         err_path = f"{prefix}.err"
         # Ensure the output directory exists (defensive — callers normally
-        # create OUTPUT_DIR, but a missing parent shouldn't crash the run).
+        # create AR_RUN_DIR, but a missing parent shouldn't crash the run).
         _ensure_parent(err_path)
         # Open in a new session so the watchdog can kill the whole process
-        # group (claude + any landlock helper) on timeout — mirrors bash's
-        # ``pkill -P <job_pid>`` then ``kill <job_pid>`` ordering. The
-        # platform kwarg abstracts POSIX (start_new_session) vs Windows.
+        # group (agent + its children) on timeout. The platform kwarg abstracts
+        # POSIX (start_new_session) vs Windows.
         self._err = open(err_path, "w")  # kept open until proc finishes
         from ..platform import PLATFORM
-        cmd = _landlock_wrap([
+        cmd = [
             "claude", "-p", prompt,
             "--output-format", "stream-json", "--verbose",
             *argv,
-        ])
+        ]
         return subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=self._err, text=True,
             **PLATFORM.new_session_kwargs(),

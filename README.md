@@ -84,8 +84,6 @@ go where — that's the consumer's choice.
 | `sandbox` / `AR_SANDBOX` | `false` | skip permission prompts |
 | `stall_timeout` / `AR_STALL_TIMEOUT` | `300` | seconds with no output before kill |
 | `total_timeout` / `AR_TOTAL_TIMEOUT` | `0` | hard total timeout (0 = unlimited) |
-| `landlock_config` / `AR_LANDLOCK_CONFIG` | (unset) | landlock sandbox config (Linux) |
-| `landlock_runner` / `AR_LANDLOCK_RUNNER` | `utils/landlock-runner/...` | landlock runner path |
 | `lpm_src` / `AR_LPM_SRC` | vendored copy | lpm source dir override |
 
 **Model selection**: `primary_model`/`downgrade_model` express the caller's wish.
@@ -117,7 +115,6 @@ concrete agent.
 - **Watchdog process-tree kill** (`agent_runner/platform.py`): `kill_tree` is
   abstracted behind a `Platform` interface — POSIX uses process groups
   (`setsid` + `killpg`); the Windows implementation is a stub (extension point).
-- **landlock**: Linux-only LSM; silently skipped on other platforms.
 
 ## Self-containment
 
@@ -156,7 +153,7 @@ agent-runner/
 │   ├── __main__.py              # `python -m agent_runner` (process mode)
 │   ├── engine.py                # orchestration
 │   ├── platform.py              # cross-platform process-tree abstraction
-│   ├── keypool.py / landlock.py
+│   ├── keypool.py
 │   └── backends/{claude_code,opencode,_jsonl}.py
 ├── llm-provider-manager/        # vendored lpm (git subtree) — keypool/providers/agents
 └── tests/

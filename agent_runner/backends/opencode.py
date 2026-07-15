@@ -22,7 +22,6 @@ import os
 import subprocess
 from typing import Any
 
-from ..landlock import wrap as _landlock_wrap
 from ._jsonl import ensure_parent as _ensure_parent
 from ._jsonl import first_matching, iter_lines, read_jsonl
 
@@ -42,7 +41,7 @@ class OpencodeBackend:
         _ensure_parent(err_path)  # defensive: callers normally create OUTPUT_DIR
         self._err = open(err_path, "w")  # kept open until proc finishes
         from ..platform import PLATFORM
-        cmd = _landlock_wrap(["opencode", "run", prompt, "--format", "json", *argv])
+        cmd = ["opencode", "run", prompt, "--format", "json", *argv]
         return subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=self._err, text=True,
             **PLATFORM.new_session_kwargs(),
@@ -177,8 +176,6 @@ class OpencodeBackend:
 
 # ── module-local helpers ───────────────────────────────────────────────────
 import json
-
-# _landlock_wrap is imported at the top (from ..landlock import wrap as _landlock_wrap).
 
 
 def _reason(obj: dict) -> Any:

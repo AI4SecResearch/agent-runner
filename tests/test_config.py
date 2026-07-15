@@ -30,7 +30,7 @@ def test_specs_cover_all_expected_keys():
     expected = {
         "backend", "primary_model", "downgrade_model", "key_pool_config",
         "keypool_state", "run_dir", "sandbox", "stall_timeout", "total_timeout",
-        "landlock_config", "landlock_runner", "opencode_auth_env_var", "lpm_src",
+        "opencode_auth_env_var", "lpm_src",
     }
     assert keys == expected
 

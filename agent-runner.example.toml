@@ -41,12 +41,6 @@ stall = 300
 # 总运行上限秒数,0 = 不限。
 total = 0
 
-# ── landlock(Linux 专属,可选) ─────────────────────────────────────────
-# landlock 配置文件路径;设置后 agent 命令经 landlock 沙箱包裹。
-#landlock_config = "/path/to/landlock.json"
-# landlock 执行器路径。
-#landlock_runner = "utils/landlock-runner/landlock_runner.py"
-
 # ── opencode 专属 ───────────────────────────────────────────────────────
 # opencode 读 API key 的环境变量名(默认 Z_AI_API_KEY)。
 #opencode_auth_env_var = "Z_AI_API_KEY"
