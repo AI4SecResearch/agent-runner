@@ -49,7 +49,7 @@ class MockBackend(ClaudeCodeBackend):
         self.calls: list[tuple] = []
         self._idx = 0
 
-    def invoke(self, prompt, prefix, argv):
+    def invoke(self, prompt, prefix, argv, key_ctx=None):
         self.calls.append((prompt, prefix, list(argv)))
         i = self._idx
         self._idx += 1
@@ -83,19 +83,18 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("AR_BACKEND", "claude-code")
     monkeypatch.setenv("AR_STALL_TIMEOUT", "5")
     monkeypatch.setenv("AR_TOTAL_TIMEOUT", "0")
-    # config 层有缓存;setenv 后清缓存让它重解析。
+    # 新设计:config 是 Config 实例(无模块级缓存);Runner 是 thread-local 默认实例。
+    # 重置默认 Config 与默认 Runner,让 setenv 在下次解析时生效。
     from agent_runner import config as _cfg
-    _cfg.clear_cache()
-    # Install the mock backend into the engine's module-level state.
-    eng._backend = None
-    eng._backend_name = None
-    eng._kp = None
-    eng._kp_current_env_var = None
-    # Monkeypatch get_backend to return our mock.
-    monkeypatch.setattr(eng, "_get_backend", lambda: _MOCK)
+    _cfg._reset_default()
+    eng._reset_default_runner()
+    # Mock backend 注入到 Runner 类(所有实例可见);刷新其 config 吃到 setenv。
+    _MOCK._config = _cfg.Config(toml={})
+    monkeypatch.setattr(eng.Runner, "_get_backend", lambda self: _MOCK)
     yield
     _MOCK.calls.clear()
-    _cfg.clear_cache()
+    _cfg._reset_default()
+    eng._reset_default_runner()
 
 
 # module-singleton mock backend; reset() before each test to clear the call
@@ -136,10 +135,11 @@ def test_session_new_succeeds_first_try(monkeypatch):
         def available_size(self): return 0
         def react(self, t): return "stop"
         def classify(self, t): return "rotate"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     monkeypatch.setenv("AR_PRIMARY_MODEL", "test-model")
     from agent_runner import config as _cfg
-    _cfg.clear_cache()
+    # 刷新 mock backend 的 config,吃到刚设的 AR_PRIMARY_MODEL(无模块级缓存可清)。
+    _MOCK._config = _cfg.Config(toml={})
     rc = eng.agent_with_retry_session_new("prompt", "log1")
     assert rc.rc == 0
     assert len(_MOCK.calls) == 1
@@ -165,7 +165,7 @@ def test_session_new_all_fail(monkeypatch):
         def react(self, t): return "rotate"  # always rotate, never stop
         def classify(self, t): return "rotate"
     kp = FakeKP()
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: kp)
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: kp)
     rc = eng.agent_with_retry_session_new("prompt", "log2")
     assert rc.rc == 1
 
@@ -182,7 +182,7 @@ def test_session_new_react_stop(monkeypatch):
         def available_size(self): return 1
         def react(self, t): return "stop"
         def classify(self, t): return "stop"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry_session_new("prompt", "log3")
     assert rc.rc == 1
     assert len(_MOCK.calls) == 1  # only the primary; retry loop stopped before retrying
@@ -205,7 +205,7 @@ def test_session_resume_uses_continue_branch(monkeypatch):
         def available_size(self): return 1
         def react(self, t): return "rotate"
         def classify(self, t): return "rotate"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry_session_resume("prompt", "log4", "s1")
     assert rc.rc == 0
     assert len(_MOCK.calls) == 2
@@ -235,7 +235,7 @@ def test_session_fork_continue_on_recorded_session(monkeypatch):
         def available_size(self): return 1
         def react(self, t): return "rotate"
         def classify(self, t): return "rotate"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry_session_fork("vote", "log5", "src")
     assert rc.rc == 0
     # primary forked from src; retry CONTINUED on the fork (继续 + --resume sfork)
@@ -262,7 +262,7 @@ def test_session_fork_no_session_replays_redo(monkeypatch):
         def available_size(self): return 1
         def react(self, t): return "rotate"
         def classify(self, t): return "rotate"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry_session_fork("vote", "log6", "src")
     assert rc.rc == 0
     # retry re-sent the original prompt + the fork flag (re-fork from source)
@@ -285,11 +285,11 @@ def test_once_session_resume_disable_on_failure(monkeypatch):
         def available_size(self): return 1
         def react(self, t): return "disable,rotate"
         def classify(self, t): return "disable,rotate"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     # Make _kp_config point to an existing file so the disable branch fires
     # (otherwise it returns 2 = no key pool).
     (Path(os.environ["AR_RUN_DIR"]) / "cfg.jsonc").touch()
-    monkeypatch.setattr(eng, "_kp_config", lambda: str(Path(os.environ["AR_RUN_DIR"]) / "cfg.jsonc"))
+    monkeypatch.setattr(eng.Runner, "_kp_config", lambda self: str(Path(os.environ["AR_RUN_DIR"]) / "cfg.jsonc"))
     rc = eng.agent_once_session_resume("prompt", "log7", "s1")
     assert rc.rc == 1  # failed
     assert disabled["n"] == 1  # self-disabled (no outer loop)
@@ -305,9 +305,9 @@ def test_once_session_resume_quota_exhausted_no_keypool(monkeypatch):
         def available_size(self): return 0
         def react(self, t): return "disable,rotate"
         def classify(self, t): return "disable,rotate"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     # _kp_config → nonexistent file → disable branch returns 2
-    monkeypatch.setattr(eng, "_kp_config", lambda: "/nonexistent/cfg.jsonc")
+    monkeypatch.setattr(eng.Runner, "_kp_config", lambda self: "/nonexistent/cfg.jsonc")
     rc = eng.agent_once_session_resume("prompt", "log8", "s1")
     assert rc.rc == 2  # quota exhausted, no key pool
 
@@ -325,7 +325,7 @@ def test_agent_with_retry_alias(monkeypatch):
         def available_size(self): return 0
         def react(self, t): return "stop"
         def classify(self, t): return "rotate"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry("prompt", "log9")
     assert rc.rc == 0
 
@@ -346,7 +346,7 @@ def test_result_carries_session_id_and_text(monkeypatch):
         def available_size(self): return 0
         def react(self, t): return "stop"
         def classify(self, t): return "rotate"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     res = eng.agent_with_retry_session_new("prompt", "logSid")
     assert isinstance(res, Result)
     assert res.rc == 0
@@ -368,7 +368,7 @@ def test_result_failure_has_no_session_id(monkeypatch):
         def available_size(self): return 0
         def react(self, t): return "stop"
         def classify(self, t): return "rotate"
-    monkeypatch.setattr(eng, "_ensure_keypool", lambda: FakeKP())
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     res = eng.agent_with_retry_session_new("prompt", "logFail")
     assert res.rc == 1
     assert res.session_id == ""

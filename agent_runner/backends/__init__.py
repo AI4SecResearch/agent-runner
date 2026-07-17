@@ -15,33 +15,53 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from .claude_code import ClaudeCodeBackend
+from .opencode import OpencodeBackend
+
 
 class Backend(Protocol):
     """The 11-op contract (mirrors ``agent_backend_*`` in ``backends/*.sh``).
 
     ``invoke`` writes ``<prefix>.jsonl`` + ``<prefix>.err`` and returns the
-    result text (stdout); the others inspect ``<prefix>.jsonl``. ``prefix`` is
-    a full path (the engine constructs it as ``$OUTPUT_DIR/$log_name``).
+    ``Popen`` (NOT waited on); the watchdog streams stdout to ``<prefix>.jsonl``
+    via ``stream``, polls, and either waits or kills. ``prefix`` is a full path
+    (the engine constructs it as ``$OUTPUT_DIR/$log_name``).
+
+    Each backend is instantiated per-``Runner`` with that Runner's ``Config``
+    instance (``__init__(self, config=None)``), so multi-threaded callers each
+    get an isolated backend with its own config view. Backends hold NO shared
+    mutable state — per-call handles (e.g. the err file) are attached to the
+    returned ``Popen`` object (``proc._ar_err``), never to instance attributes.
     """
 
     # the lpm agent id this backend maps to (claude-code → "claude", etc.)
     agent_id: str
 
-    def invoke(self, prompt: str, prefix: str, argv: list[str]):
-        """Start one agent step. Opens <prefix>.err for the agent's stderr,
-        returns the ``Popen`` WITHOUT waiting (the watchdog streams stdout to
-        <prefix>.jsonl via ``stream``, polls, and either waits or kills).
+    def __init__(self, config=None):
+        """Accept the owning Runner's ``Config`` (None → module default)."""
+        ...
 
-        Mirrors bash's ``_agent_once … &`` (backgrounded) — the watchdog owns
-        the process's lifecycle so it can kill on timeout. Success is NOT
-        judged from the returncode (see ``result_ok``)."""
+    def invoke(self, prompt: str, prefix: str, argv: list[str], key_ctx=None):
+        """Start one agent step. Opens <prefix>.err for the agent's stderr,
+        builds an isolated subprocess env (extra env vars from ``key_ctx``:
+        key/base_url → this backend's env-var names) and passes ``env=`` to
+        ``Popen`` so each agent subprocess gets its own key snapshot with zero
+        cross-thread env races. Returns the ``Popen`` WITHOUT waiting (the
+        watchdog streams stdout to <prefix>.jsonl via ``stream``, polls, and
+        either waits or kills).
+
+        ``key_ctx=None`` (no key pool) → ``Popen`` inherits ``os.environ`` as-is
+        (current behavior). Mirrors bash's ``_agent_once … &`` (backgrounded) —
+        the watchdog owns the process's lifecycle so it can kill on timeout.
+        Success is NOT judged from the returncode (see ``result_ok``)."""
         ...
 
     def stream(self, proc, prefix: str) -> None:
         """把 ``proc.stdout`` 逐行写入 <prefix>.jsonl(结果行一落地,
         ``is_complete`` 即可见)。**不**打印到 stdout——stdout 留给进程形态的
         session_id 行,结果文本由 ``result_body`` 按需从日志读回。在 reader
-        线程上跑,阻塞至 stdout EOF。"""
+        线程上跑,阻塞至 stdout EOF。finally 关闭 ``proc._ar_err``(由 invoke
+        挂上的 per-call 句柄,非实例属性——并发安全)。"""
         ...
 
     def is_complete(self, prefix: str) -> bool:
@@ -75,8 +95,13 @@ class Backend(Protocol):
         """Permission flag fragment (e.g. --dangerously-skip-permissions)."""
         ...
 
-    def model_args(self, tier: str) -> list[str]:
-        """Model flag fragment; tier is ``primary``/``downgrade``/a bare id."""
+    def model_args(self, tier: str, resolved_model: str = "") -> list[str]:
+        """Model flag fragment; tier is ``primary``/``downgrade``/a bare id.
+
+        ``resolved_model`` (the keypool's resolved model id, from ``KeyContext``)
+        takes priority over the config layer — this is the multi-thread path
+        that bypasses the ``AR_*`` env round-trip. Empty → fall back to config
+        (the startup-time ``AR_PRIMARY_MODEL``/``AR_DOWNGRADE_MODEL`` env or TOML)."""
         ...
 
     def resume_args(self, sid: str) -> list[str]:
@@ -89,29 +114,26 @@ class Backend(Protocol):
         ...
 
     def api_key_env_var(self) -> str:
-        """The env var this agent reads for its API key."""
+        """The env var this agent reads for its API key (the extra_env key)."""
         ...
 
     def base_url_env_var(self) -> str:
-        """The env var this agent reads for its base_url (empty ⇒ skip)."""
+        """The env var this agent reads for its base_url (empty ⇒ skip extra_env)."""
         ...
 
 
-def _build_registry() -> dict[str, Backend]:
-    from .claude_code import ClaudeCodeBackend
-    from .opencode import OpencodeBackend
-
-    return {
-        "claude-code": ClaudeCodeBackend(),
-        "opencode": OpencodeBackend(),
-    }
-
-
-REGISTRY: dict[str, Backend] = _build_registry()
+# REGISTRY maps names to CLASSES (not singletons): each Runner instantiates its
+# own backend with its own Config, so multi-threaded callers are isolated.
+REGISTRY: dict[str, type] = {
+    "claude-code": ClaudeCodeBackend,
+    "opencode": OpencodeBackend,
+}
 
 
 def get_backend(name: str | None) -> Backend:
-    """Look up a backend by ``$AGENT_BACKEND`` value; fall back to claude-code."""
+    """Look up a backend by ``$AGENT_BACKEND`` value; return a default-config
+    INSTANCE (backward-compat for module-level / external callers). The Runner
+    constructs its own per-instance backend via ``REGISTRY[name](config=...)``."""
     if not name or name not in REGISTRY:
         import sys
 
@@ -121,8 +143,8 @@ def get_backend(name: str | None) -> Backend:
                 f"agent_runner.backends: unknown AGENT_BACKEND '{name}', "
                 f"defaulting to '{default}'\n"
             )
-        return REGISTRY[default]
-    return REGISTRY[name]
+        return REGISTRY[default]()
+    return REGISTRY[name]()
 
 
 def known_backends() -> list[str]:

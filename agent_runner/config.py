@@ -21,13 +21,11 @@ TOML 键用下划线小写(如 ``primary_model``);对应的环境变量是 ``AR_
 from __future__ import annotations
 
 import os
+import threading
 import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
-
-_CACHE: dict | None = None
-
 
 # ── 配置项声明表(单一真相源) ─────────────────────────────────────────────
 @dataclass
@@ -97,8 +95,6 @@ def _dig(d: Any, path: str) -> Any:
     return d
 
 
-# ── 通用解析(遍历 SPECS,零特判) ─────────────────────────────────────────
-
 def _coerce(val: str, type_: type) -> Any:
     """env 字符串按声明类型转。"""
     if type_ is bool:
@@ -111,49 +107,90 @@ def _coerce(val: str, type_: type) -> Any:
     return val
 
 
-def _resolved() -> dict:
-    """全量解析(AR_ env > TOML > 默认),含 keypool_state 派生。"""
-    global _CACHE
-    if _CACHE is not None:
-        return _CACHE
+# ── 解析视图(单实例,构造时一次性解析) ───────────────────────────────────
+#
+# ``Config`` 是一个解析后的配置视图:每个 ``Runner`` 持自己的 ``Config`` 实例,
+# 从而多线程/多 Agent 场景下可各自微调(经 ``config_overrides``)。优先级:
+#   **config_overrides(实例) > AR_ env(进程) > TOML > 硬编码默认**。
+# 构造时解析一次、存 ``self._resolved``,无后续缓存污染——无 ``clear_cache`` 之需。
+# 模块级 ``get()`` 是向后兼容薄壳(锁守懒加载默认 ``Config``),仅供 bootstrap 与
+# 老的单线程调用方;生产路径经 ``Runner._config`` 实例读取。
 
-    toml = _load_toml()
-    merged: dict = {}
+class Config:
+    """一次性解析的配置视图(per-实例)。
 
-    for spec in SPECS:
-        # 1. 硬编码默认
-        val = spec.default
-        # 2. TOML 覆盖(按 toml_path 嵌套取值,否则顶层 key)
-        tv = _dig(toml, spec.toml_path) if spec.toml_path else toml.get(spec.key)
-        if tv is not None:
-            val = tv
-        # 3. AR_ env 覆盖(env 总是字符串,按 spec.type 转)
-        ev = os.environ.get("AR_" + spec.key.upper())
-        if ev is not None:
-            val = _coerce(ev, spec.type)
-        merged[spec.key] = val
+    ``config_overrides`` 用规范键(如 ``{"stall_timeout": 600, "primary_model": "glm-4.7"}``),
+    优先级最高,实现不同 Agent 的微调隔离。``toml`` 可显式传入(测试用),缺省从候选
+    路径加载。
+    """
 
-    # keypool_state 派生:未显式指定时,默认 = key_pool_config 同目录下 key-pool-state.json
-    if not merged.get("keypool_state"):
-        kpc = merged.get("key_pool_config")
-        if kpc:
-            merged["keypool_state"] = str(
-                Path(kpc).expanduser().parent / "key-pool-state.json"
-            )
+    def __init__(self, config_overrides: dict | None = None, toml: dict | None = None):
+        self._config_overrides = dict(config_overrides) if config_overrides else {}
+        self._toml = toml if toml is not None else _load_toml()
+        self._resolved = self._resolve()
 
-    _CACHE = merged
-    return merged
+    def _resolve(self) -> dict:
+        """全量解析(config_overrides > AR_ env > TOML > 默认),含 keypool_state 派生。"""
+        toml = self._toml
+        merged: dict = {}
+
+        for spec in SPECS:
+            # 1. 硬编码默认
+            val = spec.default
+            # 2. TOML 覆盖(按 toml_path 嵌套取值,否则顶层 key)
+            tv = _dig(toml, spec.toml_path) if spec.toml_path else toml.get(spec.key)
+            if tv is not None:
+                val = tv
+            # 3. AR_ env 覆盖(env 总是字符串,按 spec.type 转)
+            ev = os.environ.get("AR_" + spec.key.upper())
+            if ev is not None:
+                val = _coerce(ev, spec.type)
+            # 4. 实例 config_overrides 覆盖(最高优先级,per-实例微调)
+            if spec.key in self._config_overrides:
+                ov = self._config_overrides[spec.key]
+                if ov is not None:
+                    val = ov
+            merged[spec.key] = val
+
+        # keypool_state 派生:未显式指定时,默认 = key_pool_config 同目录下 key-pool-state.json
+        if not merged.get("keypool_state"):
+            kpc = merged.get("key_pool_config")
+            if kpc:
+                merged["keypool_state"] = str(
+                    Path(kpc).expanduser().parent / "key-pool-state.json"
+                )
+        return merged
+
+    def get(self, key: str, default=None):
+        """取一个配置项。无值返回 default。"""
+        val = self._resolved.get(key, default)
+        return val if val not in (None, "") else default
 
 
-# ── 公开 API ──────────────────────────────────────────────────────────────
+# ── 模块级默认视图(锁守懒加载,向后兼容) ──────────────────────────────────
+
+_DEFAULT_LOCK = threading.Lock()
+_default_config: Config | None = None
+
+
+def _default() -> Config:
+    """返回(必要时构造)模块级默认 Config。锁守,线程安全。"""
+    global _default_config
+    if _default_config is not None:
+        return _default_config
+    with _DEFAULT_LOCK:
+        if _default_config is None:
+            _default_config = Config()
+        return _default_config
+
 
 def get(key: str, default=None):
-    """取一个配置项(经 AR_ env > TOML > 默认 解析)。无值返回 default。"""
-    val = _resolved().get(key, default)
-    return val if val not in (None, "") else default
+    """模块级取值(委托默认 Config,向后兼容)。生产路径优先用 ``Runner._config``。"""
+    return _default().get(key, default)
 
 
-def clear_cache() -> None:
-    """清除缓存(测试用:改了 env/TOML 后重新解析)。"""
-    global _CACHE
-    _CACHE = None
+def _reset_default() -> None:
+    """重置模块级默认 Config(内部用:改了 env/TOML 后让其重解析)。"""
+    global _default_config
+    with _DEFAULT_LOCK:
+        _default_config = None

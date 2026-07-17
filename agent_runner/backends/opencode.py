@@ -32,20 +32,50 @@ class OpencodeBackend:
 
     agent_id = "opencode"
 
+    def __init__(self, config=None):
+        # Per-Runner Config (multi-thread isolation). None → module default.
+        if config is None:
+            from .. import config as _cfg_mod
+            config = _cfg_mod._default()
+        self._config = config
+
     # ── invoke (mirrors agent_backend_invoke) ─────────────────────────────
-    def invoke(self, prompt: str, prefix: str, argv: list[str]):
+    def invoke(self, prompt: str, prefix: str, argv: list[str], key_ctx=None):
         """Start ``opencode run <prompt> --format json``; open <prefix>.err for
-        stderr; return the ``Popen`` without waiting. The watchdog streams
-        stdout to <prefix>.jsonl on a reader thread, then polls/waits/kills."""
+        stderr; build an isolated subprocess env (extra env vars from
+        ``key_ctx``: key → the opencode-auth env var) and pass ``env=`` to
+        ``Popen`` so the agent subprocess gets its own key snapshot. Returns the
+        ``Popen`` without waiting. The err handle is attached to the proc
+        (``proc._ar_err``), not the instance — concurrent invocations never
+        clobber each other. ``key_ctx=None`` → inherits ``os.environ`` as-is."""
         err_path = f"{prefix}.err"
-        _ensure_parent(err_path)  # defensive: callers normally create OUTPUT_DIR
-        self._err = open(err_path, "w")  # kept open until proc finishes
+        _ensure_parent(err_path)  # defensive: callers normally create AR_RUN_DIR
+        err = open(err_path, "w")  # attached to proc; stream closes it
         from ..platform import PLATFORM
         cmd = ["opencode", "run", prompt, "--format", "json", *argv]
-        return subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=self._err, text=True,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=err, text=True,
+            env=self._build_env(key_ctx),
             **PLATFORM.new_session_kwargs(),
         )
+        proc._ar_err = err  # per-call; stream's finally closes it
+        return proc
+
+    def _build_env(self, key_ctx):
+        """``{**os.environ, **extra_env}`` from key_ctx, or None (inherit env)."""
+        if key_ctx is None:
+            return None
+        extra_env = {}
+        key_var = self.api_key_env_var()
+        if key_var and key_ctx.key:
+            extra_env[key_var] = key_ctx.key
+        # base_url_env_var() is "" for opencode (routes by provider prefix) → skip
+        url_var = self.base_url_env_var()
+        if url_var and key_ctx.base_url:
+            extra_env[url_var] = key_ctx.base_url
+        if not extra_env:
+            return None
+        return {**os.environ, **extra_env}
 
     # ── stdout 流式写入 jsonl ─────────────────────────────────────────────
     def stream(self, proc, prefix: str) -> None:
@@ -57,8 +87,9 @@ class OpencodeBackend:
                     jl.write(line)
                     jl.flush()  # 终态事件一落地,is_complete 即可见
         finally:
-            if hasattr(self, "_err") and not self._err.closed:
-                self._err.close()
+            err = getattr(proc, "_ar_err", None)
+            if err is not None and not err.closed:
+                err.close()
 
     # ── 成功运行的结果文本 ────────────────────────────────────────────────
     def result_body(self, prefix: str) -> str:
@@ -140,18 +171,19 @@ class OpencodeBackend:
 
     # ── flag fragments ────────────────────────────────────────────────────
     def perm_args(self) -> list[str]:
-        from .. import config
         # 非 sandbox 不输出——OpenCode 的权限模型在 opencode.json 里,非 CLI flag。
-        if config.get("sandbox", False):
+        if self._config.get("sandbox", False):
             return ["--dangerously-skip-permissions"]
         return []
 
-    def model_args(self, tier: str) -> list[str]:
-        from .. import config
-        if tier == "primary":
-            m = config.get("primary_model", "")
+    def model_args(self, tier: str, resolved_model: str = "") -> list[str]:
+        # resolved_model (keypool-resolved) 优先;空 → 回落 config。
+        if resolved_model:
+            m = resolved_model
+        elif tier == "primary":
+            m = self._config.get("primary_model", "")
         elif tier == "downgrade":
-            m = config.get("downgrade_model", "")
+            m = self._config.get("downgrade_model", "")
         else:
             m = tier
         return ["--model", m] if m else []
@@ -165,8 +197,7 @@ class OpencodeBackend:
 
     # ── env-var names ─────────────────────────────────────────────────────
     def api_key_env_var(self) -> str:
-        from .. import config
-        return config.get("opencode_auth_env_var", "Z_AI_API_KEY")
+        return self._config.get("opencode_auth_env_var", "Z_AI_API_KEY")
 
     def base_url_env_var(self) -> str:
         # Empty ⇒ key pool skips base_url export: OpenCode routes by the

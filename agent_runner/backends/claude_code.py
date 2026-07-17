@@ -44,34 +44,59 @@ class ClaudeCodeBackend:
 
     agent_id = "claude"
 
-    # ── invoke (mirrors agent_backend_invoke) ─────────────────────────────
-    def invoke(self, prompt: str, prefix: str, argv: list[str]):
-        """Start ``claude -p <prompt> --output-format stream-json --verbose``;
-        open <prefix>.err for stderr; return the ``Popen`` without waiting.
+    def __init__(self, config=None):
+        # Per-Runner Config (multi-thread isolation). None → module default
+        # (back-compat / process mode). Resolved once at construction.
+        if config is None:
+            from .. import config as _cfg_mod
+            config = _cfg_mod._default()
+        self._config = config
 
-        The watchdog calls ``stream(proc, prefix)`` on a reader thread (which
-        writes <prefix>.jsonl and prints the result text), then polls/waits/
-        kills. Backgrounding is the load-bearing bit — without it the watchdog
-        cannot kill a stalled agent.
+    # ── invoke (mirrors agent_backend_invoke) ─────────────────────────────
+    def invoke(self, prompt: str, prefix: str, argv: list[str], key_ctx=None):
+        """Start ``claude -p <prompt> --output-format stream-json --verbose``;
+        open <prefix>.err for stderr; build an isolated subprocess env (extra env
+        vars from ``key_ctx``: key → ANTHROPIC_AUTH_TOKEN, base_url →
+        ANTHROPIC_BASE_URL) and pass ``env=`` to ``Popen`` so the agent subprocess
+        gets its own key snapshot with zero cross-thread env races. Returns the
+        ``Popen`` without waiting. The err handle is attached to the proc
+        (``proc._ar_err``), not stored on the instance — so concurrent invocations
+        never clobber each other's err handle. ``key_ctx=None`` → inherits
+        ``os.environ`` as-is.
         """
         err_path = f"{prefix}.err"
         # Ensure the output directory exists (defensive — callers normally
         # create AR_RUN_DIR, but a missing parent shouldn't crash the run).
         _ensure_parent(err_path)
-        # Open in a new session so the watchdog can kill the whole process
-        # group (agent + its children) on timeout. The platform kwarg abstracts
-        # POSIX (start_new_session) vs Windows.
-        self._err = open(err_path, "w")  # kept open until proc finishes
+        err = open(err_path, "w")  # attached to proc; stream closes it
         from ..platform import PLATFORM
         cmd = [
             "claude", "-p", prompt,
             "--output-format", "stream-json", "--verbose",
             *argv,
         ]
-        return subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=self._err, text=True,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=err, text=True,
+            env=self._build_env(key_ctx),
             **PLATFORM.new_session_kwargs(),
         )
+        proc._ar_err = err  # per-call; stream's finally closes it
+        return proc
+
+    def _build_env(self, key_ctx):
+        """``{**os.environ, **extra_env}`` from key_ctx, or None (inherit env)."""
+        if key_ctx is None:
+            return None
+        extra_env = {}
+        key_var = self.api_key_env_var()
+        if key_var and key_ctx.key:
+            extra_env[key_var] = key_ctx.key
+        url_var = self.base_url_env_var()
+        if url_var and key_ctx.base_url:
+            extra_env[url_var] = key_ctx.base_url
+        if not extra_env:
+            return None
+        return {**os.environ, **extra_env}
 
     # ── stdout 流式写入 jsonl ─────────────────────────────────────────────
     def stream(self, proc, prefix: str) -> None:
@@ -83,8 +108,11 @@ class ClaudeCodeBackend:
                     jl.write(line)
                     jl.flush()  # 结果行一落地,is_complete 即可见
         finally:
-            if hasattr(self, "_err") and not self._err.closed:
-                self._err.close()
+            # per-call err handle (attached by invoke), NOT an instance attr —
+            # concurrent invocations each close their own.
+            err = getattr(proc, "_ar_err", None)
+            if err is not None and not err.closed:
+                err.close()
 
     # ── 成功运行的结果文本 ────────────────────────────────────────────────
     def result_body(self, prefix: str) -> str:
@@ -137,17 +165,19 @@ class ClaudeCodeBackend:
 
     # ── flag fragments ────────────────────────────────────────────────────
     def perm_args(self) -> list[str]:
-        from .. import config
-        if config.get("sandbox", False):
+        if self._config.get("sandbox", False):
             return ["--dangerously-skip-permissions"]
         return ["--permission-mode", "acceptEdits"]
 
-    def model_args(self, tier: str) -> list[str]:
-        from .. import config
-        if tier == "primary":
-            m = config.get("primary_model", "")
+    def model_args(self, tier: str, resolved_model: str = "") -> list[str]:
+        # resolved_model (keypool-resolved, multi-thread path) 优先于 config 层,
+        # 绕过 AR_* env 回环。空 resolved_model → 回落 config(启动期 AR_* env / TOML)。
+        if resolved_model:
+            m = resolved_model
+        elif tier == "primary":
+            m = self._config.get("primary_model", "")
         elif tier == "downgrade":
-            m = config.get("downgrade_model", "")
+            m = self._config.get("downgrade_model", "")
         else:
             m = tier  # bare model id
         return ["--model", m] if m else []

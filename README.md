@@ -1,19 +1,8 @@
 # agent-runner (Python)
 
-A reliable agent-CLI execution layer — **watchdog timeouts, reactive retry with
-model downgrade, multi-provider key-pool rotation, and session reuse** — exposed
-as both a **Python library** and a **process** (`python -m` or a thin `.sh`
-wrapper), so it can serve as a "high-reliability agent" parent process for bash
-pipelines or drop into a Python codebase as a dependency.
+一个可靠的 agent-CLI 执行层 —— 具备 **watchdog 超时、带模型降级的反应式重试、多 provider 密钥池轮换、会话复用** —— 以 **Python 库** 与 **进程**（`python -m` 或薄 `.sh` 封装）两种形态提供，既可充当 bash 流水线的"高可靠 agent"父进程，也可作为依赖嵌入 Python 代码库。项目独立、跨平台(POSIX)、无运行时依赖 bash 或 `jq`；内置的 `llm-provider-manager`（lpm）位于 `llm-provider-manager/`。实现与并发设计见 **[ARCHITECTURE.md](ARCHITECTURE.md)**。
 
-This is a **self-contained, cross-platform rewrite** of the original
-[bash agent-runner](..): the orchestration logic is ported 1:1 (same public
-API names, signatures, exit codes, and invariants) but reimplemented natively
-in Python with **no runtime dependency on bash or `jq`**, and **no coupling to
-the bash project**. The vendored `llm-provider-manager` (lpm) is bundled inside
-(`agent_runner/_vendor/`).
-
-## Two call shapes
+## 两种调用形态
 
 **库形态**(Python 上层):
 
@@ -31,6 +20,24 @@ if res:
     agent_with_retry_session_resume("精修 markdown", "refined", res.session_id)
 ```
 
+### 多线程使用
+
+模块级函数(`agent_with_retry` 等)内部委托一个 **thread-local 默认 `Runner`** —— 即:单线程调用方**零改动**即可跨线程并发使用,每线程各自独立的编排状态、keypool、env 快照,无跨线程竞态。
+
+需**多 Agent 微调**或显式隔离的场景,用 `Runner(config_overrides=...)` —— 每个实例持自己的 `Config`(优先级:`config_overrides` > `AR_` env > TOML > 默认),backend、keypool 全隔离:
+
+```python
+from agent_runner import Runner
+
+# 不同线程跑不同 backend / 模型 / 超时,互不干扰
+r_claude = Runner(config_overrides={"backend": "claude-code", "primary_model": "glm-5.1"})
+r_oc = Runner(config_overrides={"backend": "opencode", "primary_model": "glm-4.7", "stall_timeout": 600})
+# 各自在自己的线程里调用:
+res = r_claude.agent_with_retry("总结这份文档", "summary")
+```
+
+隔离的实现机制(`KeyContext` 纯值透传、`Popen(env=...)` 隔离快照、per-call err 句柄脱单例、线程安全 ⟹ 进程安全的推理)见 [ARCHITECTURE.md § Concurrency model](ARCHITECTURE.md#concurrency-model-multi-threaded)。`tests/test_threading.py` 端到端验证了这些保证。
+
 **进程形态**(bash / 任意语言上层 —— 本项目作为一个"高可靠 agent"子进程):
 
 ```bash
@@ -46,120 +53,62 @@ agent-runner.sh resume "精修 markdown" "refined" "$sid"
 - `$?` —— 成败(0 / 1 / 2)。
 - **stdout —— session_id 一行**(无则空行),供 `sid=$(...)` 捕获。
 - **stderr —— 诊断**(重试 / 超时 / 资源耗尽通告,给人看)。
-- 结果文本不进 stdout —— 已全量留存于 `$OUTPUT_DIR/<log_name>.jsonl`;库形态则经 `Result.text` 给到调用方。
+- 结果文本不进 stdout —— 已全量留存于 `$run_dir/<log_name>.jsonl`;库形态则经 `Result.text` 给到调用方。
 
-entry(进程形态取一):`new` / `resume` / `fork` / `once` / `agent_with_retry`
-(全名如 `agent_with_retry_session_new` 亦接受)。`resume`/`fork`/`once` 在
-`log_name` 之后还需 `session_id`;再之后的参数透传给 agent(如 `--model x`)。
+entry(进程形态取一):`new` / `resume` / `fork` / `once` / `agent_with_retry`(全名如 `agent_with_retry_session_new` 亦接受)。`resume`/`fork`/`once` 在 `log_name` 之后还需 `session_id`;再之后的参数透传给 agent(如 `--model x`)。
 
-## What it does
+## 配置(TOML 文件 + `AR_` env)
 
-For each invocation it: (1) selects a key + provider config from the pool, (2)
-runs the agent in a backgrounded process group, (3) watches for early completion
-/ stall / hard timeout (killing the whole tree on timeout), (4) on failure
-**reactively** classifies the error and applies one recovery step (disable bad
-key / rotate to next / downgrade model) then retries, re-classifying each new
-failure. Same layered design and 7 invariants as the bash engine — see the
-parent repo's `ARCHITECTURE.md`.
+所有配置项走同一套机制：写进 TOML 文件，或用 `AR_` 前缀的环境变量覆盖(env 优先)，硬编码默认值兜底。优先级:**`AR_` env > TOML > 默认**。哪项放哪由调用方决定,agent-runner 不做规定。
 
-## Configuration (TOML file + `AR_` env overrides)
+**TOML 查找**(取第一个存在的)：`$AR_CONFIG_FILE` → `./agent-runner.toml` → `~/.config/agent-runner/config.toml`。完整注释模板见 `agent-runner.example.toml`。无 TOML 也能跑(默认 + env)。
 
-All config items use one uniform mechanism: write them in a TOML file, or override
-with `AR_`-prefixed env vars (env wins). Hard-coded defaults are the fallback.
-Priority: **`AR_` env > TOML > default**. agent-runner doesn't dictate which items
-go where — that's the consumer's choice.
+| TOML key | `AR_` env | 默认值 | 用途 |
+|---|---|---|---|
+| `backend` | `AR_BACKEND` | `claude-code` | agent 后端 |
+| `primary_model` | `AR_PRIMARY_MODEL` | (无) | 调用方意愿的模型(provider 供应校验;见下) |
+| `downgrade_model` | `AR_DOWNGRADE_MODEL` | (无) | 降级档模型(同上) |
+| `key_pool_config` | `AR_KEY_POOL_CONFIG` | (无) | providers.jsonc 路径 |
+| `keypool_state` | `AR_KEYPOOL_STATE` | = key_pool_config 同目录 | 密钥池状态文件 |
+| `run_dir` | `AR_RUN_DIR` | (必填) | 产出根(jsonl/err/产物) |
+| `sandbox` | `AR_SANDBOX` | `false` | 跳过权限提示 |
+| `stall_timeout` | `AR_STALL_TIMEOUT` | `300` | 无输出多少秒后杀掉 |
+| `total_timeout` | `AR_TOTAL_TIMEOUT` | `0` | 硬总超时(0 = 不限) |
+| `lpm_src` | `AR_LPM_SRC` | 内置副本 | lpm 源目录覆盖(进程级) |
+| `opencode_auth_env_var` | `AR_OPENCODE_AUTH_ENV_VAR` | `Z_AI_API_KEY` | opencode 读 API key 的 env 变量 |
 
-**TOML lookup** (first existing): `$AR_CONFIG_FILE` → `./agent-runner.toml` →
-`~/.config/agent-runner/config.toml`. A full annotated template is at
-`agent-runner.example.toml`. agent-runner runs fine with no TOML (defaults + env).
+**模型选择**：`primary_model`/`downgrade_model` 表达调用方意愿。运行时密钥池检查所求模型是否在 provider 的可用 `models` 列表(来自 providers.jsonc)里：在 → 用它；不在 → 回落 provider 声明的 `primaryModel`/`downgradeModel`。无密钥池 → 原样透传给 agent。agent-runner **从不硬编码**模型名——一律来自 config/provider。
 
-| TOML key / `AR_` env | default | purpose |
-|---|---|---|
-| `backend` / `AR_BACKEND` | `claude-code` | agent backend |
-| `primary_model` / `AR_PRIMARY_MODEL` | (none) | caller's preferred model (provider-supply-checked; see below) |
-| `downgrade_model` / `AR_DOWNGRADE_MODEL` | (none) | downgrade-tier model (same) |
-| `key_pool_config` / `AR_KEY_POOL_CONFIG` | (none) | providers.jsonc path |
-| `keypool_state` / `AR_KEYPOOL_STATE` | = key_pool_config's dir | key-pool state file |
-| `run_dir` / `AR_RUN_DIR` | (required) | output root (jsonl/err/artifacts) |
-| `sandbox` / `AR_SANDBOX` | `false` | skip permission prompts |
-| `stall_timeout` / `AR_STALL_TIMEOUT` | `300` | seconds with no output before kill |
-| `total_timeout` / `AR_TOTAL_TIMEOUT` | `0` | hard total timeout (0 = unlimited) |
-| `lpm_src` / `AR_LPM_SRC` | vendored copy | lpm source dir override |
-
-**Model selection**: `primary_model`/`downgrade_model` express the caller's wish.
-At runtime the key pool checks if the requested model is in the provider's available
-`models` list (from providers.jsonc). If yes → use it; if not → fall back to the
-provider's declared `primaryModel`/`downgradeModel`. No key pool → pass through to
-the agent as-is. Model names are **never hard-coded** in agent-runner — they come
-from config/provider.
-
-## Backends
-
-`agent_runner/backends/` — one module per agent CLI implementing the 11-op
-contract (`invoke` / `is_complete` / `result_ok` / `result_text` / `session_id`
-/ perm/model/resume/fork flag fragments / env-var names), using `subprocess` +
-the `json` stdlib (no `jq`). Current backends: `claude_code.py`, `opencode.py`.
-Add a backend = new module + one `REGISTRY` entry; the engine never references a
-concrete agent.
-
-## Cross-platform
-
-- **Paths**: `pathlib` throughout; no hardcoded Unix separators; agent binaries
-  resolved via `PATH`. Output/state live under the caller-supplied `OUTPUT_DIR`
-  (never hardcoded `/tmp`).
-- **Key-pool locking** (`agent_runner/_vendor/.../keypool.py`): the advisory file
-  lock that guards the shared state file is platform-abstracted into `_flock_*`
-  helpers — `fcntl.flock` on POSIX, `msvcrt.locking` (degraded to exclusive) on
-  Windows. Mutual exclusion is preserved on both; only read concurrency drops
-  on Windows. (This helper is written to be lift-and-shift into upstream lpm.)
-- **Watchdog process-tree kill** (`agent_runner/platform.py`): `kill_tree` is
-  abstracted behind a `Platform` interface — POSIX uses process groups
-  (`setsid` + `killpg`); the Windows implementation is a stub (extension point).
-
-## Self-containment
-
-This project has **zero coupling** to the parent bash `agent-runner` repo:
-- No `source`/import of `runner.sh`, `runner.py`, or `backends/*.sh`.
-- lpm is vendored as a source copy at `agent_runner/_vendor/llm_provider_manager/`
-  (stdlib-only). It evolves with this project; upstream lpm changes are synced
-  by re-copying. `$LPM_SRC` can point elsewhere for development.
-
-## Tests
+## 测试
 
 ```bash
-pip install pytest       # only dev dependency
-cd agent-runner-py
+pip install pytest       # 唯一开发依赖
+cd agent-runner
 python -m pytest -q
 ```
 
-- `test_backends_jq_equiv.py` — Python jsonl parsing is byte-equivalent to the
-  bash `jq` filters (cross-checked against the parent repo's bash backends when
-  present; skips otherwise).
-- `test_engine.py` — watchdog early-exit, reactive retry, continue-vs-redo
-  branches, exit codes (mock backend, no real agent).
-- `test_platform.py` — the POSIX process-group spawn + tree-kill contract.
-- `test_cli.py` — `python -m agent_runner` dispatch, arg ordering, exit-code
-  mapping.
+- `test_backends_jq_equiv.py` —— Python 的 jsonl 解析与 bash `jq` 过滤器逐字节等价(bash 后端不存在时跳过)。
+- `test_engine.py` —— watchdog 早退、反应式重试、续接 vs 重跑分支、退出码(mock backend,不起真 agent)。
+- `test_platform.py` —— POSIX 进程组拉起 + 树杀契约。
+- `test_cli.py` —— `python -m agent_runner` 派发、参数顺序、退出码映射。
+- `test_threading.py` —— 多线程隔离:per-thread key/子进程 env 隔离、err 句柄脱单例、thread-local 默认 `Runner`、`Runner(config_overrides=...)` 配置隔离。
 
-## Layout
+## 目录结构
 
 ```
 agent-runner/
-├── agent-runner.sh              # bash → `python -m agent_runner` wrapper (process mode)
-├── pyproject.toml               # package metadata (stdlib-only; pip -e . works)
-├── README.md
-├── agent_runner/                # the importable package
-│   ├── __init__.py              # public API (library mode)
-│   ├── __main__.py              # `python -m agent_runner` (process mode)
-│   ├── engine.py                # orchestration
-│   ├── platform.py              # cross-platform process-tree abstraction
-│   ├── keypool.py
+├── agent-runner.sh              # bash → `python -m agent_runner` 封装(进程形态)
+├── pyproject.toml               # 包元数据(纯 stdlib;支持 pip -e .)
+├── README.md                    # 本文件 — 使用指南
+├── ARCHITECTURE.md              # 实现与并发设计
+├── agent_runner/                # 可 import 的包
+│   ├── __init__.py              # 公开 API(库形态)
+│   ├── __main__.py              # `python -m agent_runner`(进程形态)
+│   ├── engine.py                # 编排(Runner)
+│   ├── config.py                # Config(per-实例配置视图)
+│   ├── platform.py              # 跨平台进程树抽象
+│   ├── keypool.py               # KeyPool 包装 + KeyContext
 │   └── backends/{claude_code,opencode,_jsonl}.py
-├── llm-provider-manager/        # vendored lpm (git subtree) — keypool/providers/agents
+├── llm-provider-manager/        # 内置 lpm(git subtree)— keypool/providers/agents
 └── tests/
-```
-
-Progress tracking (the orthogonal `progress_read`/`progress_write`/
-`progress_iterations` state machine) is maintained separately; this project
-does not provide it.
 ```

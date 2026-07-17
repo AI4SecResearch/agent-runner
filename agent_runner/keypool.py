@@ -1,69 +1,122 @@
 """Key-pool adapter for the Python engine — reuses vendored lpm directly.
 
-This is the Python counterpart of ``runner.sh``'s ``key_pool_*`` wrappers +
-``runner.py`` CLI adapter, but with the CLI round-trip removed: lpm's
-``keypool.py`` already exposes a library-level ``KeyPool`` class (with
-``init``/``rotate``/``on_success``/``disable``/``available_size`` methods that
-return ``(key_value, provider_id, key_id)`` entries, not JSON lines) and
-module-level ``react``/``classify_error`` functions. We import those directly,
-so there is no ``python3 runner.py react --text - …`` subprocess, no argparse,
-no JSON-on-stdout round-trip per classification.
+This is the Python counterpart of ``runner.sh``'s ``key_pool_*`` wrappers, but
+with the CLI round-trip removed: lpm's ``keypool.py`` already exposes a
+library-level ``KeyPool`` class (with ``init``/``rotate``/``on_success``/
+``disable``/``available_size`` methods returning ``(key_value, provider_id,
+key_id)`` entries) and module-level ``react``/``classify_error`` functions,
+which we import directly.
 
-The ``_apply_entry`` mirrors ``runner.sh``'s ``_kp_apply``: each field is
-written to the environment only when non-empty, so an omitted base_url/model
-keeps the backend default; a changed API-key env-var name first unsets the
-previous one (no leak across providers).
+**Concurrency model (multi-threaded).** This wrapper mutates NO process-level
+state: it never writes ``os.environ`` and never calls ``config.clear_cache()``.
+Instead, ``init``/``rotate``/``on_success`` resolve the active pool entry to a
+pure ``KeyContext`` struct (key + base_url + provider-constrained models) and
+return it. The engine threads that ``KeyContext`` to the backend, whose
+``invoke`` maps ``key``/``base_url`` to its own env-var names and builds an
+isolated ``Popen(env={**os.environ, **extra_env})`` snapshot — so each agent
+subprocess gets its own key, with zero cross-thread env races. The wrapper
+tracks ``self._current_key_ctx`` (instance-level) so ``disable`` can find the
+active key value without reading the process environment.
+
+The wrapper holds NO backend reference (decoupled — the backend owns env-var-
+name mapping) and NO module-level singleton state (each ``Runner`` constructs
+its own ``KeyPool``). lpm loading is lazy (``_ensure_lpm``) and lock-guarded;
+``lpm_src`` is process-level (``sys.path`` is process-global).
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import threading
+from dataclasses import dataclass
 
-# ── 定位 lpm 的 src/(三段式查找)───────────────────────────────────────
-# 1. AR_LPM_SRC(经 config 层:TOML/env;显式覆盖,如指向 dev checkout)
-# 2. 仓库内 subtree 的 llm-provider-manager/src(默认)——git subtree 引入,
-#    可经 `git subtree pull/push` 与上游同步,单一来源、不复制。
-# 3. ~/.local/share/llm-provider-manager/src(install.sh 兜底)
-from . import config as _config  # 仅用于读 lpm_src;不触发循环(config 不 import keypool)
+# ── 定位 lpm 的 src/(lazy,锁守) ────────────────────────────────────────
+# 三段式查找:1. AR_LPM_SRC(经 config 层) 2. 仓库内 subtree 的
+# llm-provider-manager/src(默认)3. ~/.local/share/llm-provider-manager/src。
+# lpm_src 是进程级(sys.path 进程全局);首次调用决定,后续实例仅在未设时采纳。
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_lpm_src = _config.get("lpm_src", "")
-for _cand in (
-    _lpm_src,
-    os.path.join(_HERE, "..", "llm-provider-manager", "src"),
-    os.path.expanduser("~/.local/share/llm-provider-manager/src"),
-):
-    if _cand and os.path.isdir(_cand) and _cand not in sys.path:
-        sys.path.insert(0, _cand)
-        break
 
-try:
-    from llm_provider_manager.keypool import (  # type: ignore
-        KeyPool as _LpmKeyPool,
-        react as _lpm_react,
-        classify_error as _lpm_classify_error,
-    )
-except ImportError as _e:  # pragma: no cover - exercised via the import error path
-    sys.stderr.write(
-        f"agent_runner.keypool: llm_provider_manager not found ({_e}).\n"
-        "  Expected the vendored llm-provider-manager/src; or set LPM_SRC=<lpm>/src;\n"
-        "  or install lpm (install.sh → ~/.local/share/llm-provider-manager).\n"
-    )
-    raise
+_LPM_LOCK = threading.Lock()
+_LpmKeyPool = None  # set by _ensure_lpm
+_lpm_react = None
+_lpm_classify_error = None
+_lpm_ready = False
+
+
+def _ensure_lpm(cfg) -> None:
+    """Lazy-locate lpm 的 src/ 并 import 其 keypool 模块。幂等 + 锁守。
+
+    在 ``KeyPool.__init__`` 首次触发(读实例 config 的 ``lpm_src``)。进程级:
+    ``sys.path`` 是进程全局,首次设置后生效;``_lpm_ready`` 守卫避免重复。
+    """
+    global _LpmKeyPool, _lpm_react, _lpm_classify_error, _lpm_ready
+    if _lpm_ready:
+        return
+    with _LPM_LOCK:
+        if _lpm_ready:
+            return
+        lpm_src = cfg.get("lpm_src", "")
+        for _cand in (
+            lpm_src,
+            os.path.join(_HERE, "..", "llm-provider-manager", "src"),
+            os.path.expanduser("~/.local/share/llm-provider-manager/src"),
+        ):
+            if _cand and os.path.isdir(_cand) and _cand not in sys.path:
+                sys.path.insert(0, _cand)
+                break
+        try:
+            from llm_provider_manager.keypool import (  # type: ignore
+                KeyPool as _KP,
+                react as _r,
+                classify_error as _ce,
+            )
+        except ImportError as _e:  # pragma: no cover
+            sys.stderr.write(
+                f"agent_runner.keypool: llm_provider_manager not found ({_e}).\n"
+                "  Expected the vendored llm-provider-manager/src; or set AR_LPM_SRC=<lpm>/src;\n"
+                "  or install lpm (install.sh -> ~/.local/share/llm-provider-manager).\n"
+            )
+            raise
+        _LpmKeyPool = _KP
+        _lpm_react = _r
+        _lpm_classify_error = _ce
+        _lpm_ready = True
+
+
+@dataclass
+class KeyContext:
+    """A resolved key context (raw values) for one pool entry. Pure data.
+
+    Carries the resolved API key, base_url, and provider-constrained models.
+    The backend maps ``key``/``base_url`` to its own env-var names and builds
+    the subprocess env (extra env vars); the engine threads ``primary_model``/
+    ``downgrade_model`` to ``backend.model_args`` as ``resolved_model`` (bypassing
+    the config layer's env round-trip). Empty fields = no value to apply.
+    """
+    key: str = ""
+    base_url: str = ""
+    primary_model: str = ""
+    downgrade_model: str = ""
+    # for debugging / disable() value lookup
+    provider_id: str = ""
+    key_id: str = ""
 
 
 class KeyPool:
-    """Thin wrapper over lpm's ``KeyPool`` that writes env vars on apply.
+    """Thin wrapper over lpm's ``KeyPool`` resolving entries to ``KeyContext``.
 
-    Holds the ``_current_env_var`` mirror of ``runner.sh``'s
-    ``$_kp_current_env_var`` so a changed API-key env-var name unsets the
-    previous one rather than leaking it into the next invocation.
+    Holds no backend reference (decoupled) and mutates no ``os.environ`` (each
+    subprocess gets fresh extra env vars via ``Popen env=``). Tracks
+    ``self._current_key_ctx`` (instance-level) so ``disable`` can find the
+    active key value without reading the process environment.
     """
 
-    def __init__(self, config_path: str, state_path: str, agent_id: str, backend):
+    def __init__(self, config_path: str, state_path: str, agent_id: str, config):
+        _ensure_lpm(config)
         self._kp = _LpmKeyPool(config_path, state_path, agent_id=agent_id)
-        self._backend = backend
-        self._current_env_var: str | None = None
+        self._config = config
+        self._current_key_ctx: KeyContext | None = None
         self._has_config = os.path.isfile(config_path)
 
     # ── config-presence guard (mirrors runner.py dispatch's has_config) ──
@@ -74,91 +127,82 @@ class KeyPool:
         """True when there's no config → the op should be a no-op."""
         return not self._has_config
 
-    # ── apply an entry to the environment (mirror of _kp_apply) ──────────
-    def _apply_entry(self, entry) -> None:
+    # ── resolve an entry to a KeyContext (pure, no env writes) ───────────
+    def _resolve_entry(self, entry) -> KeyContext:
+        """``(key_value, provider_id, key_id)`` → ``KeyContext``(纯,无副作用)。
+
+        仅做解析:从 entry 取 provider(经 lpm)、解析 base_url(经 lpm agent 的
+        ``base_url_for``)、按 AR_* 调用方意愿 + provider 供应边界选出模型。
+        不写 env、不碰 config 缓存——应用动作由 backend 在 Popen env= 完成。
+        """
         if not entry:
-            return
+            return KeyContext()
         key_value, pid, kid = entry
-
-        # key → API key env var (backend-declared); unset a previously-exported
-        # var if its name changed.
-        api_key_var = self._backend.api_key_env_var()
-        if api_key_var:
-            if (
-                self._current_env_var
-                and self._current_env_var != api_key_var
-                and self._current_env_var in os.environ
-            ):
-                del os.environ[self._current_env_var]
-            os.environ[api_key_var] = key_value
-            self._current_env_var = api_key_var
-
-        # Resolve the provider from the entry's provider_id — NOT by re-reading
-        # state (which would be a TOCTOU window where a concurrent rotate could
-        # pair this key with another provider's base_url/models). lpm's
-        # _apply_line does the same: derive provider from the resolved entry.
         provider = self._kp.config.provider_by_id(pid)
         if provider is None:
-            return
+            # provider 查不到(配置漂移)→ 只带 key,base_url/模型留空
+            return KeyContext(key=key_value, provider_id=pid, key_id=kid)
 
-        # base_url → base_url env var (backend-declared; empty for backends
-        # that route via their own config). Exported only when both the var
-        # name and the value are non-empty.
-        base_url_var = self._backend.base_url_env_var()
-        if base_url_var:
-            base_url = self._kp._agent.base_url_for(provider) or ""
-            if base_url:
-                os.environ[base_url_var] = base_url
+        base_url = self._kp._agent.base_url_for(provider) or ""
 
-        # 模型选择:AR_* 表调用方意愿,provider 约束供应边界。
-        #   AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL(经 config,TOML/env)若在 provider
-        #   可用 models 列表里 → 用 AR_* 的值(意愿合法);
-        #   否则 → 回落 provider 声明的 primaryModel/downgradeModel;
-        #   provider 也没声明 → 不写(保持现状/空)。
-        # 写入 AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL env,供 backend 经 config 读。
-        ar_primary = _config.get("primary_model", "")
-        ar_downgrade = _config.get("downgrade_model", "")
+        # 模型选择:AR_* 表调用方意愿(经 config),provider 约束供应边界。
+        ar_primary = self._config.get("primary_model", "")
+        ar_downgrade = self._config.get("downgrade_model", "")
         provider_primary, provider_downgrade = _resolve_models_external(provider, kid)
         available = {m.id for m in provider.models_for_key(kid)}
 
         chosen_primary = _choose_model(ar_primary, provider_primary, available)
         chosen_downgrade = _choose_model(ar_downgrade, provider_downgrade, available)
-        wrote = False
-        if chosen_primary:
-            os.environ["AR_PRIMARY_MODEL"] = chosen_primary
-            wrote = True
-        if chosen_downgrade:
-            os.environ["AR_DOWNGRADE_MODEL"] = chosen_downgrade
-            wrote = True
-        if wrote:
-            # backend 经 config.get 读模型;清缓存让它重解析到刚写入的 env。
-            _config.clear_cache()
 
-    # ── the subcommands runner.sh wraps ──────────────────────────────────
-    def init(self) -> None:
-        if self._noop_guard():
-            return
-        self._apply_entry(self._kp.init())
+        return KeyContext(
+            key=key_value,
+            base_url=base_url,
+            primary_model=chosen_primary,
+            downgrade_model=chosen_downgrade,
+            provider_id=pid,
+            key_id=kid,
+        )
 
-    def rotate(self) -> None:
+    # ── the subcommands runner.sh wraps — each returns a KeyContext ──────
+    def init(self) -> KeyContext:
+        """Initialize state, resolve the current entry → KeyContext. Sets current."""
         if self._noop_guard():
-            return
-        self._apply_entry(self._kp.rotate())
+            return KeyContext()
+        ctx = self._resolve_entry(self._kp.init())
+        self._current_key_ctx = ctx
+        return ctx
 
-    def on_success(self) -> None:
+    def rotate(self) -> KeyContext:
+        """Advance to next non-disabled key → KeyContext. Sets current."""
         if self._noop_guard():
-            return
-        self._apply_entry(self._kp.on_success())
+            return KeyContext()
+        ctx = self._resolve_entry(self._kp.rotate())
+        self._current_key_ctx = ctx
+        return ctx
+
+    def on_success(self) -> KeyContext:
+        """Proactive rotation check → KeyContext (the now-current entry).
+
+        If lpm rotated (success_count reached rotate_every), resolves & sets
+        the new current. Otherwise returns the unchanged current. Either way
+        returns the now-current KeyContext.
+        """
+        if self._noop_guard():
+            return KeyContext()
+        entry = self._kp.on_success()
+        if entry:  # proactively rotated
+            ctx = self._resolve_entry(entry)
+            self._current_key_ctx = ctx
+            return ctx
+        return self._current_key_ctx or KeyContext()
 
     def disable(self) -> None:
-        """Disable the currently-applied key (value tracked in env)."""
-        if not self._current_env_var:
+        """Disable the currently-applied key (value tracked in instance)."""
+        if self._current_key_ctx is None or not self._current_key_ctx.key:
             return
         if not (self._has_config and os.path.isfile(self._kp.state_path)):
             return
-        key_value = os.environ.get(self._current_env_var, "")
-        if key_value:
-            self._kp.disable(key_value)
+        self._kp.disable(self._current_key_ctx.key)
 
     def available_size(self) -> int:
         if self._noop_guard():

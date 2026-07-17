@@ -18,6 +18,12 @@
 供后续 resume/fork 续接)、``text``(成功尝试的结果文本)。``int(Result)``/
 ``bool(Result)`` 保留退出码习惯。
 
+**多线程**:`Runner` 类封装一条独立编排链(持自己的 ``Config``/backend/``KeyPool``);
+模块级函数委托一个 thread-local 默认 ``Runner``,故老调用方零改动即可跨线程并发使用。
+多 Agent 微调/显式隔离场景用 ``Runner(config_overrides={...})`` —— 各实例配置全隔离
+(优先级:config_overrides > AR_ env > TOML > 默认)。keypool 返回纯 ``KeyContext``(不写
+``os.environ``),经引擎透传给 ``backend.invoke(key_ctx=...)`` 构造隔离的子进程 env 快照。
+
 进程形态的输出通道分工:``$?`` = 成败(0/1/2)、stdout = session_id 一行(供
 ``sid=$(agent-runner.sh ...)`` 捕获)、stderr = 诊断(重试/超时/耗尽通告)。结果
 文本不进 stdout——已全量留存于 ``$OUTPUT_DIR/<log_name>.jsonl``。
@@ -37,13 +43,14 @@
     if res:
         print("session:", res.session_id)
 
-后端/密钥池/认证全部经环境变量配置(``OUTPUT_DIR`` / ``AGENT_BACKEND`` /
-``SANDBOX`` / ``KEY_POOL_CONFIG`` / ``LPM_SRC`` / ``AGENT_STALL_TIMEOUT`` /
-``AGENT_TIMEOUT`` 等)。
+后端/密钥池/认证全部经环境变量配置(``AR_RUN_DIR`` / ``AR_BACKEND`` /
+``AR_SANDBOX`` / ``AR_KEY_POOL_CONFIG`` / ``AR_LPM_SRC`` / ``AR_STALL_TIMEOUT`` /
+``AR_TOTAL_TIMEOUT`` 等)。优先级:实例 ``config_overrides`` > ``AR_`` env > TOML > 默认。
 """
 
 from .engine import (
     Result,
+    Runner,
     agent_with_retry,
     agent_with_retry_session_fork,
     agent_with_retry_session_new,
@@ -52,6 +59,7 @@ from .engine import (
 
 __all__ = [
     "Result",
+    "Runner",
     "agent_with_retry",
     "agent_with_retry_session_new",
     "agent_with_retry_session_resume",
