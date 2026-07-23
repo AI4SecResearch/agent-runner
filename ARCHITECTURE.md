@@ -19,9 +19,9 @@ classDiagram
         -_config: Config
         -_backend: Backend
         -_kp: KeyPool
-        +agent_with_retry_session_new(prompt, log_name, *extra)
-        +agent_with_retry_session_resume(prompt, log_name, sid, *extra)
-        +agent_with_retry_session_fork(prompt, log_name, sid, *extra)
+        +agent_with_retry_session_new(prompt, log_name, *extra, working_directory=None)
+        +agent_with_retry_session_resume(prompt, log_name, sid, *extra, working_directory=None)
+        +agent_with_retry_session_fork(prompt, log_name, sid, *extra, working_directory=None)
         +agent_once_session_resume(prompt, log_name, sid, *extra)
         +agent_with_retry(prompt, log_name, *extra)
         -_agent_once_with_check(prompt, log_name, extra, key_ctx)
@@ -71,7 +71,7 @@ classDiagram
     class Backend {
         <<interface>>
         // process(2)
-        +invoke(prompt, prefix, argv, key_ctx)*
+        +invoke(prompt, prefix, argv, key_ctx, working_directory=None)*
         +stream(proc, prefix)*
         // result inspection (5)
         +is_complete(prefix)*
@@ -164,7 +164,9 @@ For each invocation the engine: (1) selects a key + provider config from the poo
 The contract (`backends/__init__.py:Backend`):
 
 ```
-invoke(prompt, prefix, argv, key_ctx=None)  ── start agent subprocess; env (extra env vars) from key_ctx
+invoke(prompt, prefix, argv, key_ctx=None, *, working_directory=None)
+                                               ── start agent subprocess; env from key_ctx,
+                                                  cwd from this invocation only
 stream(proc, prefix)                          ── stdout → <prefix>.jsonl (reader thread)
 is_complete(prefix)                            ── watchdog early-exit predicate
 result_ok / result_text / result_body / session_id  ── read <prefix>.jsonl
@@ -233,10 +235,18 @@ The resolved model flows directly (no env round-trip):
 keypool._resolve_entry(entry) → KeyContext{ key, base_url, primary_model, downgrade_model }
    └ engine threads it to:
       backend.model_args(tier, resolved_model=key_ctx.<tier>_model)   # direct, no env
-      backend.invoke(prompt, prefix, argv, key_ctx=key_ctx)    # → Popen env for the agent subprocess
+      backend.invoke(
+          prompt, prefix, argv, key_ctx=key_ctx, working_directory=working_directory
+      )  # → Popen env + cwd for this agent subprocess only
 ```
 
 `key_ctx=None` (no key pool) → `Popen` inherits `os.environ` as-is; `model_args` resolved_model empty → falls back to the startup-time `AR_*` env (set once, read-only, no per-call race).
+
+`working_directory` is keyword-only on the explicit `Runner` new/resume/fork
+entries and is passed unchanged to every attempt, including internal retries.
+Backends map it only to `Popen(cwd=...)`; `None` preserves the legacy caller
+working directory. The engine never calls `os.chdir()`, so concurrent
+invocations cannot change the host process directory.
 
 ### thread-safe ⟹ process-safe
 

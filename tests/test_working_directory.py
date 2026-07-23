@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import agent_runner.engine as engine
 from agent_runner.backends import claude_code, opencode
 from agent_runner.backends.claude_code import ClaudeCodeBackend
@@ -95,11 +97,9 @@ class _RetryBackend(_SuccessfulBackend):
         return _ExitedProcess()
 
 
-def test_session_new_uses_requested_working_directory(tmp_path, monkeypatch):
+def _runner_with_backend(tmp_path, monkeypatch, backend_type, key_pool):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    working_directory = tmp_path / "workspace"
-    working_directory.mkdir()
     runner = engine.Runner(
         config_overrides={
             "run_dir": str(run_dir),
@@ -108,13 +108,44 @@ def test_session_new_uses_requested_working_directory(tmp_path, monkeypatch):
         },
         discover_config_files=False,
     )
-    backend = _SuccessfulBackend(runner._config)
+    backend = backend_type(runner._config)
     monkeypatch.setattr(runner, "_get_backend", lambda: backend)
-    monkeypatch.setattr(runner, "_ensure_keypool", lambda: _KeyPool())
+    monkeypatch.setattr(runner, "_ensure_keypool", lambda: key_pool)
+    return runner, backend
 
-    result = runner.agent_with_retry_session_new(
-        "prompt",
-        "new",
+
+@pytest.mark.parametrize(
+    ("method_name", "arguments"),
+    [
+        ("agent_with_retry_session_new", ("prompt", "new")),
+        (
+            "agent_with_retry_session_resume",
+            ("prompt", "resume", "source-session"),
+        ),
+        (
+            "agent_with_retry_session_fork",
+            ("prompt", "fork", "source-session"),
+        ),
+    ],
+    ids=("new", "resume", "fork"),
+)
+def test_session_entry_uses_requested_working_directory(
+    tmp_path,
+    monkeypatch,
+    method_name,
+    arguments,
+):
+    working_directory = tmp_path / "workspace"
+    working_directory.mkdir()
+    runner, backend = _runner_with_backend(
+        tmp_path,
+        monkeypatch,
+        _SuccessfulBackend,
+        _KeyPool(),
+    )
+
+    result = getattr(runner, method_name)(
+        *arguments,
         working_directory=working_directory,
     )
 
@@ -122,9 +153,19 @@ def test_session_new_uses_requested_working_directory(tmp_path, monkeypatch):
     assert backend.working_directories == [working_directory]
 
 
-def test_claude_process_starts_in_requested_working_directory(
+@pytest.mark.parametrize(
+    ("backend_module", "backend_type"),
+    [
+        (claude_code, ClaudeCodeBackend),
+        (opencode, OpencodeBackend),
+    ],
+    ids=("claude-code", "opencode"),
+)
+def test_backend_process_starts_in_requested_working_directory(
     tmp_path,
     monkeypatch,
+    backend_module,
+    backend_type,
 ):
     working_directory = tmp_path / "workspace"
     working_directory.mkdir()
@@ -137,121 +178,29 @@ def test_claude_process_starts_in_requested_working_directory(
         popen_calls.append((command, kwargs))
         return _Process()
 
-    monkeypatch.setattr(claude_code.subprocess, "Popen", record_popen)
-    backend = ClaudeCodeBackend()
+    monkeypatch.setattr(backend_module.subprocess, "Popen", record_popen)
+    backend = backend_type()
 
     process = backend.invoke(
         "prompt",
-        str(tmp_path / "logs" / "claude"),
+        str(tmp_path / "logs" / backend_type.agent_id),
         [],
         working_directory=working_directory,
     )
     process._ar_err.close()
 
     assert popen_calls[0][1]["cwd"] == working_directory
-
-
-def test_opencode_process_starts_in_requested_working_directory(
-    tmp_path,
-    monkeypatch,
-):
-    working_directory = tmp_path / "workspace"
-    working_directory.mkdir()
-    popen_calls = []
-
-    class _Process:
-        pass
-
-    def record_popen(command, **kwargs):
-        popen_calls.append((command, kwargs))
-        return _Process()
-
-    monkeypatch.setattr(opencode.subprocess, "Popen", record_popen)
-    backend = OpencodeBackend()
-
-    process = backend.invoke(
-        "prompt",
-        str(tmp_path / "logs" / "opencode"),
-        [],
-        working_directory=working_directory,
-    )
-    process._ar_err.close()
-
-    assert popen_calls[0][1]["cwd"] == working_directory
-
-
-def test_session_resume_uses_requested_working_directory(tmp_path, monkeypatch):
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    working_directory = tmp_path / "workspace"
-    working_directory.mkdir()
-    runner = engine.Runner(
-        config_overrides={
-            "run_dir": str(run_dir),
-            "stall_timeout": 5,
-            "total_timeout": 0,
-        },
-        discover_config_files=False,
-    )
-    backend = _SuccessfulBackend(runner._config)
-    monkeypatch.setattr(runner, "_get_backend", lambda: backend)
-    monkeypatch.setattr(runner, "_ensure_keypool", lambda: _KeyPool())
-
-    result = runner.agent_with_retry_session_resume(
-        "prompt",
-        "resume",
-        "source-session",
-        working_directory=working_directory,
-    )
-
-    assert result.rc == 0
-    assert backend.working_directories == [working_directory]
-
-
-def test_session_fork_uses_requested_working_directory(tmp_path, monkeypatch):
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    working_directory = tmp_path / "workspace"
-    working_directory.mkdir()
-    runner = engine.Runner(
-        config_overrides={
-            "run_dir": str(run_dir),
-            "stall_timeout": 5,
-            "total_timeout": 0,
-        },
-        discover_config_files=False,
-    )
-    backend = _SuccessfulBackend(runner._config)
-    monkeypatch.setattr(runner, "_get_backend", lambda: backend)
-    monkeypatch.setattr(runner, "_ensure_keypool", lambda: _KeyPool())
-
-    result = runner.agent_with_retry_session_fork(
-        "prompt",
-        "fork",
-        "source-session",
-        working_directory=working_directory,
-    )
-
-    assert result.rc == 0
-    assert backend.working_directories == [working_directory]
 
 
 def test_internal_retry_keeps_requested_working_directory(tmp_path, monkeypatch):
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
     working_directory = tmp_path / "workspace"
     working_directory.mkdir()
-    runner = engine.Runner(
-        config_overrides={
-            "run_dir": str(run_dir),
-            "stall_timeout": 5,
-            "total_timeout": 0,
-        },
-        discover_config_files=False,
+    runner, backend = _runner_with_backend(
+        tmp_path,
+        monkeypatch,
+        _RetryBackend,
+        _RetryKeyPool(),
     )
-    backend = _RetryBackend(runner._config)
-    monkeypatch.setattr(runner, "_get_backend", lambda: backend)
-    monkeypatch.setattr(runner, "_ensure_keypool", lambda: _RetryKeyPool())
 
     result = runner.agent_with_retry_session_new(
         "prompt",

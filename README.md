@@ -28,6 +28,7 @@ if res:
 
 ```python
 from agent_runner import Runner
+from pathlib import Path
 
 # 不同线程跑不同 backend / 模型 / 超时,互不干扰
 r_claude = Runner(config_overrides={"backend": "claude-code", "primary_model": "glm-5.1"})
@@ -38,7 +39,19 @@ r_oc = Runner(config_overrides={
 })
 # 各自在自己的线程里调用:
 res = r_claude.agent_with_retry("总结这份文档", "summary")
+
+# 显式 Runner 的 new/resume/fork 可为单次调用指定 Agent 子进程工作目录:
+res = r_claude.agent_with_retry_session_new(
+    "检查这个工作区",
+    "workspace-check",
+    working_directory=Path("/srv/workspaces/task-1"),
+)
 ```
+
+`working_directory`是 explicit `Runner` 的 new/resume/fork 入口上的
+keyword-only 参数，并逐次透传到所有内部重试的`Popen(cwd=...)`。默认`None`
+保持既有调用行为；Runner 不调用进程级`os.chdir()`，因此不同线程可以安全使用
+不同工作目录。目录存在性和授权范围仍由嵌入方负责。
 
 隔离的实现机制(`KeyContext` 纯值透传、`Popen(env=...)` 隔离快照、per-call err 句柄脱单例、线程安全 ⟹ 进程安全的推理)见 [ARCHITECTURE.md § Concurrency model](ARCHITECTURE.md#concurrency-model-multi-threaded)。`tests/test_threading.py` 端到端验证了这些保证。
 
