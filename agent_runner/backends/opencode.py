@@ -18,7 +18,6 @@ pool's per-provider base_url is unused for opencode).
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -57,7 +56,8 @@ class OpencodeBackend:
         ``Popen`` so the agent subprocess gets its own key snapshot. Returns the
         ``Popen`` without waiting. The err handle is attached to the proc
         (``proc._ar_err``), not the instance — concurrent invocations never
-        clobber each other. ``key_ctx=None`` → inherits ``os.environ`` as-is."""
+        clobber each other. Without private config or ``key_ctx``, the child
+        inherits ``os.environ`` as-is."""
         err_path = f"{prefix}.err"
         _ensure_parent(err_path)  # defensive: callers normally create AR_RUN_DIR
         err = open(err_path, "w")  # attached to proc; stream closes it
@@ -76,11 +76,20 @@ class OpencodeBackend:
         """Build the per-process OpenCode environment without global mutation."""
         extra_env = {}
         config_path = self._config.get("opencode_config", "")
+        base_env = os.environ
         if config_path:
+            base_env = {
+                name: value
+                for name, value in os.environ.items()
+                if not name.startswith("OPENCODE_")
+            }
             extra_env["OPENCODE_CONFIG"] = config_path
-            config_directory = str(Path(config_path).parent)
+            config_path_object = Path(config_path)
+            config_directory = str(config_path_object.parent)
+            private_root = str(config_path_object.parent.parent)
             extra_env["OPENCODE_CONFIG_DIR"] = config_directory
-            extra_env["XDG_CONFIG_HOME"] = config_directory
+            extra_env["HOME"] = private_root
+            extra_env["XDG_CONFIG_HOME"] = private_root
             extra_env.update(
                 {
                     "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
@@ -100,7 +109,7 @@ class OpencodeBackend:
                 extra_env[url_var] = key_ctx.base_url
         if not extra_env:
             return None
-        return {**os.environ, **extra_env}
+        return {**base_env, **extra_env}
 
     # ── stdout 流式写入 jsonl ─────────────────────────────────────────────
     def stream(self, proc, prefix: str) -> None:
@@ -231,6 +240,9 @@ class OpencodeBackend:
 
 
 # ── module-local helpers ───────────────────────────────────────────────────
+import json
+
+
 def _reason(obj: dict) -> Any:
     """``.part.reason`` (may be absent → None, matching jq's null)."""
     part = obj.get("part")

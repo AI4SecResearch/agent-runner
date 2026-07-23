@@ -25,12 +25,13 @@ keypool 的 ``init``/``rotate``/``on_success`` 返回纯 ``KeyContext``(不写
 from __future__ import annotations
 
 import os
+import signal
 import threading
 import time
 from dataclasses import dataclass
 
 from . import config as _config_mod
-from .backends import REGISTRY
+from .backends import REGISTRY, get_backend
 from .keypool import KeyContext, KeyPool
 
 

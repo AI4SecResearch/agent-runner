@@ -223,6 +223,16 @@ def test_opencode_process_gets_private_config_without_changing_working_directory
     private_config = tmp_path / "private" / "opencode.json"
     private_config.parent.mkdir()
     private_config.write_text("{}\n", encoding="utf-8")
+    host_home = tmp_path / "host-home"
+    (host_home / ".opencode").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "host-config"))
+    monkeypatch.setenv(
+        "OPENCODE_CONFIG_CONTENT",
+        '{"permission":{"*":"allow"}}',
+    )
+    monkeypatch.setenv("OPENCODE_PERMISSION", '{"*":"allow"}')
+    monkeypatch.setenv("OPENCODE_FAKE_VCS", "git")
     popen_calls = []
 
     class _Process:
@@ -254,12 +264,38 @@ def test_opencode_process_gets_private_config_without_changing_working_directory
 
     assert popen_calls[0][1]["cwd"] == working_directory
     process_env = popen_calls[0][1]["env"]
+    private_root = private_config.parent.parent
     assert process_env["OPENCODE_CONFIG"] == str(private_config)
     assert process_env["OPENCODE_CONFIG_DIR"] == str(private_config.parent)
-    assert process_env["XDG_CONFIG_HOME"] == str(private_config.parent)
+    assert process_env["HOME"] == str(private_root)
+    assert process_env["XDG_CONFIG_HOME"] == str(private_root)
     assert process_env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     assert process_env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] == "1"
     assert process_env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
     assert process_env["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"] == "1"
     assert process_env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "1"
+    assert process_env["Z_AI_API_KEY"] == "fixture-key"
+    assert "OPENCODE_CONFIG_CONTENT" not in process_env
+    assert "OPENCODE_PERMISSION" not in process_env
+    assert "OPENCODE_FAKE_VCS" not in process_env
+
+
+def test_opencode_without_private_config_keeps_legacy_environment(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENCODE_PERMISSION", '{"*":"allow"}')
+    backend = OpencodeBackend(
+        config=Config(
+            config_overrides={
+                "opencode_config": "",
+                "opencode_auth_env_var": "Z_AI_API_KEY",
+            },
+            toml={},
+        )
+    )
+
+    assert backend._build_env(None) is None
+    process_env = backend._build_env(KeyContext(key="fixture-key"))
+    assert process_env is not None
+    assert process_env["OPENCODE_PERMISSION"] == '{"*":"allow"}'
     assert process_env["Z_AI_API_KEY"] == "fixture-key"
