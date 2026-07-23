@@ -103,6 +103,12 @@ class KeyContext:
     key_id: str = ""
 
 
+@dataclass(frozen=True)
+class _VerifiedProviderSnapshot:
+    file_descriptor: int
+    sha256: str
+
+
 class KeyPool:
     """Thin wrapper over lpm's ``KeyPool`` resolving entries to ``KeyContext``.
 
@@ -119,12 +125,17 @@ class KeyPool:
         agent_id: str,
         config,
         *,
-        provider_config_fd: int | None = None,
-        provider_config_sha256: str | None = None,
+        provider_snapshot: _VerifiedProviderSnapshot | None = None,
     ):
         _ensure_lpm(config)
-        self._config_fd = provider_config_fd
-        self._config_sha256 = provider_config_sha256
+        self._config_fd = (
+            None
+            if provider_snapshot is None
+            else provider_snapshot.file_descriptor
+        )
+        self._config_sha256 = (
+            None if provider_snapshot is None else provider_snapshot.sha256
+        )
         self._kp = _LpmKeyPool(
             config_path,
             state_path,

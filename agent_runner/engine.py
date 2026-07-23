@@ -38,7 +38,7 @@ from .hooks import (
     LifecycleEventType,
     LifecycleSink,
 )
-from .keypool import KeyContext, KeyPool
+from .keypool import KeyContext, KeyPool, _VerifiedProviderSnapshot
 
 _WATCHDOG_POLL_SECONDS = 10
 
@@ -117,8 +117,6 @@ class Runner:
         config_overrides: dict | None = None,
         *,
         discover_config_files: bool = True,
-        provider_config_fd: int | None = None,
-        provider_config_sha256: str | None = None,
     ):
         if type(discover_config_files) is not bool:
             raise TypeError("discover_config_files 必须是 bool")
@@ -126,22 +124,29 @@ class Runner:
             self._config = _config_mod.Config(config_overrides)
         else:
             self._config = _config_mod.Config(config_overrides, toml={})
-        if provider_config_fd is not None and (
-            type(provider_config_fd) is not int or provider_config_fd < 0
-        ):
-            raise TypeError("provider_config_fd 必须是非负 int 或 None")
-        if provider_config_sha256 is not None and (
-            type(provider_config_sha256) is not str
-            or len(provider_config_sha256) != 64
-        ):
-            raise TypeError(
-                "provider_config_sha256 必须是 64 字符 str 或 None"
-            )
-        self._provider_config_fd = provider_config_fd
-        self._provider_config_sha256 = provider_config_sha256
+        self._provider_snapshot: _VerifiedProviderSnapshot | None = None
         self._backend = None
         self._backend_name: str | None = None
         self._kp: KeyPool | None = None
+
+    @classmethod
+    def _with_provider_snapshot(
+        cls,
+        config_overrides: dict | None,
+        *,
+        discover_config_files: bool,
+        provider_snapshot: _VerifiedProviderSnapshot,
+    ):
+        if type(provider_snapshot) is not _VerifiedProviderSnapshot:
+            raise TypeError(
+                "provider_snapshot 必须是 _VerifiedProviderSnapshot"
+            )
+        runner = cls(
+            config_overrides,
+            discover_config_files=discover_config_files,
+        )
+        runner._provider_snapshot = provider_snapshot
+        return runner
 
     # ── lazy resolution (config is fixed at construction; backend/kp on first use) ─
     def _get_backend(self):
@@ -175,8 +180,7 @@ class Runner:
                 self._kp_config(), self._kp_state(),
                 agent_id=backend.agent_id,
                 config=self._config,
-                provider_config_fd=self._provider_config_fd,
-                provider_config_sha256=self._provider_config_sha256,
+                provider_snapshot=self._provider_snapshot,
             )
         return self._kp
 

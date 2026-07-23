@@ -13,6 +13,7 @@ import json
 import os
 import re
 import stat
+import threading
 from pathlib import Path
 
 from .schema import Config
@@ -20,6 +21,7 @@ from .schema import Config
 # Permit reading group/other-readable configs but warn loudly: the file
 # contains real API keys.
 INSECURE_PERM_WARN = 0o077  # any group/other read/write/exec bits
+_HELD_DESCRIPTOR_READ_LOCK = threading.Lock()
 
 
 def _strip_jsonc_comments(text: str) -> str:
@@ -97,13 +99,33 @@ def load(
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise OSError(f"{p}: provider config is not a regular file")
-        if file_descriptor is not None and hasattr(os, "pread"):
+        pread = getattr(os, "pread", None)
+        if file_descriptor is not None and callable(pread):
             offset = 0
             content = bytearray()
-            while chunk := os.pread(descriptor, 64 * 1024, offset):
+            while chunk := pread(descriptor, 64 * 1024, offset):
                 content.extend(chunk)
                 offset += len(chunk)
             text = bytes(content).decode("utf-8")
+        elif file_descriptor is not None:
+            with _HELD_DESCRIPTOR_READ_LOCK:
+                original_offset = os.lseek(
+                    descriptor,
+                    0,
+                    os.SEEK_CUR,
+                )
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    content = bytearray()
+                    while chunk := os.read(descriptor, 64 * 1024):
+                        content.extend(chunk)
+                    text = bytes(content).decode("utf-8")
+                finally:
+                    os.lseek(
+                        descriptor,
+                        original_offset,
+                        os.SEEK_SET,
+                    )
         else:
             with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
                 descriptor = -1

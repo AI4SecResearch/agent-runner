@@ -61,19 +61,46 @@ try:
 except ImportError:  # Windows: fcntl unavailable → msvcrt byte-range lock
     import msvcrt
 
+    def _with_lock_at_start(f, action):
+        original_position = f.tell()
+        f.seek(0)
+        try:
+            return action()
+        finally:
+            f.seek(original_position)
+
     def _flock_sh(f) -> None:
         # No shared/exclusive distinction on Windows — exclusive everywhere.
         # Lock the first byte (state files always start with '{', so byte 0
         # exists); locking a region past EOF is permitted by msvcrt too.
-        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        _with_lock_at_start(
+            f,
+            lambda: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1),
+        )
 
     def _flock_ex(f) -> None:
-        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        _with_lock_at_start(
+            f,
+            lambda: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1),
+        )
 
     def _flock_un(f) -> None:
-        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        _with_lock_at_start(
+            f,
+            lambda: msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1),
+        )
 
     _PLATFORM_LOCK = "msvcrt"
+
+
+if "_with_lock_at_start" not in globals():
+    def _with_lock_at_start(f, action):
+        original_position = f.tell()
+        f.seek(0)
+        try:
+            return action()
+        finally:
+            f.seek(original_position)
 
 from . import agents as agents_mod
 from . import config as config_mod

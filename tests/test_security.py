@@ -5,15 +5,18 @@ import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+import inspect
 from pathlib import Path
 
 import pytest
 from llm_provider_manager import config as lpm_config
+import llm_provider_manager.keypool as lpm_keypool
 
 from agent_runner.backends.claude_code import ClaudeCodeBackend
 from agent_runner.config import Config
 from agent_runner.engine import Runner
 from agent_runner.keypool import KeyContext, KeyPool as RunnerKeyPool
+from agent_runner.keypool import _VerifiedProviderSnapshot
 
 
 class _ExitedProcess:
@@ -257,18 +260,20 @@ def test_runner_uses_held_provider_descriptor_for_real_child_spawn(
     )
     monkeypatch.setenv("HOST_CAPTURE_PATH", str(capture_path))
     try:
-        runner = Runner(
-            discover_config_files=False,
-            provider_config_fd=provider_fd,
-            provider_config_sha256=hashlib.sha256(
-                original_text.encode("utf-8")
-            ).hexdigest(),
-            config_overrides={
+        runner = Runner._with_provider_snapshot(
+            {
                 "backend": "claude-code",
                 "key_pool_config": str(provider_path),
                 "keypool_state": str(tmp_path / "state.json"),
                 "run_dir": str(tmp_path / "diagnostics"),
             },
+            discover_config_files=False,
+            provider_snapshot=_VerifiedProviderSnapshot(
+                file_descriptor=provider_fd,
+                sha256=hashlib.sha256(
+                    original_text.encode("utf-8")
+                ).hexdigest(),
+            ),
         )
 
         result = runner.agent_with_retry_session_new("safe prompt", "run")
@@ -326,3 +331,76 @@ def test_held_provider_descriptor_can_be_loaded_concurrently_without_offset_race
         catalog.providers[0].keys[0].key
         for catalog in catalogs
     } == {"selected-key"}
+
+
+def test_held_provider_fallback_serializes_seek_read_and_restores_offset(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    provider_path = tmp_path / "providers.jsonc"
+    text = json.dumps(
+        {
+            "providers": [
+                {
+                    "id": "provider-a",
+                    "type": "symmetric",
+                    "baseURLs": {
+                        "anthropic": "https://example.test/anthropic",
+                    },
+                    "keys": [{"id": "key-a", "key": "selected-key"}],
+                    "models": [
+                        {
+                            "id": "model-a",
+                            "context": 4096,
+                            "output": 1024,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    provider_path.write_text(text, encoding="utf-8")
+    descriptor = os.open(provider_path, os.O_RDONLY)
+    os.lseek(descriptor, 7, os.SEEK_SET)
+    monkeypatch.setattr(lpm_config.os, "pread", None)
+    expected_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    try:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            catalogs = list(
+                executor.map(
+                    lambda _: lpm_config.load(
+                        provider_path,
+                        file_descriptor=descriptor,
+                        expected_sha256=expected_sha256,
+                    ),
+                    range(8),
+                )
+            )
+        final_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+    finally:
+        os.close(descriptor)
+
+    assert len(catalogs) == 8
+    assert final_offset == 7
+
+
+def test_platform_lock_helper_locks_byte_zero_and_restores_position() -> None:
+    stream = io.StringIO("state")
+    stream.seek(3)
+    observed = []
+
+    lpm_keypool._with_lock_at_start(
+        stream,
+        lambda: observed.append(stream.tell()),
+    )
+
+    assert observed == [0]
+    assert stream.tell() == 3
+
+
+def test_public_runner_constructor_has_no_provider_descriptor_primitives(
+) -> None:
+    parameters = inspect.signature(Runner.__init__).parameters
+
+    assert "provider_config_fd" not in parameters
+    assert "provider_config_sha256" not in parameters
