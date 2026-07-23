@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -30,7 +31,9 @@ sys.path.insert(0, str(ROOT))
 
 import agent_runner.engine as eng  # noqa: E402
 from agent_runner.backends.claude_code import ClaudeCodeBackend  # noqa: E402
+from agent_runner.backends.opencode import OpencodeBackend  # noqa: E402
 from agent_runner.backends._jsonl import ensure_parent  # noqa: E402
+from agent_runner.config import Config  # noqa: E402
 from agent_runner.keypool import KeyContext  # noqa: E402
 
 
@@ -194,6 +197,137 @@ def test_concurrent_threads_isolated_keys_and_env(monkeypatch):
     errs = [err for (_n, _e, err, _p) in backend.records]
     assert len({id(e) for e in errs}) == N, "err handles must be distinct objects"
     assert len({id(p) for (_n, _e, _er, p) in backend.records}) == N, "procs distinct"
+
+
+def test_real_subprocesses_receive_only_their_selected_managed_credentials(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HOST_RUNTIME_SENTINEL", "preserved")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale-anthropic-token")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://stale.example")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "stale-model")
+    monkeypatch.setenv("Z_AI_API_KEY", "stale-opencode-key")
+    monkeypatch.setenv("LLM_KEY_STALE", "stale-lpm-key")
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "stale/default")
+    host_environment = dict(os.environ)
+    backend = ClaudeCodeBackend()
+    barrier = threading.Barrier(2)
+    records = {}
+    errors = []
+    child_code = (
+        "import json, os;"
+        "names=('HOST_RUNTIME_SENTINEL','ANTHROPIC_AUTH_TOKEN',"
+        "'ANTHROPIC_BASE_URL','ANTHROPIC_DEFAULT_OPUS_MODEL',"
+        "'Z_AI_API_KEY','LLM_KEY_STALE','LLM_DEFAULT_MODEL');"
+        "print(json.dumps({name: os.environ.get(name) for name in names}))"
+    )
+
+    def worker(index):
+        key_context = KeyContext(
+            key=f"selected-key-{index}",
+            base_url=f"https://selected-{index}.example",
+            primary_model=f"selected-model-{index}",
+        )
+        stderr_path = tmp_path / f"child-{index}.err"
+        try:
+            barrier.wait()
+            with stderr_path.open("w", encoding="utf-8") as stderr:
+                completed = subprocess.run(
+                    [sys.executable, "-c", child_code],
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    env=backend._build_env(key_context),
+                )
+            records[index] = (
+                json.loads(completed.stdout),
+                backend.model_args(
+                    "primary",
+                    resolved_model=key_context.primary_model,
+                ),
+                stderr_path,
+            )
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=worker, args=(index,))
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    for index in range(2):
+        child_environment, model_args, stderr_path = records[index]
+        assert child_environment == {
+            "HOST_RUNTIME_SENTINEL": "preserved",
+            "ANTHROPIC_AUTH_TOKEN": f"selected-key-{index}",
+            "ANTHROPIC_BASE_URL": f"https://selected-{index}.example",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": None,
+            "Z_AI_API_KEY": None,
+            "LLM_KEY_STALE": None,
+            "LLM_DEFAULT_MODEL": None,
+        }
+        assert model_args == ["--model", f"selected-model-{index}"]
+        assert stderr_path.read_text(encoding="utf-8") == ""
+    assert os.environ == host_environment
+
+
+def test_opencode_real_subprocess_receives_private_config_and_current_key_only(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HOST_RUNTIME_SENTINEL", "preserved")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale-anthropic-token")
+    monkeypatch.setenv("Z_AI_API_KEY", "stale-opencode-key")
+    monkeypatch.setenv("LLM_KEY_STALE", "stale-lpm-key")
+    host_environment = dict(os.environ)
+    private_config = (
+        tmp_path / "private" / ".opencode" / "opencode.json"
+    )
+    backend = OpencodeBackend(
+        config=Config(
+            config_overrides={
+                "opencode_config": str(private_config),
+                "opencode_auth_env_var": "Z_AI_API_KEY",
+            },
+            toml={},
+        )
+    )
+    child_environment = backend._build_env(
+        KeyContext(key="selected-opencode-key")
+    )
+    child_code = (
+        "import json, os;"
+        "names=('HOST_RUNTIME_SENTINEL','ANTHROPIC_AUTH_TOKEN',"
+        "'Z_AI_API_KEY','LLM_KEY_STALE','OPENCODE_CONFIG',"
+        "'OPENCODE_CONFIG_DIR','OPENCODE_DISABLE_PROJECT_CONFIG');"
+        "print(json.dumps({name: os.environ.get(name) for name in names}))"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child_code],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        env=child_environment,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "HOST_RUNTIME_SENTINEL": "preserved",
+        "ANTHROPIC_AUTH_TOKEN": None,
+        "Z_AI_API_KEY": "selected-opencode-key",
+        "LLM_KEY_STALE": None,
+        "OPENCODE_CONFIG": str(private_config),
+        "OPENCODE_CONFIG_DIR": str(private_config.parent),
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+    }
+    assert os.environ == host_environment
 
 
 def test_concurrent_invocations_keep_distinct_working_directories(

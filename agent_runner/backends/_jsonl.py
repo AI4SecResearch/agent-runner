@@ -21,6 +21,26 @@ def ensure_parent(path: str | os.PathLike) -> None:
     parent.mkdir(parents=True, exist_ok=True)
 
 
+def open_private_text(path: str):
+    """Open a backend diagnostic for truncating writes with POSIX mode 0600."""
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_TRUNC
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "w", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def read_jsonl(path: str) -> list[dict]:
     """Read a jsonl file into a list of parsed objects.
 

@@ -25,6 +25,8 @@ from typing import Any
 
 from ._jsonl import ensure_parent as _ensure_parent
 from ._jsonl import first_matching, iter_lines, read_jsonl
+from ._jsonl import open_private_text as _open_private_text
+from ._environment import subprocess_base_environment
 
 
 # 模型名不在此写死——经 config 层取(AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL)。
@@ -53,14 +55,16 @@ class OpencodeBackend:
         """Start ``opencode run <prompt> --format json``; open <prefix>.err for
         stderr; build an isolated subprocess env (extra env vars from
         ``key_ctx``: key → the opencode-auth env var) and pass ``env=`` to
-        ``Popen`` so the agent subprocess gets its own key snapshot. Returns the
+        ``Popen`` so the agent subprocess gets its own key snapshot. Stale
+        Runner/LPM-managed auth variables are removed when a key context is
+        present. Returns the
         ``Popen`` without waiting. The err handle is attached to the proc
         (``proc._ar_err``), not the instance — concurrent invocations never
         clobber each other. Without private config or ``key_ctx``, the child
         inherits ``os.environ`` as-is."""
         err_path = f"{prefix}.err"
         _ensure_parent(err_path)  # defensive: callers normally create AR_RUN_DIR
-        err = open(err_path, "w")  # attached to proc; stream closes it
+        err = _open_private_text(err_path)  # attached to proc; stream closes it
         from ..platform import PLATFORM
         cmd = ["opencode", "run", prompt, "--format", "json", *argv]
         proc = subprocess.Popen(
@@ -76,11 +80,17 @@ class OpencodeBackend:
         """Build the per-process OpenCode environment without global mutation."""
         extra_env = {}
         config_path = self._config.get("opencode_config", "")
-        base_env = os.environ
+        base_env = (
+            subprocess_base_environment(
+                additional_managed_names=(self.api_key_env_var(),),
+            )
+            if key_ctx is not None
+            else os.environ
+        )
         if config_path:
             base_env = {
                 name: value
-                for name, value in os.environ.items()
+                for name, value in base_env.items()
                 if not name.startswith("OPENCODE_")
             }
             extra_env["OPENCODE_CONFIG"] = config_path
@@ -130,7 +140,7 @@ class OpencodeBackend:
     def stream(self, proc, prefix: str) -> None:
         jsonl_path = f"{prefix}.jsonl"
         try:
-            with open(jsonl_path, "w") as jl:
+            with _open_private_text(jsonl_path) as jl:
                 assert proc.stdout is not None
                 for line in proc.stdout:
                     jl.write(line)

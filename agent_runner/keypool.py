@@ -13,7 +13,7 @@ Instead, ``init``/``rotate``/``on_success`` resolve the active pool entry to a
 pure ``KeyContext`` struct (key + base_url + provider-constrained models) and
 return it. The engine threads that ``KeyContext`` to the backend, whose
 ``invoke`` maps ``key``/``base_url`` to its own env-var names and builds an
-isolated ``Popen(env={**os.environ, **extra_env})`` snapshot — so each agent
+isolated controlled ``Popen(env=...)`` snapshot — so each agent
 subprocess gets its own key, with zero cross-thread env races. The wrapper
 tracks ``self._current_key_ctx`` (instance-level) so ``disable`` can find the
 active key value without reading the process environment.

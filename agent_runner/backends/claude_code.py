@@ -20,6 +20,8 @@ import subprocess
 
 from ._jsonl import ensure_parent as _ensure_parent
 from ._jsonl import first_matching, iter_lines, read_jsonl
+from ._jsonl import open_private_text as _open_private_text
+from ._environment import subprocess_base_environment
 
 # ── env vars Claude Code reads natively (reuse lpm's constants when lpm is
 #    importable; fall back to literals so the backend works even if lpm isn't
@@ -67,7 +69,9 @@ class ClaudeCodeBackend:
         vars from ``key_ctx``: key → ANTHROPIC_AUTH_TOKEN, base_url →
         ANTHROPIC_BASE_URL) and pass ``env=`` to ``Popen`` so the agent subprocess
         gets its own key snapshot with zero cross-thread env races. Returns the
-        ``Popen`` without waiting. The err handle is attached to the proc
+        ``Popen`` without waiting. Stale Runner/LPM-managed auth variables are
+        removed from the copied host environment before this call's values are
+        added. The err handle is attached to the proc
         (``proc._ar_err``), not stored on the instance — so concurrent invocations
         never clobber each other's err handle. ``key_ctx=None`` → inherits
         ``os.environ`` as-is.
@@ -76,7 +80,7 @@ class ClaudeCodeBackend:
         # Ensure the output directory exists (defensive — callers normally
         # create AR_RUN_DIR, but a missing parent shouldn't crash the run).
         _ensure_parent(err_path)
-        err = open(err_path, "w")  # attached to proc; stream closes it
+        err = _open_private_text(err_path)  # attached to proc; stream closes it
         from ..platform import PLATFORM
         cmd = [
             "claude", "-p", prompt,
@@ -93,7 +97,7 @@ class ClaudeCodeBackend:
         return proc
 
     def _build_env(self, key_ctx):
-        """``{**os.environ, **extra_env}`` from key_ctx, or None (inherit env)."""
+        """Controlled host snapshot plus key_ctx, or None to inherit directly."""
         if key_ctx is None:
             return None
         extra_env = {}
@@ -105,13 +109,13 @@ class ClaudeCodeBackend:
             extra_env[url_var] = key_ctx.base_url
         if not extra_env:
             return None
-        return {**os.environ, **extra_env}
+        return {**subprocess_base_environment(), **extra_env}
 
     # ── stdout 流式写入 jsonl ─────────────────────────────────────────────
     def stream(self, proc, prefix: str) -> None:
         jsonl_path = f"{prefix}.jsonl"
         try:
-            with open(jsonl_path, "w") as jl:
+            with _open_private_text(jsonl_path) as jl:
                 assert proc.stdout is not None
                 for line in proc.stdout:
                     jl.write(line)

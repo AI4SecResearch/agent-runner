@@ -253,7 +253,12 @@ keypool._resolve_entry(entry) → KeyContext{ key, base_url, primary_model, down
       )  # → Popen env + cwd for this agent subprocess only
 ```
 
-`key_ctx=None` (no key pool) → `Popen` inherits `os.environ` as-is; `model_args` resolved_model empty → falls back to the startup-time `AR_*` env (set once, read-only, no per-call race).
+`key_ctx=None` (no key pool) → `Popen` inherits `os.environ` as-is. With a
+managed key, the backend copies the host environment, removes only stale
+Runner/LPM-owned authentication variables, then adds the current
+`KeyContext`; it never mutates `os.environ`. `model_args` with an empty
+`resolved_model` falls back to the startup-time `AR_*` env (set once,
+read-only, no per-call race).
 
 `working_directory` is keyword-only on the explicit `Runner` new/resume/fork
 entries and is passed unchanged to every attempt, including internal retries.

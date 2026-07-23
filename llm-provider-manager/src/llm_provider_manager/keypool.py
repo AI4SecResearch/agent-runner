@@ -229,7 +229,7 @@ class KeyPool:
 
     def _init_state(self):
         """Ensure state file is initialized. LOCK_EX serializes concurrent inits."""
-        fd = os.open(self.state_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fd = os.open(self.state_path, os.O_CREAT | os.O_RDWR, 0o600)
         with os.fdopen(fd, "r+") as f:
             _flock_ex(f)
             try:
@@ -305,7 +305,7 @@ class KeyPool:
         self._init_state()
         idx = self._read_state().get("current_index", 0)
         entry = self._entry_at(idx)
-        _dbg(f"init: [{idx}] ({self._label(entry)}) key={(entry[0] if entry else '')[:8]}...")
+        _dbg(f"init: [{idx}] ({self._label(entry)})")
         return entry
 
     def rotate(self):
@@ -331,8 +331,10 @@ class KeyPool:
                 new_idx = (new_idx + 1) % len(keys)
             data["current_index"] = new_idx
             entry = self._entry_at(new_idx)
-            _dbg(f"rotate: {cur}→{new_idx} ({self._label(entry)}) "
-                 f"key={keys[new_idx][:8]}... disabled={disabled}")
+            _dbg(
+                f"rotate: {cur}→{new_idx} ({self._label(entry)}) "
+                f"disabled={disabled}"
+            )
             return entry
 
         return self._modify_state(_rotate)
@@ -347,7 +349,7 @@ class KeyPool:
         try:
             idx = keys.index(key_str)
         except ValueError:
-            _dbg(f"disable: key={key_str[:8]}... not found in pool")
+            _dbg("disable: key not found in pool")
             return ""
 
         ttl = self.config.settings.disable_ttl_hours * 3600
@@ -356,8 +358,10 @@ class KeyPool:
             self._purge_expired(data)
             expiry = time.time() + ttl
             data.setdefault("disabled", {})[str(idx)] = self._format_expiry(expiry)
-            _dbg(f"disable: [{idx}] ({self._label(self._entry_at(idx))}) "
-                 f"key={key_str[:8]}... until={self._format_expiry(expiry)}")
+            _dbg(
+                f"disable: [{idx}] ({self._label(self._entry_at(idx))}) "
+                f"until={self._format_expiry(expiry)}"
+            )
             return key_str
 
         return self._modify_state(_disable)
@@ -403,8 +407,10 @@ class KeyPool:
                 new_idx = (new_idx + 1) % len(keys)
             data["current_index"] = new_idx
             entry = self._entry_at(new_idx)
-            _dbg(f"on_success: count={count}/{rotate_every}, rotating {cur}→{new_idx} "
-                 f"({self._label(entry)}) key={keys[new_idx][:8]}...")
+            _dbg(
+                f"on_success: count={count}/{rotate_every}, rotating "
+                f"{cur}→{new_idx} ({self._label(entry)})"
+            )
             return entry
 
         return self._modify_state(_on_success)

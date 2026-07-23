@@ -16,7 +16,7 @@
 ``Runner`` 持自己的 ``Config``、backend、``KeyPool``,线程各持一个即天然隔离。
 keypool 的 ``init``/``rotate``/``on_success`` 返回纯 ``KeyContext``(不写
 ``os.environ``),由引擎透传给 ``backend.invoke(key_ctx=...)``,后者构造隔离的
-``Popen(env={**os.environ, **extra_env})``——agent 子进程各拿各的 key 快照,零
+``Popen(env=controlled_snapshot)``——agent 子进程各拿各的 key 快照,零
 跨线程 env 竞态。模块级公开函数(``agent_with_retry`` 等)委托一个 thread-local
 默认 ``Runner``,故老的单线程调用方零改动即可跨线程安全使用;需精细隔离的场景
 显式 ``Runner(config_overrides=...)``。
@@ -106,7 +106,7 @@ class Runner:
     持自己的 ``Config``(per-实例,支持 ``config_overrides`` 微调)、backend、``KeyPool``。
     所有编排状态在实例上,无模块级共享可变状态。keypool 返回纯 ``KeyContext``,
     经 ``_agent_once`` 透传给 ``backend.invoke(key_ctx=...)``——agent 子进程拿
-    隔离的 env 快照。构造廉价(lazy 解析 backend/keypool),可在每线程按需建。
+        隔离的受控 env 快照。构造廉价(lazy 解析 backend/keypool),可在每线程按需建。
     ``discover_config_files=False``只关闭候选 TOML 文件发现,不关闭 ``AR_``环境层;
     嵌入方必须提供完整安全 overrides。该 keyword-only 参数只接受 exact bool,
     默认 ``True``保持既有搜索行为。
