@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from ._jsonl import ensure_parent as _ensure_parent
@@ -76,6 +77,16 @@ class OpencodeBackend:
         config_path = self._config.get("opencode_config", "")
         if config_path:
             extra_env["OPENCODE_CONFIG"] = config_path
+            extra_env["XDG_CONFIG_HOME"] = str(Path(config_path).parent)
+            extra_env.update(
+                {
+                    "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+                    "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+                    "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+                    "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
+                    "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
+                }
+            )
         if key_ctx is not None:
             key_var = self.api_key_env_var()
             if key_var and key_ctx.key:
