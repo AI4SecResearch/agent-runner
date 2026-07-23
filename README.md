@@ -31,10 +31,11 @@ from agent_runner import Runner
 
 # 不同线程跑不同 backend / 模型 / 超时,互不干扰
 r_claude = Runner(config_overrides={"backend": "claude-code", "primary_model": "glm-5.1"})
-r_oc = Runner(
-    config_overrides={"backend": "opencode", "primary_model": "glm-4.7", "stall_timeout": 600},
-    discover_config_files=False,
-)
+r_oc = Runner(config_overrides={
+    "backend": "opencode",
+    "primary_model": "glm-4.7",
+    "stall_timeout": 600,
+})
 # 各自在自己的线程里调用:
 res = r_claude.agent_with_retry("总结这份文档", "summary")
 ```
