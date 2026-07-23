@@ -73,8 +73,18 @@ class Runner:
     隔离的 env 快照。构造廉价(lazy 解析 backend/keypool),可在每线程按需建。
     """
 
-    def __init__(self, config_overrides: dict | None = None):
-        self._config = _config_mod.Config(config_overrides)
+    def __init__(
+        self,
+        config_overrides: dict | None = None,
+        *,
+        discover_config_files: bool = True,
+    ):
+        if type(discover_config_files) is not bool:
+            raise TypeError("discover_config_files 必须是 bool")
+        if discover_config_files:
+            self._config = _config_mod.Config(config_overrides)
+        else:
+            self._config = _config_mod.Config(config_overrides, toml={})
         self._backend = None
         self._backend_name: str | None = None
         self._kp: KeyPool | None = None
