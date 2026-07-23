@@ -217,17 +217,41 @@ def test_internal_retry_routes_model_to_rotated_opencode_provider(
     result = runner.agent_with_retry_session_new(
         "prompt",
         "run",
+        "--agent",
+        "agent-runtime",
+        "--file",
+        "/scope/input.txt",
+        "--dir",
+        str(working_directory),
         working_directory=working_directory,
     )
 
     assert result.rc == 0
     assert backend.calls == [
         (
-            ["--model", "provider-a/model-a"],
+            [
+                "--model",
+                "provider-a/model-a",
+                "--agent",
+                "agent-runtime",
+                "--file",
+                "/scope/input.txt",
+                "--dir",
+                str(working_directory),
+            ],
             working_directory,
         ),
         (
-            ["--model", "provider-b/model-b"],
+            [
+                "--model",
+                "provider-b/model-b",
+                "--agent",
+                "agent-runtime",
+                "--file",
+                "/scope/input.txt",
+                "--dir",
+                str(working_directory),
+            ],
             working_directory,
         ),
     ]

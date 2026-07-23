@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from llm_provider_manager import agents as agents_mod
 from llm_provider_manager import config as config_mod
 from llm_provider_manager import use as use_mod
@@ -60,6 +62,76 @@ def test_opencode_render_bakes_providers_with_env_placeholders(sample_config_fil
     bailian_b = out["provider"]["bailian-account-b"]
     assert set(bailian_b["models"].keys()) == {"glm-4.6"}
     assert bailian_b["options"]["apiKey"] == "{env:LLM_KEY_BAILIAN_ACCOUNT_B}"
+
+
+def test_opencode_provider_entries_support_one_runtime_key_reference(
+    sample_config_file: Path,
+) -> None:
+    cfg = config_mod.load(sample_config_file)
+    agent = agents_mod.get_agent("opencode")
+
+    providers, skipped = agent.provider_entries_for(
+        cfg,
+        api_key_reference="{env:Z_AI_API_KEY}",
+    )
+
+    assert skipped == []
+    assert providers["zhipu"]["options"]["apiKey"] == "{env:Z_AI_API_KEY}"
+    assert (
+        providers["bailian-account-a"]["options"]["apiKey"]
+        == "{env:Z_AI_API_KEY}"
+    )
+    assert set(providers["zhipu"]["models"]) == {"glm-5.2", "glm-5-turbo"}
+    assert set(providers["bailian-account-a"]["models"]) == {"glm-5.2"}
+
+
+def test_opencode_provider_entries_reject_canonical_id_collision(
+    tmp_path: Path,
+) -> None:
+    sample = {
+        "providers": [
+            {
+                "id": "a-b",
+                "type": "symmetric",
+                "baseURLs": {"openai": "https://symmetric.test"},
+                "keys": [{"id": "key", "key": "secret"}],
+                "models": [
+                    {
+                        "id": "symmetric-model",
+                        "context": 1,
+                        "output": 1,
+                    }
+                ],
+            },
+            {
+                "id": "a",
+                "type": "asymmetric",
+                "baseURLs": {"openai": "https://asymmetric.test"},
+                "keys": [
+                    {
+                        "id": "b",
+                        "key": "secret",
+                        "models": [
+                            {
+                                "id": "asymmetric-model",
+                                "context": 1,
+                                "output": 1,
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+    }
+    sample_path = tmp_path / "providers.jsonc"
+    sample_path.write_text(json.dumps(sample), encoding="utf-8")
+    cfg = config_mod.load(sample_path)
+
+    with pytest.raises(ValueError, match="entry id collision"):
+        agents_mod.get_agent("opencode").provider_entries_for(
+            cfg,
+            api_key_reference="{env:Z_AI_API_KEY}",
+        )
 
 
 def test_opencode_render_default_model(sample_config_file: Path, tmp_path: Path):

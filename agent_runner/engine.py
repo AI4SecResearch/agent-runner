@@ -25,13 +25,12 @@ keypool 的 ``init``/``rotate``/``on_success`` 返回纯 ``KeyContext``(不写
 from __future__ import annotations
 
 import os
-import signal
 import threading
 import time
 from dataclasses import dataclass
 
 from . import config as _config_mod
-from .backends import REGISTRY, get_backend
+from .backends import REGISTRY
 from .keypool import KeyContext, KeyPool
 
 
@@ -383,6 +382,9 @@ class Runner:
             resolved_model = (key_ctx.downgrade_model if model == "downgrade"
                               else key_ctx.primary_model) if key_ctx else ""
             model_args = backend.model_args(model, resolved_model=resolved_model)
+            retry_extra = list(extra)
+            if "--model" not in retry_extra:
+                retry_extra = model_args + retry_extra
             sys_stderr_write(
                 f"          ⚠️ 重试 {attempt}/{max_attempts} ({model} / {step}): {base_log}\n"
             )
@@ -392,7 +394,7 @@ class Runner:
                 res = self._agent_once_with_check(
                     "继续",
                     name,
-                    cont_resume + model_args,
+                    cont_resume + retry_extra,
                     key_ctx=key_ctx,
                     working_directory=working_directory,
                 )
@@ -402,7 +404,7 @@ class Runner:
                 res = self._agent_once_with_check(
                     prompt,
                     name,
-                    list(session_args) + model_args,
+                    list(session_args) + retry_extra,
                     key_ctx=key_ctx,
                     working_directory=working_directory,
                 )

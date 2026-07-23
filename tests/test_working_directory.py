@@ -255,6 +255,7 @@ def test_opencode_process_gets_private_config_without_changing_working_directory
     assert popen_calls[0][1]["cwd"] == working_directory
     process_env = popen_calls[0][1]["env"]
     assert process_env["OPENCODE_CONFIG"] == str(private_config)
+    assert process_env["OPENCODE_CONFIG_DIR"] == str(private_config.parent)
     assert process_env["XDG_CONFIG_HOME"] == str(private_config.parent)
     assert process_env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     assert process_env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] == "1"

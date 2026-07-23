@@ -18,6 +18,7 @@ pool's per-provider base_url is unused for opencode).
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -77,7 +78,9 @@ class OpencodeBackend:
         config_path = self._config.get("opencode_config", "")
         if config_path:
             extra_env["OPENCODE_CONFIG"] = config_path
-            extra_env["XDG_CONFIG_HOME"] = str(Path(config_path).parent)
+            config_directory = str(Path(config_path).parent)
+            extra_env["OPENCODE_CONFIG_DIR"] = config_directory
+            extra_env["XDG_CONFIG_HOME"] = config_directory
             extra_env.update(
                 {
                     "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
@@ -228,9 +231,6 @@ class OpencodeBackend:
 
 
 # ── module-local helpers ───────────────────────────────────────────────────
-import json
-
-
 def _reason(obj: dict) -> Any:
     """``.part.reason`` (may be absent → None, matching jq's null)."""
     part = obj.get("part")

@@ -262,6 +262,65 @@ class OpencodeAgent:
             block["models"][m.id] = self._model_entry(m)
         return block
 
+    def provider_entries_for(
+        self,
+        config: "Config",
+        *,
+        selection: "UsePlan | None" = None,
+        api_key_reference: str | None = None,
+    ) -> tuple[dict[str, dict], list[str]]:
+        """Render canonical provider entries without writing a config file.
+
+        ``api_key_reference`` lets an embedding runtime bind every entry to
+        one child-process-only environment variable while reusing the same
+        provider/model renderer as the CLI. It is mutually exclusive with an
+        inline ``selection``, whose exports may contain real key values.
+        """
+        if selection is not None and api_key_reference is not None:
+            raise ValueError(
+                "selection and api_key_reference are mutually exclusive"
+            )
+
+        providers_out: dict[str, dict] = {}
+        skipped: list[str] = []
+
+        def add_entry(entry_id: str, block: dict) -> None:
+            if entry_id in providers_out:
+                raise ValueError(
+                    f"OpenCode provider entry id collision: {entry_id}"
+                )
+            providers_out[entry_id] = block
+
+        for prov in config.providers:
+            protocol = self._preferred_protocol(prov)
+            if protocol is None:
+                skipped.append(prov.id)
+                continue
+            if self._needs_per_key_entries(prov):
+                for k in prov.keys:
+                    var = key_var(prov.id, k.id)
+                    value = (
+                        api_key_reference
+                        if api_key_reference is not None
+                        else selection.exports.get(var) if selection else None
+                    )
+                    add_entry(
+                        opencode_entry_id(prov.id, k.id),
+                        self._key_block(prov, k, protocol, value),
+                    )
+            else:
+                var = key_var(prov.id)
+                value = (
+                    api_key_reference
+                    if api_key_reference is not None
+                    else selection.exports.get(var) if selection else None
+                )
+                add_entry(
+                    opencode_entry_id(prov.id),
+                    self._provider_block(prov, protocol, value),
+                )
+        return providers_out, skipped
+
     def render_config(
         self,
         config: "Config",
@@ -284,25 +343,10 @@ class OpencodeAgent:
         out = json.loads(json.dumps(DEFAULT_CONFIG_TEMPLATE))
         out.setdefault("$schema", "https://opencode.ai/config.json")
 
-        providers_out: dict[str, dict] = {}
-        skipped: list[str] = []
-        for prov in config.providers:
-            protocol = self._preferred_protocol(prov)
-            if protocol is None:
-                skipped.append(prov.id)
-                continue
-            if self._needs_per_key_entries(prov):
-                for k in prov.keys:
-                    var = key_var(prov.id, k.id)
-                    val = selection.exports.get(var) if selection else None
-                    providers_out[opencode_entry_id(prov.id, k.id)] = \
-                        self._key_block(prov, k, protocol, val)
-            else:
-                var = key_var(prov.id)
-                val = selection.exports.get(var) if selection else None
-                providers_out[opencode_entry_id(prov.id)] = \
-                    self._provider_block(prov, protocol, val)
-
+        providers_out, skipped = self.provider_entries_for(
+            config,
+            selection=selection,
+        )
         out["provider"] = providers_out
         if skipped:
             out["__skipped_providers__"] = skipped  # informational; stripped below
