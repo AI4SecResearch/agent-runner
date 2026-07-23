@@ -14,6 +14,7 @@ here + one ``REGISTRY`` entry; the engine never references a concrete agent.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import Protocol
 
 from .claude_code import ClaudeCodeBackend
@@ -50,6 +51,7 @@ class Backend(Protocol):
         key_ctx=None,
         *,
         working_directory: str | os.PathLike[str] | None = None,
+        command_wrapper: Callable[[list[str]], list[str]] | None = None,
     ):
         """Start one agent step. Opens <prefix>.err for the agent's stderr,
         builds an isolated subprocess env (extra env vars from ``key_ctx``:

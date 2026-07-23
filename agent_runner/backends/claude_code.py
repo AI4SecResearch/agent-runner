@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Callable
 
 from ._jsonl import ensure_parent as _ensure_parent
 from ._jsonl import first_matching, iter_lines, read_jsonl
@@ -63,6 +64,7 @@ class ClaudeCodeBackend:
         key_ctx=None,
         *,
         working_directory: str | os.PathLike[str] | None = None,
+        command_wrapper: Callable[[list[str]], list[str]] | None = None,
     ):
         """Start ``claude -p <prompt> --output-format stream-json --verbose``;
         open <prefix>.err for stderr; build an isolated subprocess env (extra env
@@ -87,6 +89,8 @@ class ClaudeCodeBackend:
             "--output-format", "stream-json", "--verbose",
             *argv,
         ]
+        if command_wrapper is not None:
+            cmd = command_wrapper(cmd)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err, text=True,
             env=self._build_env(key_ctx),

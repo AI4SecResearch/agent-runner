@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,7 @@ class OpencodeBackend:
         key_ctx=None,
         *,
         working_directory: str | os.PathLike[str] | None = None,
+        command_wrapper: Callable[[list[str]], list[str]] | None = None,
     ):
         """Start ``opencode run <prompt> --format json``; open <prefix>.err for
         stderr; build an isolated subprocess env (extra env vars from
@@ -67,6 +69,8 @@ class OpencodeBackend:
         err = _open_private_text(err_path)  # attached to proc; stream closes it
         from ..platform import PLATFORM
         cmd = ["opencode", "run", prompt, "--format", "json", *argv]
+        if command_wrapper is not None:
+            cmd = command_wrapper(cmd)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err, text=True,
             env=self._build_env(key_ctx),

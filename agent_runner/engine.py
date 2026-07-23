@@ -29,6 +29,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 from . import config as _config_mod
 from .backends import REGISTRY, get_backend
@@ -41,6 +42,19 @@ from .hooks import (
 from .keypool import KeyContext, KeyPool, _VerifiedProviderSnapshot
 
 _WATCHDOG_POLL_SECONDS = 10
+
+
+@dataclass(frozen=True)
+class _ProcessIntegration:
+    """Private embedding seam for product-neutral process command wrapping."""
+
+    command_wrapper: Callable[[list[str]], list[str]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.command_wrapper is not None and not callable(
+            self.command_wrapper
+        ):
+            raise TypeError("command_wrapper 必须可调用或为 None")
 
 
 # ── structured run outcome ────────────────────────────────────────────────
@@ -125,6 +139,7 @@ class Runner:
         else:
             self._config = _config_mod.Config(config_overrides, toml={})
         self._provider_snapshot: _VerifiedProviderSnapshot | None = None
+        self._process_integration = _ProcessIntegration()
         self._backend = None
         self._backend_name: str | None = None
         self._kp: KeyPool | None = None
@@ -141,11 +156,36 @@ class Runner:
             raise TypeError(
                 "provider_snapshot 必须是 _VerifiedProviderSnapshot"
             )
+        return cls._with_process_integration(
+            config_overrides,
+            discover_config_files=discover_config_files,
+            provider_snapshot=provider_snapshot,
+            integration=_ProcessIntegration(),
+        )
+
+    @classmethod
+    def _with_process_integration(
+        cls,
+        config_overrides: dict | None,
+        *,
+        discover_config_files: bool,
+        provider_snapshot: _VerifiedProviderSnapshot | None,
+        integration: _ProcessIntegration,
+    ):
+        if provider_snapshot is not None and type(
+            provider_snapshot
+        ) is not _VerifiedProviderSnapshot:
+            raise TypeError(
+                "provider_snapshot 必须是 _VerifiedProviderSnapshot 或 None"
+            )
+        if type(integration) is not _ProcessIntegration:
+            raise TypeError("integration 必须是 _ProcessIntegration")
         runner = cls(
             config_overrides,
             discover_config_files=discover_config_files,
         )
         runner._provider_snapshot = provider_snapshot
+        runner._process_integration = integration
         return runner
 
     # ── lazy resolution (config is fixed at construction; backend/kp on first use) ─
@@ -226,14 +266,19 @@ class Runner:
             argv += backend.model_args("primary", resolved_model=resolved_model)
         argv += list(extra)
 
-        if working_directory is None:
-            return backend.invoke(prompt, prefix, argv, key_ctx=key_ctx)
+        invoke_kwargs = {}
+        if working_directory is not None:
+            invoke_kwargs["working_directory"] = working_directory
+        if self._process_integration.command_wrapper is not None:
+            invoke_kwargs["command_wrapper"] = (
+                self._process_integration.command_wrapper
+            )
         return backend.invoke(
             prompt,
             prefix,
             argv,
             key_ctx=key_ctx,
-            working_directory=working_directory,
+            **invoke_kwargs,
         )
 
     def _agent_once_with_watchdog(
