@@ -182,6 +182,7 @@ Backends hold **no shared mutable state**: per-call handles (the err file) are a
 
 - `SPECS` (the `Spec` declaration table) is the **shared schema** (key / type / default / TOML path) — module-level, read-only, identical for all instances.
 - **`config_overrides`** is the per-instance "fine-tuning" channel (canonical keys, e.g. `{"primary_model": "glm-4.7", "stall_timeout": 600}`), enabling different Agents / threads to be tuned independently. Highest priority.
+- `Runner(..., *, discover_config_files=False)`通过既有 `Config(config_overrides, toml={})`为嵌入方建立显式配置视图；它只关闭 `$AR_CONFIG_FILE` / CWD / 用户目录 TOML 发现，不关闭 `AR_` 环境层。该参数只接受 exact `bool`，默认 `True`保持向后兼容的文件发现行为。
 - `lpm_src` is process-level (`sys.path` is process-global); resolved once on first `KeyPool` construction via the lock-guarded `_ensure_lpm`.
 - A lock-guarded module-level default `Config` exists only as a backward-compat shim for bootstrap / process-mode; production paths read the owning `Runner`'s instance.
 
@@ -212,7 +213,7 @@ Give each thread its own `Runner` and there is **no shared mutable state** acros
 | Track | When | How |
 |---|---|---|
 | **Transparent** | module-level `agent_with_retry(...)` etc. | delegates to thread-local default `Runner` (lazy, per-thread) |
-| **Explicit** | `Runner(config_overrides=...)` then `r.agent_with_retry(...)` | each instance: own Config/backend/keypool, full isolation + multi-Agent tuning |
+| **Explicit** | `Runner(config_overrides=..., discover_config_files=...)` then `r.agent_with_retry(...)` | 每个实例独占 Config/backend/keypool，支持完整隔离与多 Agent 微调；嵌入方可关闭候选 TOML 发现 |
 
 ### Concurrency guarantees
 

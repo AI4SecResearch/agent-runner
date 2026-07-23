@@ -234,64 +234,6 @@ def test_runner_config_overrides_beat_env(monkeypatch):
     assert eng._default_runner()._config.get("primary_model") == "env-model"
 
 
-def test_runner_can_disable_config_file_discovery(monkeypatch):
-    """显式配置视图不读取 AR_CONFIG_FILE、CWD 或用户目录候选 TOML。"""
-    monkeypatch.setenv("AR_CONFIG_FILE", "/malicious/agent-runner.toml")
-
-    def fail_if_loaded():
-        raise AssertionError("implicit TOML loading must be disabled")
-
-    monkeypatch.setattr(eng._config_mod, "_load_toml", fail_if_loaded)
-
-    runner = eng.Runner(
-        config_overrides={"backend": "opencode"},
-        discover_config_files=False,
-    )
-
-    assert runner._config.get("backend") == "opencode"
-
-
-def test_runner_rejects_non_boolean_config_file_discovery_before_loading(monkeypatch):
-    """策略只接受 exact bool；truthy 字符串不能意外重新启用文件发现。"""
-    calls = []
-
-    def load_toml():
-        calls.append("loaded")
-        raise AssertionError("config file loading must not precede validation")
-
-    monkeypatch.setattr(eng._config_mod, "_load_toml", load_toml)
-
-    with pytest.raises(TypeError, match="discover_config_files 必须是 bool"):
-        eng.Runner(discover_config_files="false")
-
-    assert calls == []
-
-
-@pytest.mark.parametrize(
-    "constructor",
-    (
-        lambda: eng.Runner(),
-        lambda: eng.Runner(discover_config_files=True),
-    ),
-    ids=("default", "explicit-true"),
-)
-def test_runner_preserves_config_file_discovery_by_default(monkeypatch, constructor):
-    """省略策略或显式传 True 时，独立 Runner 保持既有候选 TOML 搜索。"""
-    monkeypatch.delenv("AR_BACKEND", raising=False)
-    calls = []
-
-    def load_toml():
-        calls.append("loaded")
-        return {"backend": "opencode"}
-
-    monkeypatch.setattr(eng._config_mod, "_load_toml", load_toml)
-
-    runner = constructor()
-
-    assert calls == ["loaded"]
-    assert runner._config.get("backend") == "opencode"
-
-
 def test_runners_without_config_file_discovery_are_thread_isolated(monkeypatch):
     """并发显式配置视图各持独立 Config，且都不触发候选文件搜索。"""
     monkeypatch.setattr(

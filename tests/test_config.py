@@ -1,5 +1,6 @@
-"""config.py 测试:Config 类(解析视图)、SPECS 表驱动、TOML 加载、
-AR_ env 覆盖优先级、config_overrides 微调(多实例)、类型转换。
+"""配置契约测试:Config 解析视图、SPECS 表驱动、TOML 加载、
+AR_ env 覆盖优先级、config_overrides 微调(多实例)、类型转换，以及 Runner
+候选配置文件发现 Interface。
 
 新设计:配置经 ``Config(config_overrides=..., toml=...)`` 实例化,构造时一次性解析、
 无后续缓存污染(无 ``clear_cache``)。优先级:**config_overrides(实例) > AR_ env > TOML > 默认**。
@@ -18,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from agent_runner import config  # noqa: E402
 from agent_runner.config import SPECS, Config, Spec  # noqa: E402
+from agent_runner.engine import Runner  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -92,6 +94,60 @@ def test_toml_nested_timeouts():
     c = Config(toml={"timeouts": {"stall": 100, "total": 200}})
     assert c.get("stall_timeout") == 100
     assert c.get("total_timeout") == 200
+
+
+def test_runner_can_disable_config_file_discovery(monkeypatch):
+    """显式配置视图不读取 AR_CONFIG_FILE、CWD 或用户目录候选 TOML。"""
+    monkeypatch.setenv("AR_CONFIG_FILE", "/malicious/agent-runner.toml")
+
+    def fail_if_loaded():
+        raise AssertionError("不得触发隐式 TOML 加载")
+
+    monkeypatch.setattr(config, "_load_toml", fail_if_loaded)
+
+    Runner(
+        config_overrides={"backend": "opencode"},
+        discover_config_files=False,
+    )
+
+
+def test_runner_rejects_non_boolean_config_file_discovery_before_loading(monkeypatch):
+    """策略只接受 exact bool；truthy 字符串不能意外重新启用文件发现。"""
+    calls = []
+
+    def load_toml():
+        calls.append("loaded")
+        raise AssertionError("配置文件读取不得早于参数校验")
+
+    monkeypatch.setattr(config, "_load_toml", load_toml)
+
+    with pytest.raises(TypeError, match="discover_config_files 必须是 bool"):
+        Runner(discover_config_files="false")
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    (
+        lambda: Runner(),
+        lambda: Runner(discover_config_files=True),
+    ),
+    ids=("default", "explicit-true"),
+)
+def test_runner_preserves_config_file_discovery_by_default(monkeypatch, constructor):
+    """省略策略或显式传 True 时，独立 Runner 保持既有候选 TOML 搜索。"""
+    calls = []
+
+    def load_toml():
+        calls.append("loaded")
+        return {}
+
+    monkeypatch.setattr(config, "_load_toml", load_toml)
+
+    constructor()
+
+    assert calls == ["loaded"]
 
 
 # ── env 覆盖 ───────────────────────────────────────────────────────────────

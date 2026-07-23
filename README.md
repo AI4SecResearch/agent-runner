@@ -24,14 +24,17 @@ if res:
 
 模块级函数(`agent_with_retry` 等)内部委托一个 **thread-local 默认 `Runner`** —— 即:单线程调用方**零改动**即可跨线程并发使用,每线程各自独立的编排状态、keypool、env 快照,无跨线程竞态。
 
-需**多 Agent 微调**或显式隔离的场景,用 `Runner(config_overrides=...)` —— 每个实例持自己的 `Config`(优先级:`config_overrides` > `AR_` env > TOML > 默认),backend、keypool 全隔离:
+需**多 Agent 微调**或显式隔离的场景,用 `Runner(config_overrides=...)` —— 每个实例持自己的 `Config`(优先级:`config_overrides` > `AR_` env > TOML > 默认),backend、keypool 全隔离。嵌入方已经提供完整显式配置视图、且不允许读取候选 TOML 文件时，传 keyword-only `discover_config_files=False`；该参数只关闭 TOML 文件发现，`AR_` 环境层仍保留，因此调用方必须显式覆盖全部安全相关配置键。参数只接受 `bool`，省略或传 `True` 均保持既有搜索行为:
 
 ```python
 from agent_runner import Runner
 
 # 不同线程跑不同 backend / 模型 / 超时,互不干扰
 r_claude = Runner(config_overrides={"backend": "claude-code", "primary_model": "glm-5.1"})
-r_oc = Runner(config_overrides={"backend": "opencode", "primary_model": "glm-4.7", "stall_timeout": 600})
+r_oc = Runner(
+    config_overrides={"backend": "opencode", "primary_model": "glm-4.7", "stall_timeout": 600},
+    discover_config_files=False,
+)
 # 各自在自己的线程里调用:
 res = r_claude.agent_with_retry("总结这份文档", "summary")
 ```
@@ -61,7 +64,7 @@ entry(进程形态取一):`new` / `resume` / `fork` / `once` / `agent_with_retry
 
 所有配置项走同一套机制：写进 TOML 文件，或用 `AR_` 前缀的环境变量覆盖(env 优先)，硬编码默认值兜底。优先级:**`AR_` env > TOML > 默认**。哪项放哪由调用方决定,agent-runner 不做规定。
 
-**TOML 查找**(取第一个存在的)：`$AR_CONFIG_FILE` → `./agent-runner.toml` → `~/.config/agent-runner/config.toml`。完整注释模板见 `agent-runner.example.toml`。无 TOML 也能跑(默认 + env)。
+**TOML 查找**(取第一个存在的)：`$AR_CONFIG_FILE` → `./agent-runner.toml` → `~/.config/agent-runner/config.toml`。完整注释模板见 `agent-runner.example.toml`。无 TOML 也能跑(默认 + env)。显式构造 `Runner(..., discover_config_files=False)`时跳过这三处候选文件；配置优先级变为 `config_overrides` > `AR_` env > 默认。
 
 | TOML key | `AR_` env | 默认值 | 用途 |
 |---|---|---|---|
@@ -88,6 +91,7 @@ python -m pytest -q
 ```
 
 - `test_backends_jq_equiv.py` —— Python 的 jsonl 解析与 bash `jq` 过滤器逐字节等价(bash 后端不存在时跳过)。
+- `test_config.py` —— `Config`解析、优先级、类型转换，以及 `Runner`候选配置文件发现 Interface。
 - `test_engine.py` —— watchdog 早退、反应式重试、续接 vs 重跑分支、退出码(mock backend,不起真 agent)。
 - `test_platform.py` —— POSIX 进程组拉起 + 树杀契约。
 - `test_cli.py` —— `python -m agent_runner` 派发、参数顺序、退出码映射。

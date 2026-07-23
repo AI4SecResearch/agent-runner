@@ -71,6 +71,9 @@ class Runner:
     所有编排状态在实例上,无模块级共享可变状态。keypool 返回纯 ``KeyContext``,
     经 ``_agent_once`` 透传给 ``backend.invoke(key_ctx=...)``——agent 子进程拿
     隔离的 env 快照。构造廉价(lazy 解析 backend/keypool),可在每线程按需建。
+    ``discover_config_files=False``只关闭候选 TOML 文件发现,不关闭 ``AR_``环境层;
+    嵌入方必须提供完整安全 overrides。该 keyword-only 参数只接受 exact bool,
+    默认 ``True``保持既有搜索行为。
     """
 
     def __init__(
