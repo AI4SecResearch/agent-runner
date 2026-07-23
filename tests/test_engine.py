@@ -51,10 +51,25 @@ class MockBackend(ClaudeCodeBackend):
         super().__init__()
         self.script: list[dict] = []
         self.calls: list[tuple] = []
+        self.wrapped_commands: list[list[str]] = []
         self._idx = 0
 
-    def invoke(self, prompt, prefix, argv, key_ctx=None):
+    def invoke(
+        self,
+        prompt,
+        prefix,
+        argv,
+        key_ctx=None,
+        *,
+        working_directory=None,
+        command_wrapper=None,
+    ):
+        del working_directory
         self.calls.append((prompt, prefix, list(argv)))
+        if command_wrapper is not None:
+            self.wrapped_commands.append(
+                command_wrapper(["agent-binary", *argv])
+            )
         i = self._idx
         self._idx += 1
         if i < len(self.script):
@@ -78,6 +93,7 @@ class MockBackend(ClaudeCodeBackend):
     def reset(self, script):
         self.script = script
         self.calls = []
+        self.wrapped_commands = []
         self._idx = 0
 
 
@@ -177,6 +193,57 @@ def test_public_runner_constructor_signature_stays_exact() -> None:
     assert parameters["config_overrides"].default is None
     assert parameters["discover_config_files"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["discover_config_files"].default is True
+
+
+def test_internal_retry_wraps_every_backend_spawn_independently(
+    monkeypatch,
+) -> None:
+    _MOCK.reset(
+        [
+            {
+                "events": [make_result("retry", is_error=True)],
+                "ok": False,
+            },
+            {"events": [make_result()], "ok": True},
+        ]
+    )
+
+    class FakeKP:
+        def init(self): pass
+        def on_success(self): pass
+        def rotate(self): pass
+        def disable(self): pass
+        def available_size(self): return 1
+        def react(self, text): return "rotate"
+        def classify(self, text): return "rotate"
+
+    monkeypatch.setattr(
+        eng.Runner,
+        "_ensure_keypool",
+        lambda self: FakeKP(),
+    )
+    wrapped_attempts = []
+
+    def wrap(command):
+        wrapped_attempts.append(list(command))
+        return [f"wrapper-{len(wrapped_attempts)}", *command]
+
+    runner = eng.Runner._with_process_integration(
+        {
+            "backend": "claude-code",
+            "run_dir": os.environ["AR_RUN_DIR"],
+        },
+        discover_config_files=False,
+        provider_snapshot=None,
+        integration=eng._ProcessIntegration(command_wrapper=wrap),
+    )
+
+    result = runner.agent_with_retry_session_new("prompt", "retry-spawn")
+
+    assert result.rc == 0
+    assert len(wrapped_attempts) == 2
+    assert _MOCK.wrapped_commands[0][0] == "wrapper-1"
+    assert _MOCK.wrapped_commands[1][0] == "wrapper-2"
 
 
 # ── success on first try ──────────────────────────────────────────────────
