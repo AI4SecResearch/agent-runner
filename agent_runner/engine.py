@@ -457,6 +457,12 @@ class Runner:
             # 非 rotate 分支(如 bare downgrade)复用 key_ctx 不变
             model = "downgrade" if "downgrade" in atoms else "primary"
 
+            if _is_canceled(cancellation):
+                _emit_lifecycle(
+                    lifecycle_sink,
+                    LifecycleEventType.CANCEL_REQUESTED,
+                )
+                return Result.canceled()
             attempt += 1
             _emit_lifecycle(
                 lifecycle_sink,

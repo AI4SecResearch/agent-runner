@@ -252,6 +252,66 @@ def test_cancellation_after_failed_attempt_prevents_retry(
     assert calls == 1
 
 
+def test_cancellation_observed_during_retry_decision_prevents_spawn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cancellation = _Cancellation()
+    runner = Runner(
+        config_overrides={
+            "backend": "claude-code",
+            "run_dir": str(tmp_path),
+        },
+        discover_config_files=False,
+    )
+
+    class _CancelingKeyPool(_KeyPool):
+        def react(self, text: str) -> str:
+            del text
+            cancellation.requested = True
+            return "rotate"
+
+        def rotate(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        runner,
+        "_ensure_keypool",
+        lambda: _CancelingKeyPool(),
+    )
+    calls = 0
+
+    def fail_attempt(*args: object, **kwargs: object) -> Result:
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        return Result(1)
+
+    monkeypatch.setattr(runner, "_agent_once_with_check", fail_attempt)
+    monkeypatch.setattr(
+        runner,
+        "_get_backend",
+        lambda: type(
+            "Backend",
+            (),
+            {
+                "result_text": lambda self, prefix: "failed",
+                "session_id": lambda self, prefix: "",
+                "resume_args": lambda self, sid: [],
+            },
+        )(),
+    )
+
+    result = runner.agent_with_retry_session_new(
+        "prompt",
+        "run",
+        cancellation=cancellation,
+    )
+
+    assert result.outcome is RunOutcome.CANCELED
+    assert calls == 1
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX watchdog proof")
 @pytest.mark.parametrize(
     ("stall_timeout", "attempt_timeout", "expected"),
