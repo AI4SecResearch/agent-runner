@@ -66,6 +66,42 @@ def test_asymmetric_key_must_have_models():
         }""")
 
 
+@pytest.mark.parametrize("field", ["primaryModel", "downgradeModel"])
+def test_asymmetric_provider_model_overrides_rejected(
+    sample_config_dict: dict, field: str
+):
+    provider = sample_config_dict["providers"][1]
+    provider[field] = provider["keys"][0]["models"][0]["id"]
+
+    with pytest.raises(
+        ValueError,
+        match=rf"asymmetric provider 'bailian' must not declare provider-level '{field}'",
+    ):
+        Config.from_dict(sample_config_dict)
+
+
+def test_asymmetric_key_model_overrides_allowed(sample_config_dict: dict):
+    key = sample_config_dict["providers"][1]["keys"][0]
+    key["primaryModel"] = "glm-5.2"
+    key["downgradeModel"] = "glm-5.2"
+
+    parsed_key = Config.from_dict(sample_config_dict).provider_by_id("bailian").keys[0]
+
+    assert parsed_key.primary_model == "glm-5.2"
+    assert parsed_key.downgrade_model == "glm-5.2"
+
+
+def test_symmetric_provider_model_overrides_allowed(sample_config_dict: dict):
+    provider = sample_config_dict["providers"][0]
+    provider["primaryModel"] = "glm-5-turbo"
+    provider["downgradeModel"] = "glm-5.2"
+
+    parsed_provider = Config.from_dict(sample_config_dict).provider_by_id("zhipu")
+
+    assert parsed_provider.primary_model == "glm-5-turbo"
+    assert parsed_provider.downgrade_model == "glm-5.2"
+
+
 def test_duplicate_provider_ids_rejected():
     with pytest.raises(ValueError, match="duplicate provider ids"):
         parse_text("""{

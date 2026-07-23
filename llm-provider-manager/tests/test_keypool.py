@@ -82,6 +82,25 @@ def test_non_rotating_on_success_emits_empty_line(tmp_path: Path, capsys):
     assert _line_for("on-success", cfg, state, capsys) is None
 
 
+def test_rotate_every_zero_disables_proactive_rotation(tmp_path: Path):
+    cfg_dict = json.loads(_two_provider_cfg(tmp_path).read_text())
+    cfg_dict["settings"]["rotateEvery"] = 0
+    cfg = tmp_path / "providers.jsonc"
+    cfg.write_text(json.dumps(cfg_dict))
+    state = tmp_path / "state.json"
+    pool = KeyPool(cfg, state, agent_id="claude")
+
+    pool.init()
+    initial_key = pool.current_key()
+    initial_state = json.loads(state.read_text())
+
+    assert [pool.on_success() for _ in range(5)] == [None] * 5
+    assert pool.current_key() == initial_key
+    final_state = json.loads(state.read_text())
+    assert final_state["current_index"] == initial_state["current_index"]
+    assert final_state["success_count"] == 0
+
+
 def test_rotate_returns_entry_with_matching_provider(tmp_path: Path):
     cfg = _two_provider_cfg(tmp_path)
     state = tmp_path / "state.json"

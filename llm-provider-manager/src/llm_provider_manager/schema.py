@@ -132,6 +132,16 @@ class Provider:
             raise ValueError(
                 f"asymmetric provider '{self.id}' must not declare provider-level 'models'"
             )
+        if self.type == "asymmetric":
+            for label, model_id in (
+                ("primaryModel", self.primary_model),
+                ("downgradeModel", self.downgrade_model),
+            ):
+                if model_id is not None:
+                    raise ValueError(
+                        f"asymmetric provider '{self.id}' must not declare "
+                        f"provider-level '{label}'"
+                    )
         key_ids = [k.id for k in self.keys]
         if len(set(key_ids)) != len(key_ids):
             raise ValueError(f"provider '{self.id}' has duplicate key ids")

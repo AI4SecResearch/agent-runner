@@ -382,6 +382,8 @@ class KeyPool:
         index so the key and its provider stay consistent.
         """
         rotate_every = self.config.settings.rotate_every
+        if rotate_every == 0:
+            return None
 
         def _on_success(data):
             self._purge_expired(data)
