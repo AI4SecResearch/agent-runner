@@ -107,6 +107,7 @@ python -m pytest -q
 - `test_backends_jq_equiv.py` —— Python 的 jsonl 解析与 bash `jq` 过滤器逐字节等价(bash 后端不存在时跳过)。
 - `test_config.py` —— `Config`解析、优先级、类型转换，以及 `Runner`候选配置文件发现 Interface。
 - `test_engine.py` —— watchdog 早退、反应式重试、续接 vs 重跑分支、退出码(mock backend,不起真 agent)。
+- `test_working_directory.py` —— new/resume/fork逐调用工作目录透传、两种 backend 的`Popen(cwd=...)`映射，以及内部重试保持同一目录。
 - `test_platform.py` —— POSIX 进程组拉起 + 树杀契约。
 - `test_cli.py` —— `python -m agent_runner` 派发、参数顺序、退出码映射。
 - `test_threading.py` —— 多线程隔离:per-thread key/子进程 env 隔离、err 句柄脱单例、thread-local 默认 `Runner`、`Runner(config_overrides=...)` 配置隔离。

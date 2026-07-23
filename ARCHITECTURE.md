@@ -24,9 +24,9 @@ classDiagram
         +agent_with_retry_session_fork(prompt, log_name, sid, *extra, working_directory=None)
         +agent_once_session_resume(prompt, log_name, sid, *extra)
         +agent_with_retry(prompt, log_name, *extra)
-        -_agent_once_with_check(prompt, log_name, extra, key_ctx)
+        -_agent_once_with_check(prompt, log_name, extra, key_ctx, working_directory=None)
         -_agent_once_with_disable(prompt, log_name, extra, key_ctx)
-        -_agent_retry_loop(prompt, base_log, session_args, extra, key_ctx)
+        -_agent_retry_loop(prompt, base_log, session_args, extra, key_ctx, working_directory=None)
         -_get_backend()
         -_ensure_keypool()
     }
