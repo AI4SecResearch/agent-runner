@@ -13,7 +13,7 @@ _MANAGED_ENV_NAMES = frozenset(
         "Z_AI_API_KEY",
     }
 )
-_MANAGED_ENV_PREFIXES = ("LLM_KEY_",)
+_MANAGED_ENV_PREFIXES = ("ANTHROPIC_", "LLM_KEY_")
 
 
 def subprocess_base_environment(

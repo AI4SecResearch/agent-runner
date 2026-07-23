@@ -205,6 +205,8 @@ def test_real_subprocesses_receive_only_their_selected_managed_credentials(
 ):
     monkeypatch.setenv("HOST_RUNTIME_SENTINEL", "preserved")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale-anthropic-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-anthropic-api-key")
+    monkeypatch.setenv("ANTHROPIC_LEGACY_AUTH", "stale-anthropic-legacy")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://stale.example")
     monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "stale-model")
     monkeypatch.setenv("Z_AI_API_KEY", "stale-opencode-key")
@@ -218,6 +220,7 @@ def test_real_subprocesses_receive_only_their_selected_managed_credentials(
     child_code = (
         "import json, os;"
         "names=('HOST_RUNTIME_SENTINEL','ANTHROPIC_AUTH_TOKEN',"
+        "'ANTHROPIC_API_KEY','ANTHROPIC_LEGACY_AUTH',"
         "'ANTHROPIC_BASE_URL','ANTHROPIC_DEFAULT_OPUS_MODEL',"
         "'Z_AI_API_KEY','LLM_KEY_STALE','LLM_DEFAULT_MODEL');"
         "print(json.dumps({name: os.environ.get(name) for name in names}))"
@@ -267,6 +270,8 @@ def test_real_subprocesses_receive_only_their_selected_managed_credentials(
         assert child_environment == {
             "HOST_RUNTIME_SENTINEL": "preserved",
             "ANTHROPIC_AUTH_TOKEN": f"selected-key-{index}",
+            "ANTHROPIC_API_KEY": None,
+            "ANTHROPIC_LEGACY_AUTH": None,
             "ANTHROPIC_BASE_URL": f"https://selected-{index}.example",
             "ANTHROPIC_DEFAULT_OPUS_MODEL": None,
             "Z_AI_API_KEY": None,
@@ -284,6 +289,7 @@ def test_opencode_real_subprocess_receives_private_config_and_current_key_only(
 ):
     monkeypatch.setenv("HOST_RUNTIME_SENTINEL", "preserved")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale-anthropic-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-anthropic-api-key")
     monkeypatch.setenv("Z_AI_API_KEY", "stale-opencode-key")
     monkeypatch.setenv("LLM_KEY_STALE", "stale-lpm-key")
     host_environment = dict(os.environ)
@@ -305,7 +311,7 @@ def test_opencode_real_subprocess_receives_private_config_and_current_key_only(
     child_code = (
         "import json, os;"
         "names=('HOST_RUNTIME_SENTINEL','ANTHROPIC_AUTH_TOKEN',"
-        "'Z_AI_API_KEY','LLM_KEY_STALE','OPENCODE_CONFIG',"
+        "'ANTHROPIC_API_KEY','Z_AI_API_KEY','LLM_KEY_STALE','OPENCODE_CONFIG',"
         "'OPENCODE_CONFIG_DIR','OPENCODE_DISABLE_PROJECT_CONFIG');"
         "print(json.dumps({name: os.environ.get(name) for name in names}))"
     )
@@ -321,11 +327,86 @@ def test_opencode_real_subprocess_receives_private_config_and_current_key_only(
     assert json.loads(completed.stdout) == {
         "HOST_RUNTIME_SENTINEL": "preserved",
         "ANTHROPIC_AUTH_TOKEN": None,
+        "ANTHROPIC_API_KEY": None,
         "Z_AI_API_KEY": "selected-opencode-key",
         "LLM_KEY_STALE": None,
         "OPENCODE_CONFIG": str(private_config),
         "OPENCODE_CONFIG_DIR": str(private_config.parent),
         "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+    }
+    assert os.environ == host_environment
+
+
+def test_claude_and_opencode_real_subprocesses_do_not_cross_credentials(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-anthropic")
+    monkeypatch.setenv("Z_AI_API_KEY", "stale-opencode")
+    host_environment = dict(os.environ)
+    claude = ClaudeCodeBackend()
+    opencode = OpencodeBackend(
+        config=Config(
+            config_overrides={
+                "opencode_config": str(tmp_path / "opencode.json"),
+                "opencode_auth_env_var": "Z_AI_API_KEY",
+            },
+            toml={},
+        )
+    )
+    barrier = threading.Barrier(2)
+    captured = {}
+
+    def child(name, environment):
+        barrier.wait()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json, os;"
+                    "print(json.dumps({"
+                    "'anthropic': os.environ.get('ANTHROPIC_AUTH_TOKEN'),"
+                    "'opencode': os.environ.get('Z_AI_API_KEY')}))"
+                ),
+            ],
+            check=True,
+            env=environment,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        captured[name] = json.loads(completed.stdout)
+
+    threads = [
+        threading.Thread(
+            target=child,
+            args=(
+                "claude",
+                claude._build_env(KeyContext(key="claude-selected")),
+            ),
+        ),
+        threading.Thread(
+            target=child,
+            args=(
+                "opencode",
+                opencode._build_env(KeyContext(key="opencode-selected")),
+            ),
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert captured == {
+        "claude": {
+            "anthropic": "claude-selected",
+            "opencode": None,
+        },
+        "opencode": {
+            "anthropic": None,
+            "opencode": "opencode-selected",
+        },
     }
     assert os.environ == host_environment
 

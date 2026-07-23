@@ -112,12 +112,31 @@ class KeyPool:
     active key value without reading the process environment.
     """
 
-    def __init__(self, config_path: str, state_path: str, agent_id: str, config):
+    def __init__(
+        self,
+        config_path: str,
+        state_path: str,
+        agent_id: str,
+        config,
+        *,
+        provider_config_fd: int | None = None,
+        provider_config_sha256: str | None = None,
+    ):
         _ensure_lpm(config)
-        self._kp = _LpmKeyPool(config_path, state_path, agent_id=agent_id)
+        self._config_fd = provider_config_fd
+        self._config_sha256 = provider_config_sha256
+        self._kp = _LpmKeyPool(
+            config_path,
+            state_path,
+            agent_id=agent_id,
+            config_fd=self._config_fd,
+            expected_config_sha256=self._config_sha256,
+        )
         self._config = config
         self._current_key_ctx: KeyContext | None = None
-        self._has_config = os.path.isfile(config_path)
+        self._has_config = self._config_fd is not None or os.path.isfile(
+            config_path
+        )
 
     # ── config-presence guard (mirrors runner.py dispatch's has_config) ──
     # lpm's KeyPool raises on a missing config; runner.py's dispatch short-
@@ -227,6 +246,8 @@ class KeyPool:
             self._kp.config_path,
             self._kp.state_path,
             agent_id=self._kp.agent_id,
+            config_fd=self._config_fd,
+            expected_config_sha256=self._config_sha256,
         )
 
     def classify(self, payload_text: str) -> str:
@@ -235,6 +256,8 @@ class KeyPool:
             self._kp.config_path,
             self._kp.state_path,
             agent_id=self._kp.agent_id,
+            config_fd=self._config_fd,
+            expected_config_sha256=self._config_sha256,
         )
 
 

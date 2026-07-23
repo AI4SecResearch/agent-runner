@@ -234,7 +234,7 @@ Give each thread its own `Runner` and there is **no shared mutable state** acros
 
 | # | Guarantee |
 |---|---|
-| ① | **no `os.environ` writes**: keypool's `_resolve_entry` returns a pure `KeyContext`; the engine threads it to `backend.invoke(key_ctx=...)`, which builds `Popen(env={**os.environ, **extra_env})` — each agent subprocess gets its own isolated env snapshot. |
+| ① | **no `os.environ` writes**: keypool's `_resolve_entry` returns a pure `KeyContext`; the engine threads it to `backend.invoke(key_ctx=...)`, which builds `Popen(env=controlled_snapshot)` after removing stale Runner/LPM-managed authentication names — each agent subprocess gets its own isolated env snapshot. |
 | ② | **no shared orchestration state**: all state lives on the `Runner` instance; one Runner per thread. |
 | ③ | **backends hold no per-call mutable state**: `REGISTRY` maps to classes (per-Runner instances); the err handle attaches to the returned `Popen` (`proc._ar_err`), never to the instance. |
 | ④ | **no unsynchronized config cache**: `Config` is resolved once per instance at construction; the only module-level default is lock-guarded, for bootstrap/back-compat only. |

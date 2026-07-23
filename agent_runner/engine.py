@@ -117,6 +117,8 @@ class Runner:
         config_overrides: dict | None = None,
         *,
         discover_config_files: bool = True,
+        provider_config_fd: int | None = None,
+        provider_config_sha256: str | None = None,
     ):
         if type(discover_config_files) is not bool:
             raise TypeError("discover_config_files 必须是 bool")
@@ -124,6 +126,19 @@ class Runner:
             self._config = _config_mod.Config(config_overrides)
         else:
             self._config = _config_mod.Config(config_overrides, toml={})
+        if provider_config_fd is not None and (
+            type(provider_config_fd) is not int or provider_config_fd < 0
+        ):
+            raise TypeError("provider_config_fd 必须是非负 int 或 None")
+        if provider_config_sha256 is not None and (
+            type(provider_config_sha256) is not str
+            or len(provider_config_sha256) != 64
+        ):
+            raise TypeError(
+                "provider_config_sha256 必须是 64 字符 str 或 None"
+            )
+        self._provider_config_fd = provider_config_fd
+        self._provider_config_sha256 = provider_config_sha256
         self._backend = None
         self._backend_name: str | None = None
         self._kp: KeyPool | None = None
@@ -158,7 +173,10 @@ class Runner:
             backend = self._get_backend()
             self._kp = KeyPool(
                 self._kp_config(), self._kp_state(),
-                agent_id=backend.agent_id, config=self._config,
+                agent_id=backend.agent_id,
+                config=self._config,
+                provider_config_fd=self._provider_config_fd,
+                provider_config_sha256=self._provider_config_sha256,
             )
         return self._kp
 

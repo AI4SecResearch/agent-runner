@@ -8,9 +8,11 @@ is not treated as a comment).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat
 from pathlib import Path
 
 from .schema import Config
@@ -74,9 +76,39 @@ def parse_text(text: str, source: str = "<string>") -> Config:
     return Config.from_dict(data)
 
 
-def load(path: str | os.PathLike[str]) -> Config:
+def load(
+    path: str | os.PathLike[str],
+    *,
+    file_descriptor: int | None = None,
+    expected_sha256: str | None = None,
+) -> Config:
     p = Path(path)
-    text = p.read_text(encoding="utf-8")
+    descriptor = (
+        os.dup(file_descriptor)
+        if file_descriptor is not None
+        else os.open(
+            p,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(f"{p}: provider config is not a regular file")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = -1
+            text = stream.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        expected_sha256 is not None
+        and hashlib.sha256(text.encode("utf-8")).hexdigest()
+        != expected_sha256
+    ):
+        raise ValueError(f"{p}: provider config changed after startup")
     return parse_text(text, source=str(p))
 
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
 import time
 
@@ -108,17 +109,31 @@ def _resolve_models(provider: Provider, key_id: str):
 
 
 class KeyPool:
-    def __init__(self, config_path, state_path, *, agent_id):
+    def __init__(
+        self,
+        config_path,
+        state_path,
+        *,
+        agent_id,
+        config_fd=None,
+        expected_config_sha256=None,
+    ):
         self.config_path = config_path
         self.state_path = state_path
         self.agent_id = agent_id
+        self._config_fd = config_fd
+        self._expected_config_sha256 = expected_config_sha256
         self._config: Config | None = None
         self._agent = agents_mod.get_agent(agent_id)
 
     @property
     def config(self) -> Config:
         if self._config is None:
-            self._config = config_mod.load(self.config_path)  # silent (no warnings)
+            self._config = config_mod.load(
+                self.config_path,
+                file_descriptor=self._config_fd,
+                expected_sha256=self._expected_config_sha256,
+            )  # silent (no warnings)
         return self._config
 
     def _entries(self):
@@ -161,7 +176,7 @@ class KeyPool:
         entries = self._entries()
         if not entries:
             return None
-        if not os.path.exists(self.state_path):
+        if not self._state_exists():
             return entries[0]
         data = self._read_state()
         idx = data.get("current_index", 0) % len(entries)
@@ -201,9 +216,45 @@ class KeyPool:
     # Copied verbatim from agent-runner/runner.py — the f.truncate() flush
     # trick is load-bearing for correctness under flock. Do not simplify.
 
+    def _state_exists(self):
+        try:
+            metadata = os.lstat(self.state_path)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(f"{self.state_path}: state is not a regular file")
+        return True
+
+    def _open_state(self, *, writable):
+        descriptor = os.open(
+            self.state_path,
+            (os.O_RDWR if writable else os.O_RDONLY)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError(
+                    f"{self.state_path}: state is not a regular file"
+                )
+            if os.name == "posix":
+                mode = stat.S_IMODE(metadata.st_mode)
+                required = stat.S_IRUSR | (
+                    stat.S_IWUSR if writable else 0
+                )
+                if mode & 0o077 or mode & required != required:
+                    raise PermissionError(
+                        f"{self.state_path}: state permissions are unsafe"
+                    )
+            return os.fdopen(descriptor, "r+" if writable else "r")
+        except BaseException:
+            os.close(descriptor)
+            raise
+
     def _read_state(self):
         """Read state under shared lock."""
-        with open(self.state_path) as f:
+        with self._open_state(writable=False) as f:
             _flock_sh(f)
             try:
                 return json.load(f)
@@ -212,7 +263,7 @@ class KeyPool:
 
     def _modify_state(self, fn):
         """Read-modify-write under exclusive lock. Returns fn result."""
-        with open(self.state_path, "r+") as f:
+        with self._open_state(writable=True) as f:
             _flock_ex(f)
             try:
                 data = json.load(f)
@@ -229,7 +280,20 @@ class KeyPool:
 
     def _init_state(self):
         """Ensure state file is initialized. LOCK_EX serializes concurrent inits."""
-        fd = os.open(self.state_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fd = os.open(
+            self.state_path,
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(fd)
+            raise OSError(f"{self.state_path}: state is not a regular file")
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "r+") as f:
             _flock_ex(f)
             try:
@@ -285,7 +349,7 @@ class KeyPool:
         keys = self._keys()
         if not keys:
             return ""
-        if not os.path.exists(self.state_path):
+        if not self._state_exists():
             return keys[0]
         data = self._read_state()
         idx = data.get("current_index", 0)
@@ -369,7 +433,7 @@ class KeyPool:
     def available_size(self):
         """Return number of non-disabled keys."""
         total = len(self._keys())
-        if not os.path.exists(self.state_path):
+        if not self._state_exists():
             return total
         data = self._read_state()
         active = total - len(self._active_disabled(data))
@@ -416,7 +480,15 @@ class KeyPool:
         return self._modify_state(_on_success)
 
 
-def classify_error(payload_text, config_path, state_path, *, agent_id):
+def classify_error(
+    payload_text,
+    config_path,
+    state_path,
+    *,
+    agent_id,
+    config_fd=None,
+    expected_config_sha256=None,
+):
     """Classify an error payload via the active provider module.
 
     The provider is the active key's provider (resolved from keypool state);
@@ -425,8 +497,14 @@ def classify_error(payload_text, config_path, state_path, *, agent_id):
     """
     provider_id = None
     handling: dict[str, str] = {}
-    if os.path.exists(config_path):
-        pool = KeyPool(config_path, state_path, agent_id=agent_id)
+    if config_fd is not None or os.path.exists(config_path):
+        pool = KeyPool(
+            config_path,
+            state_path,
+            agent_id=agent_id,
+            config_fd=config_fd,
+            expected_config_sha256=expected_config_sha256,
+        )
         p = pool._provider_for_current()
         if p is not None:
             provider_id = p.id
@@ -434,7 +512,15 @@ def classify_error(payload_text, config_path, state_path, *, agent_id):
     return providers_mod.classify(provider_id, payload_text, handling)
 
 
-def react(payload_text, config_path, state_path, *, agent_id):
+def react(
+    payload_text,
+    config_path,
+    state_path,
+    *,
+    agent_id,
+    config_fd=None,
+    expected_config_sha256=None,
+):
     """Decide ONE recovery step for the given error (reactive retry).
 
     The reactive counterpart to the old pre-planned ``retry_plan``: instead of
@@ -450,12 +536,25 @@ def react(payload_text, config_path, state_path, *, agent_id):
       * strategy carries no actionable atom at all (e.g. bare ``disable`` with
         an empty pool) → stop.
     """
-    action = classify_error(payload_text, config_path, state_path, agent_id=agent_id)
+    action = classify_error(
+        payload_text,
+        config_path,
+        state_path,
+        agent_id=agent_id,
+        config_fd=config_fd,
+        expected_config_sha256=expected_config_sha256,
+    )
 
-    has_pool = os.path.exists(config_path)
+    has_pool = config_fd is not None or os.path.exists(config_path)
     available = 0
     if has_pool:
-        pool = KeyPool(config_path, state_path, agent_id=agent_id)
+        pool = KeyPool(
+            config_path,
+            state_path,
+            agent_id=agent_id,
+            config_fd=config_fd,
+            expected_config_sha256=expected_config_sha256,
+        )
         available = pool.available_size()
 
     # No key pool → disable/rotate are meaningless (nothing to disable, nothing

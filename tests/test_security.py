@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from agent_runner.backends.claude_code import ClaudeCodeBackend
 from agent_runner.config import Config
+from agent_runner.engine import Runner
 from agent_runner.keypool import KeyContext, KeyPool as RunnerKeyPool
 
 
@@ -107,3 +112,166 @@ def test_backend_raw_diagnostics_are_created_owner_only(
         (tmp_path / "diagnostics" / "run.jsonl").stat().st_mode & 0o777
         == 0o600
     )
+
+
+def test_backend_raw_diagnostics_remain_owner_only_under_restrictive_umask(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    process = _ExitedProcess()
+    monkeypatch.setattr(
+        "agent_runner.backends.claude_code.subprocess.Popen",
+        lambda *args, **kwargs: process,
+    )
+    backend = ClaudeCodeBackend()
+    (tmp_path / "diagnostics").mkdir()
+    prefix = str(tmp_path / "diagnostics" / "restrictive")
+    previous_umask = os.umask(0o777)
+    try:
+        invoked = backend.invoke(
+            "prompt",
+            prefix,
+            [],
+            key_ctx=KeyContext(key="selected-key"),
+        )
+        backend.stream(invoked, prefix)
+    finally:
+        os.umask(previous_umask)
+
+    assert (
+        (tmp_path / "diagnostics" / "restrictive.err").stat().st_mode
+        & 0o777
+        == 0o600
+    )
+    assert (
+        (tmp_path / "diagnostics" / "restrictive.jsonl").stat().st_mode
+        & 0o777
+        == 0o600
+    )
+
+
+def test_key_pool_rejects_symlink_state_file_before_reading_or_writing(
+    tmp_path: Path,
+) -> None:
+    provider_path = tmp_path / "providers.jsonc"
+    provider_path.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "id": "provider-a",
+                        "type": "symmetric",
+                        "baseURLs": {
+                            "anthropic": "https://example.test/anthropic",
+                        },
+                        "keys": [{"id": "key-a", "key": "selected-key"}],
+                        "models": [
+                            {
+                                "id": "model-a",
+                                "context": 4096,
+                                "output": 1024,
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    real_state = tmp_path / "real-state.json"
+    real_state.write_text(
+        '{"current_index": 0, "disabled": {}, "success_count": 0}',
+        encoding="utf-8",
+    )
+    state_path = tmp_path / "state.json"
+    state_path.symlink_to(real_state)
+    key_pool = RunnerKeyPool(
+        str(provider_path),
+        str(state_path),
+        agent_id="claude",
+        config=Config(config_overrides={}, toml={}),
+    )
+
+    with pytest.raises(OSError):
+        key_pool.init()
+
+
+def test_runner_uses_held_provider_descriptor_for_real_child_spawn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    provider_path = tmp_path / "providers.jsonc"
+
+    def provider_document(key: str) -> str:
+        return json.dumps(
+            {
+                "providers": [
+                    {
+                        "id": "provider-a",
+                        "type": "symmetric",
+                        "baseURLs": {
+                            "anthropic": "https://example.test/anthropic",
+                        },
+                        "keys": [{"id": "key-a", "key": key}],
+                        "models": [
+                            {
+                                "id": "model-a",
+                                "context": 4096,
+                                "output": 1024,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+    original_key = "descriptor-selected-key"
+    original_text = provider_document(original_key)
+    provider_path.write_text(original_text, encoding="utf-8")
+    provider_fd = os.open(provider_path, os.O_RDONLY)
+    replacement = tmp_path / "replacement.jsonc"
+    replacement.write_text(
+        provider_document("replacement-key"),
+        encoding="utf-8",
+    )
+    replacement.replace(provider_path)
+    capture_path = tmp_path / "captured-key.txt"
+    executable_directory = tmp_path / "bin"
+    executable_directory.mkdir()
+    fake_claude = executable_directory / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os\n"
+        "open(os.environ['HOST_CAPTURE_PATH'], 'w').write("
+        "os.environ['ANTHROPIC_AUTH_TOKEN'])\n"
+        "print(json.dumps({'type': 'result', 'result': 'safe', "
+        "'is_error': False, 'session_id': 'session-1'}))\n",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH",
+        f"{executable_directory}{os.pathsep}{os.environ['PATH']}",
+    )
+    monkeypatch.setenv("HOST_CAPTURE_PATH", str(capture_path))
+    try:
+        runner = Runner(
+            discover_config_files=False,
+            provider_config_fd=provider_fd,
+            provider_config_sha256=hashlib.sha256(
+                original_text.encode("utf-8")
+            ).hexdigest(),
+            config_overrides={
+                "backend": "claude-code",
+                "key_pool_config": str(provider_path),
+                "keypool_state": str(tmp_path / "state.json"),
+                "run_dir": str(tmp_path / "diagnostics"),
+            },
+        )
+
+        result = runner.agent_with_retry_session_new("safe prompt", "run")
+    finally:
+        os.close(provider_fd)
+
+    assert result.rc == 0
+    assert capture_path.read_text(encoding="utf-8") == original_key
