@@ -153,6 +153,18 @@ class KeyPool:
 
         chosen_primary = _choose_model(ar_primary, provider_primary, available)
         chosen_downgrade = _choose_model(ar_downgrade, provider_downgrade, available)
+        chosen_primary = _model_for_agent(
+            agent_id=self._kp.agent_id,
+            provider=provider,
+            key_id=kid,
+            model_id=chosen_primary,
+        )
+        chosen_downgrade = _model_for_agent(
+            agent_id=self._kp.agent_id,
+            provider=provider,
+            key_id=kid,
+            model_id=chosen_downgrade,
+        )
 
         return KeyContext(
             key=key_value,
@@ -248,3 +260,20 @@ def _choose_model(wanted: str, provider_default, available: set[str]) -> str:
     if provider_default:
         return provider_default
     return ""
+
+
+def _model_for_agent(
+    *,
+    agent_id: str,
+    provider,
+    key_id: str,
+    model_id: str,
+) -> str:
+    if not model_id or agent_id != "opencode":
+        return model_id
+    from llm_provider_manager.agents.opencode import (  # type: ignore
+        opencode_entry_id_for,
+    )
+
+    entry_id = opencode_entry_id_for(provider, key_id)
+    return f"{entry_id}/{model_id}"

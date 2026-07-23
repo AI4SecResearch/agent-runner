@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 from llm_provider_manager import config as config_mod
+from llm_provider_manager.agents.opencode import opencode_entry_id_for
 from llm_provider_manager.config import parse_text, check_permissions, looks_unfilled
-from llm_provider_manager.schema import Config
+from llm_provider_manager.schema import Config, Key, Model, Provider
 
 
 def test_parse_symmetric_and_asymmetric(sample_config_file: Path):
@@ -24,6 +25,31 @@ def test_parse_symmetric_and_asymmetric(sample_config_file: Path):
     bailian = cfg.provider_by_id("bailian")
     assert bailian.type == "asymmetric"
     assert {m.id for m in bailian.models_for_key("account-b")} == {"glm-4.6"}
+
+
+def test_opencode_entry_id_for_uses_provider_shape() -> None:
+    model = Model("model", "Model", 4096, 1024)
+    symmetric = Provider(
+        id="symmetric",
+        type="symmetric",
+        display_name="Symmetric",
+        base_urls={"openai": "https://example.test/v1"},
+        keys=[Key(id="main", key="secret")],
+        models=[model],
+    )
+    asymmetric = Provider(
+        id="asymmetric",
+        type="asymmetric",
+        display_name="Asymmetric",
+        base_urls={"openai": "https://example.test/v1"},
+        keys=[Key(id="tenant", key="secret", models=[model])],
+    )
+
+    assert opencode_entry_id_for(symmetric, "main") == "symmetric"
+    assert (
+        opencode_entry_id_for(asymmetric, "tenant")
+        == "asymmetric-tenant"
+    )
 
 
 def test_jsonc_comments_stripped(tmp_path: Path):

@@ -71,17 +71,19 @@ class OpencodeBackend:
         return proc
 
     def _build_env(self, key_ctx):
-        """``{**os.environ, **extra_env}`` from key_ctx, or None (inherit env)."""
-        if key_ctx is None:
-            return None
+        """Build the per-process OpenCode environment without global mutation."""
         extra_env = {}
-        key_var = self.api_key_env_var()
-        if key_var and key_ctx.key:
-            extra_env[key_var] = key_ctx.key
-        # base_url_env_var() is "" for opencode (routes by provider prefix) → skip
-        url_var = self.base_url_env_var()
-        if url_var and key_ctx.base_url:
-            extra_env[url_var] = key_ctx.base_url
+        config_path = self._config.get("opencode_config", "")
+        if config_path:
+            extra_env["OPENCODE_CONFIG"] = config_path
+        if key_ctx is not None:
+            key_var = self.api_key_env_var()
+            if key_var and key_ctx.key:
+                extra_env[key_var] = key_ctx.key
+            # base_url_env_var() is "" for opencode (routes by provider prefix) → skip
+            url_var = self.base_url_env_var()
+            if url_var and key_ctx.base_url:
+                extra_env[url_var] = key_ctx.base_url
         if not extra_env:
             return None
         return {**os.environ, **extra_env}

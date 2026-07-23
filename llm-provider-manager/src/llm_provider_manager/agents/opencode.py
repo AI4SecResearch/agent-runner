@@ -56,6 +56,14 @@ def opencode_entry_id(provider_id: str, key_id: str | None = None) -> str:
     return f"{provider_id}-{key_id}" if key_id else provider_id
 
 
+def opencode_entry_id_for(provider: "Provider", key_id: str) -> str:
+    """Return the canonical OpenCode entry id for a Provider/Key."""
+    return opencode_entry_id(
+        provider.id,
+        key_id if OpencodeAgent._needs_per_key_entries(provider) else None,
+    )
+
+
 def _npm_for_protocol(protocol: str) -> str:
     if protocol == "openai":
         return "@ai-sdk/openai-compatible"

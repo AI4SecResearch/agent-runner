@@ -9,6 +9,8 @@ import agent_runner.engine as engine
 from agent_runner.backends import claude_code, opencode
 from agent_runner.backends.claude_code import ClaudeCodeBackend
 from agent_runner.backends.opencode import OpencodeBackend
+from agent_runner.config import Config
+from agent_runner.keypool import KeyContext
 
 
 class _ExitedProcess:
@@ -210,3 +212,46 @@ def test_internal_retry_keeps_requested_working_directory(tmp_path, monkeypatch)
 
     assert result.rc == 0
     assert backend.working_directories == [working_directory, working_directory]
+
+
+def test_opencode_process_gets_private_config_without_changing_working_directory(
+    tmp_path,
+    monkeypatch,
+):
+    working_directory = tmp_path / "workspace"
+    working_directory.mkdir()
+    private_config = tmp_path / "private" / "opencode.json"
+    private_config.parent.mkdir()
+    private_config.write_text("{}\n", encoding="utf-8")
+    popen_calls = []
+
+    class _Process:
+        pass
+
+    def record_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return _Process()
+
+    monkeypatch.setattr(opencode.subprocess, "Popen", record_popen)
+    backend = OpencodeBackend(
+        config=Config(
+            config_overrides={
+                "opencode_config": str(private_config),
+                "opencode_auth_env_var": "Z_AI_API_KEY",
+            },
+            toml={},
+        )
+    )
+
+    process = backend.invoke(
+        "prompt",
+        str(tmp_path / "logs" / "opencode"),
+        ["--dir", str(working_directory)],
+        key_ctx=KeyContext(key="fixture-key"),
+        working_directory=working_directory,
+    )
+    process._ar_err.close()
+
+    assert popen_calls[0][1]["cwd"] == working_directory
+    assert popen_calls[0][1]["env"]["OPENCODE_CONFIG"] == str(private_config)
+    assert popen_calls[0][1]["env"]["Z_AI_API_KEY"] == "fixture-key"
