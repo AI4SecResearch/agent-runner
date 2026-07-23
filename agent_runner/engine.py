@@ -141,8 +141,15 @@ class Runner:
 
     # ── process execution (pure orchestration, generic) ─────────────────────
 
-    def _agent_once(self, prompt: str, log_name: str, extra: list[str],
-                    key_ctx: KeyContext | None = None):
+    def _agent_once(
+        self,
+        prompt: str,
+        log_name: str,
+        extra: list[str],
+        key_ctx: KeyContext | None = None,
+        *,
+        working_directory: str | os.PathLike[str] | None = None,
+    ):
         """Assemble argv (perm + primary-model unless caller gave --model + pass-
         through) → backend.invoke(key_ctx=...)。Guarantees exactly one --model
         (caller overrides primary)。``key_ctx`` 透传给 invoke 构造隔离 env 快照;
@@ -161,11 +168,25 @@ class Runner:
             argv += backend.model_args("primary", resolved_model=resolved_model)
         argv += list(extra)
 
-        return backend.invoke(prompt, prefix, argv, key_ctx=key_ctx)
+        if working_directory is None:
+            return backend.invoke(prompt, prefix, argv, key_ctx=key_ctx)
+        return backend.invoke(
+            prompt,
+            prefix,
+            argv,
+            key_ctx=key_ctx,
+            working_directory=working_directory,
+        )
 
-    def _agent_once_with_watchdog(self, prompt: str, log_name: str,
-                                  extra: list[str],
-                                  key_ctx: KeyContext | None = None) -> tuple[int, int]:
+    def _agent_once_with_watchdog(
+        self,
+        prompt: str,
+        log_name: str,
+        extra: list[str],
+        key_ctx: KeyContext | None = None,
+        *,
+        working_directory: str | os.PathLike[str] | None = None,
+    ) -> tuple[int, int]:
         """后台启动 agent,reader 线程把 stdout 流式写入 jsonl,主线程轮询早退/
         超时,正常则等待、超时则杀。返回 (进程退出码, 看门狗状态):看门狗状态
         0=正常结束、1=超时被杀。
@@ -183,7 +204,13 @@ class Runner:
         max_timeout = self._config.get("total_timeout", 0)
         backend = self._get_backend()
 
-        proc = self._agent_once(prompt, log_name, extra, key_ctx)
+        proc = self._agent_once(
+            prompt,
+            log_name,
+            extra,
+            key_ctx,
+            working_directory=working_directory,
+        )
 
         # reader 线程:stdout → jsonl(阻塞至 stdout EOF,即进程退出——正常或被杀)。
         reader = threading.Thread(target=backend.stream, args=(proc, prefix), daemon=True)
@@ -247,9 +274,15 @@ class Runner:
 
     # ── 带检查的单次执行 ───────────────────────────────────────────────────
 
-    def _agent_once_with_check(self, prompt: str, log_name: str,
-                               extra: list[str],
-                               key_ctx: KeyContext | None = None) -> Result:
+    def _agent_once_with_check(
+        self,
+        prompt: str,
+        log_name: str,
+        extra: list[str],
+        key_ctx: KeyContext | None = None,
+        *,
+        working_directory: str | os.PathLike[str] | None = None,
+    ) -> Result:
         """看门狗 + 业务面结果检查。成功时返回带 session_id 与结果文本的 Result;
         失败(含超时被杀)返回 rc=1 的 Result。不碰密钥池——disable 由调用方决策
         (重试循环在循环顶部统一决策,单次执行不重复 disable)。
@@ -257,7 +290,13 @@ class Runner:
         session_id 与结果文本都从成功日志读回(单一真相,与后端是否流式无关)。"""
         output = self._config.get("run_dir", "")
         backend = self._get_backend()
-        _rc, wd = self._agent_once_with_watchdog(prompt, log_name, extra, key_ctx)
+        _rc, wd = self._agent_once_with_watchdog(
+            prompt,
+            log_name,
+            extra,
+            key_ctx,
+            working_directory=working_directory,
+        )
         if wd == 1:
             return Result(1)  # 超时被杀 → 视为可重试失败
         if self._check_agent_result(log_name):
@@ -287,9 +326,16 @@ class Runner:
 
     # ── 重试编排(反应式:每次失败决定一步) ────────────────────────────────────
 
-    def _agent_retry_loop(self, prompt: str, base_log: str, session_args: list[str],
-                          extra: list[str],
-                          key_ctx: KeyContext | None = None) -> Result:
+    def _agent_retry_loop(
+        self,
+        prompt: str,
+        base_log: str,
+        session_args: list[str],
+        extra: list[str],
+        key_ctx: KeyContext | None = None,
+        *,
+        working_directory: str | os.PathLike[str] | None = None,
+    ) -> Result:
         """共享的反应式重试循环。前置:调用方已 ``key_pool_init`` 并跑完一次失败的
         主试(日志 base_log)。``session_args`` 是主试所用的会话 flag(""=全新 /
         --resume S=续接 / --resume S --fork-session=分叉),仅在重跑分支按原样复用。
@@ -343,11 +389,23 @@ class Runner:
 
             if cont_resume:
                 # 续接:在主试已记录的 session 上"继续"(不再 fork、不重发 session_args)
-                res = self._agent_once_with_check("继续", name, cont_resume + model_args, key_ctx=key_ctx)
+                res = self._agent_once_with_check(
+                    "继续",
+                    name,
+                    cont_resume + model_args,
+                    key_ctx=key_ctx,
+                    working_directory=working_directory,
+                )
             else:
                 # 无 session 可接续 → 按主试原样重跑
                 # (new 重发 $prompt;resume 重接 S;fork 重新 fork 自 S)
-                res = self._agent_once_with_check(prompt, name, list(session_args) + model_args, key_ctx=key_ctx)
+                res = self._agent_once_with_check(
+                    prompt,
+                    name,
+                    list(session_args) + model_args,
+                    key_ctx=key_ctx,
+                    working_directory=working_directory,
+                )
 
             if res.rc == 0:
                 if model != "downgrade":
@@ -361,39 +419,98 @@ class Runner:
 
     # ── 公开入口(new / resume / fork)────────────────────────────────────────
 
-    def agent_with_retry_session_new(self, prompt: str, log_name: str, *extra: str) -> Result:
+    def agent_with_retry_session_new(
+        self,
+        prompt: str,
+        log_name: str,
+        *extra: str,
+        working_directory: str | os.PathLike[str] | None = None,
+    ) -> Result:
         """全新会话运行。返回 Result(rc=0 成功 / 1=均失败)。"""
         extra_list = list(extra)
         key_ctx = self._ensure_keypool().init()
-        res = self._agent_once_with_check(prompt, log_name, extra_list, key_ctx=key_ctx)
+        res = self._agent_once_with_check(
+            prompt,
+            log_name,
+            extra_list,
+            key_ctx=key_ctx,
+            working_directory=working_directory,
+        )
         if res.rc == 0:
             self._ensure_keypool().on_success()
             return res
-        return self._agent_retry_loop(prompt, log_name, [], extra_list, key_ctx=key_ctx)
+        return self._agent_retry_loop(
+            prompt,
+            log_name,
+            [],
+            extra_list,
+            key_ctx=key_ctx,
+            working_directory=working_directory,
+        )
 
-    def agent_with_retry_session_resume(self, prompt: str, log_name: str, sid: str, *extra: str) -> Result:
+    def agent_with_retry_session_resume(
+        self,
+        prompt: str,
+        log_name: str,
+        sid: str,
+        *extra: str,
+        working_directory: str | os.PathLike[str] | None = None,
+    ) -> Result:
         """在 session_id 上续接(resume:同一会话,积累上下文)。返回 Result(rc=0/1)。"""
         extra_list = list(extra)
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()
         session_args = backend.resume_args(sid)
-        res = self._agent_once_with_check(prompt, log_name, session_args + extra_list, key_ctx=key_ctx)
+        res = self._agent_once_with_check(
+            prompt,
+            log_name,
+            session_args + extra_list,
+            key_ctx=key_ctx,
+            working_directory=working_directory,
+        )
         if res.rc == 0:
             self._ensure_keypool().on_success()
             return res
-        return self._agent_retry_loop(prompt, log_name, session_args, extra_list, key_ctx=key_ctx)
+        return self._agent_retry_loop(
+            prompt,
+            log_name,
+            session_args,
+            extra_list,
+            key_ctx=key_ctx,
+            working_directory=working_directory,
+        )
 
-    def agent_with_retry_session_fork(self, prompt: str, log_name: str, sid: str, *extra: str) -> Result:
+    def agent_with_retry_session_fork(
+        self,
+        prompt: str,
+        log_name: str,
+        sid: str,
+        *extra: str,
+        working_directory: str | os.PathLike[str] | None = None,
+    ) -> Result:
         """从 session_id 分叉(fork:拷贝一份独立会话再跑)。返回 Result(rc=0/1)。"""
         extra_list = list(extra)
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()
         session_args = backend.fork_args(sid)
-        res = self._agent_once_with_check(prompt, log_name, session_args + extra_list, key_ctx=key_ctx)
+        res = self._agent_once_with_check(
+            prompt,
+            log_name,
+            session_args + extra_list,
+            key_ctx=key_ctx,
+            working_directory=working_directory,
+        )
         if res.rc == 0:
             self._ensure_keypool().on_success()
             return res
-        return self._agent_retry_loop(prompt, log_name, session_args, extra_list, key_ctx=key_ctx)
+        return self._agent_retry_loop(
+            prompt,
+            log_name,
+            session_args,
+            extra_list,
+            key_ctx=key_ctx,
+            working_directory=working_directory,
+        )
 
     def agent_once_session_resume(self, prompt: str, log_name: str, sid: str, *extra: str) -> Result:
         """单次续接(无重试循环)。运行一次,后端支持则续接已有 session(否则退化为

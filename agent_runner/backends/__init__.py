@@ -13,6 +13,7 @@ here + one ``REGISTRY`` entry; the engine never references a concrete agent.
 
 from __future__ import annotations
 
+import os
 from typing import Protocol
 
 from .claude_code import ClaudeCodeBackend
@@ -41,7 +42,15 @@ class Backend(Protocol):
         """Accept the owning Runner's ``Config`` (None → module default)."""
         ...
 
-    def invoke(self, prompt: str, prefix: str, argv: list[str], key_ctx=None):
+    def invoke(
+        self,
+        prompt: str,
+        prefix: str,
+        argv: list[str],
+        key_ctx=None,
+        *,
+        working_directory: str | os.PathLike[str] | None = None,
+    ):
         """Start one agent step. Opens <prefix>.err for the agent's stderr,
         builds an isolated subprocess env (extra env vars from ``key_ctx``:
         key/base_url → this backend's env-var names) and passes ``env=`` to
@@ -51,9 +60,11 @@ class Backend(Protocol):
         either waits or kills).
 
         ``key_ctx=None`` (no key pool) → ``Popen`` inherits ``os.environ`` as-is
-        (current behavior). Mirrors bash's ``_agent_once … &`` (backgrounded) —
-        the watchdog owns the process's lifecycle so it can kill on timeout.
-        Success is NOT judged from the returncode (see ``result_ok``)."""
+        (current behavior). ``working_directory`` maps only to that subprocess's
+        ``cwd``; ``None`` preserves the caller's current working directory.
+        Mirrors bash's ``_agent_once … &`` (backgrounded) — the watchdog owns the
+        process's lifecycle so it can kill on timeout. Success is NOT judged from
+        the returncode (see ``result_ok``)."""
         ...
 
     def stream(self, proc, prefix: str) -> None:

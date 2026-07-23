@@ -40,7 +40,15 @@ class OpencodeBackend:
         self._config = config
 
     # ── invoke (mirrors agent_backend_invoke) ─────────────────────────────
-    def invoke(self, prompt: str, prefix: str, argv: list[str], key_ctx=None):
+    def invoke(
+        self,
+        prompt: str,
+        prefix: str,
+        argv: list[str],
+        key_ctx=None,
+        *,
+        working_directory: str | os.PathLike[str] | None = None,
+    ):
         """Start ``opencode run <prompt> --format json``; open <prefix>.err for
         stderr; build an isolated subprocess env (extra env vars from
         ``key_ctx``: key → the opencode-auth env var) and pass ``env=`` to
@@ -56,6 +64,7 @@ class OpencodeBackend:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err, text=True,
             env=self._build_env(key_ctx),
+            cwd=working_directory,
             **PLATFORM.new_session_kwargs(),
         )
         proc._ar_err = err  # per-call; stream's finally closes it

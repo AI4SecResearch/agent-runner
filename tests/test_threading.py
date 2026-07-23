@@ -63,9 +63,18 @@ class ThreadBackend(ClaudeCodeBackend):
     def __init__(self, config=None):
         super().__init__(config=config)
         self.records: list[tuple] = []  # (thread_name, env, err_handle, proc)
+        self.working_directories: list[tuple[str, Path | None]] = []
         self._lock = threading.Lock()
 
-    def invoke(self, prompt, prefix, argv, key_ctx=None):
+    def invoke(
+        self,
+        prompt,
+        prefix,
+        argv,
+        key_ctx=None,
+        *,
+        working_directory=None,
+    ):
         env = self._build_env(key_ctx)  # 真实 subprocess env: {**os.environ, **extra_env} or None
         err_path = f"{prefix}.err"
         ensure_parent(err_path)
@@ -76,6 +85,9 @@ class ThreadBackend(ClaudeCodeBackend):
         proc._ar_err = err
         with self._lock:
             self.records.append((threading.current_thread().name, env, err, proc))
+            self.working_directories.append(
+                (threading.current_thread().name, working_directory)
+            )
         return proc
 
     def stream(self, proc, prefix):
@@ -182,6 +194,56 @@ def test_concurrent_threads_isolated_keys_and_env(monkeypatch):
     errs = [err for (_n, _e, err, _p) in backend.records]
     assert len({id(e) for e in errs}) == N, "err handles must be distinct objects"
     assert len({id(p) for (_n, _e, _er, p) in backend.records}) == N, "procs distinct"
+
+
+def test_concurrent_invocations_keep_distinct_working_directories(
+    tmp_path,
+    monkeypatch,
+):
+    backend = ThreadBackend()
+    key_pool = ThreadFakeKP()
+    monkeypatch.setattr(eng.Runner, "_get_backend", lambda self: backend)
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: key_pool)
+    original_process_directory = Path.cwd()
+    workspaces = [tmp_path / "workspace-a", tmp_path / "workspace-b"]
+    for workspace in workspaces:
+        workspace.mkdir()
+
+    runners = [
+        eng.Runner(
+            config_overrides={
+                "run_dir": str(tmp_path),
+                "stall_timeout": 5,
+                "total_timeout": 0,
+            },
+            discover_config_files=False,
+        )
+        for _ in workspaces
+    ]
+    results = {}
+
+    def worker(index):
+        results[index] = runners[index].agent_with_retry_session_new(
+            f"prompt-{index}",
+            f"working-directory-{index}",
+            working_directory=workspaces[index],
+        )
+
+    threads = [
+        threading.Thread(target=worker, args=(index,), name=f"cwd-{index}")
+        for index in range(len(workspaces))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert all(results[index].rc == 0 for index in range(len(workspaces)))
+    assert dict(backend.working_directories) == {
+        "cwd-0": workspaces[0],
+        "cwd-1": workspaces[1],
+    }
+    assert Path.cwd() == original_process_directory
 
 
 # ── ③ 模块级函数委托 thread-local 默认 Runner(每线程独立实例) ─────────────
