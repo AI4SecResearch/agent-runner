@@ -90,6 +90,21 @@ class OpencodeBackend:
             extra_env["OPENCODE_CONFIG_DIR"] = config_directory
             extra_env["HOME"] = private_root
             extra_env["XDG_CONFIG_HOME"] = private_root
+            host_home = Path(
+                os.environ.get("HOME") or Path.home()
+            )
+            extra_env["XDG_DATA_HOME"] = (
+                os.environ.get("XDG_DATA_HOME")
+                or str(host_home / ".local" / "share")
+            )
+            extra_env["XDG_STATE_HOME"] = (
+                os.environ.get("XDG_STATE_HOME")
+                or str(host_home / ".local" / "state")
+            )
+            extra_env["XDG_CACHE_HOME"] = (
+                os.environ.get("XDG_CACHE_HOME")
+                or str(host_home / ".cache")
+            )
             extra_env.update(
                 {
                     "OPENCODE_DISABLE_PROJECT_CONFIG": "1",

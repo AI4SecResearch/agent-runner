@@ -299,3 +299,49 @@ def test_opencode_without_private_config_keeps_legacy_environment(
     assert process_env is not None
     assert process_env["OPENCODE_PERMISSION"] == '{"*":"allow"}'
     assert process_env["Z_AI_API_KEY"] == "fixture-key"
+
+
+def test_private_config_roots_share_host_session_storage(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    host_home = tmp_path / "host-home"
+    monkeypatch.setenv("HOME", str(host_home))
+    for name in (
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    environments = []
+    for execution_id in ("execution-1", "execution-2"):
+        private_config = (
+            tmp_path
+            / execution_id
+            / "backend"
+            / "opencode"
+            / ".opencode"
+            / "opencode.json"
+        )
+        backend = OpencodeBackend(
+            config=Config(
+                config_overrides={
+                    "opencode_config": str(private_config),
+                },
+                toml={},
+            )
+        )
+        environments.append(backend._build_env(None))
+
+    first, second = environments
+    assert first is not None
+    assert second is not None
+    assert first["HOME"] != second["HOME"]
+    for name, expected in (
+        ("XDG_DATA_HOME", host_home / ".local" / "share"),
+        ("XDG_STATE_HOME", host_home / ".local" / "state"),
+        ("XDG_CACHE_HOME", host_home / ".cache"),
+    ):
+        assert first[name] == str(expected)
+        assert second[name] == str(expected)
