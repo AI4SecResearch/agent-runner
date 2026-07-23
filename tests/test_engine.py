@@ -23,8 +23,10 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
 import agent_runner.engine as eng  # noqa: E402
-from agent_runner.backends import claude_code  # noqa: E402
+from agent_runner.backends import claude_code, opencode  # noqa: E402
 from agent_runner.backends.claude_code import ClaudeCodeBackend  # noqa: E402
+from agent_runner.backends.opencode import OpencodeBackend  # noqa: E402
+from agent_runner.config import Config  # noqa: E402
 
 _REAL_GET_BACKEND = eng.Runner._get_backend
 
@@ -180,6 +182,57 @@ def test_private_process_integration_wraps_real_backend_spawn(
         "--permission-mode",
         "acceptEdits",
     ]
+
+
+@pytest.mark.parametrize("backend_kind", ["claude-code", "opencode"])
+def test_wrapper_failure_happens_before_diagnostic_fd_or_spawn(
+    tmp_path: Path,
+    monkeypatch,
+    backend_kind: str,
+) -> None:
+    popen_calls = []
+
+    def unexpected_popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        raise AssertionError("Popen must not run after wrapper failure")
+
+    class WrapperFailure(RuntimeError):
+        pass
+
+    def fail_wrapper(command):
+        del command
+        raise WrapperFailure("injected wrapper failure")
+
+    if backend_kind == "claude-code":
+        backend = ClaudeCodeBackend(
+            config=Config({"sandbox": False}, toml={})
+        )
+        monkeypatch.setattr(
+            claude_code.subprocess,
+            "Popen",
+            unexpected_popen,
+        )
+    else:
+        backend = OpencodeBackend(
+            config=Config({"sandbox": False}, toml={})
+        )
+        monkeypatch.setattr(
+            opencode.subprocess,
+            "Popen",
+            unexpected_popen,
+        )
+    prefix = tmp_path / "diagnostics" / backend_kind
+
+    with pytest.raises(WrapperFailure):
+        backend.invoke(
+            "prompt",
+            str(prefix),
+            [],
+            command_wrapper=fail_wrapper,
+        )
+
+    assert popen_calls == []
+    assert not Path(f"{prefix}.err").exists()
 
 
 def test_public_runner_constructor_signature_stays_exact() -> None:

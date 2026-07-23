@@ -78,11 +78,6 @@ class ClaudeCodeBackend:
         never clobber each other's err handle. ``key_ctx=None`` → inherits
         ``os.environ`` as-is.
         """
-        err_path = f"{prefix}.err"
-        # Ensure the output directory exists (defensive — callers normally
-        # create AR_RUN_DIR, but a missing parent shouldn't crash the run).
-        _ensure_parent(err_path)
-        err = _open_private_text(err_path)  # attached to proc; stream closes it
         from ..platform import PLATFORM
         cmd = [
             "claude", "-p", prompt,
@@ -91,6 +86,11 @@ class ClaudeCodeBackend:
         ]
         if command_wrapper is not None:
             cmd = command_wrapper(cmd)
+        err_path = f"{prefix}.err"
+        # Ensure the output directory exists (defensive — callers normally
+        # create AR_RUN_DIR, but a missing parent shouldn't crash the run).
+        _ensure_parent(err_path)
+        err = _open_private_text(err_path)  # attached to proc; stream closes it
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err, text=True,
             env=self._build_env(key_ctx),

@@ -64,13 +64,13 @@ class OpencodeBackend:
         (``proc._ar_err``), not the instance — concurrent invocations never
         clobber each other. Without private config or ``key_ctx``, the child
         inherits ``os.environ`` as-is."""
-        err_path = f"{prefix}.err"
-        _ensure_parent(err_path)  # defensive: callers normally create AR_RUN_DIR
-        err = _open_private_text(err_path)  # attached to proc; stream closes it
         from ..platform import PLATFORM
         cmd = ["opencode", "run", prompt, "--format", "json", *argv]
         if command_wrapper is not None:
             cmd = command_wrapper(cmd)
+        err_path = f"{prefix}.err"
+        _ensure_parent(err_path)  # defensive: callers normally create AR_RUN_DIR
+        err = _open_private_text(err_path)  # attached to proc; stream closes it
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err, text=True,
             env=self._build_env(key_ctx),
