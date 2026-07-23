@@ -11,6 +11,7 @@ right atoms. This isolates the orchestration from the subprocess mechanics.
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -22,7 +23,10 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
 import agent_runner.engine as eng  # noqa: E402
+from agent_runner.backends import claude_code  # noqa: E402
 from agent_runner.backends.claude_code import ClaudeCodeBackend  # noqa: E402
+
+_REAL_GET_BACKEND = eng.Runner._get_backend
 
 
 def write_jsonl(prefix: str, events: list[dict]):
@@ -120,6 +124,59 @@ class _FakeProc:
 
     def wait(self, timeout=None):
         return 0
+
+
+def test_private_process_integration_wraps_real_backend_spawn(
+    monkeypatch,
+) -> None:
+    popen_calls = []
+
+    def record_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return _FakeProc()
+
+    monkeypatch.setattr(eng.Runner, "_get_backend", _REAL_GET_BACKEND)
+    monkeypatch.setattr(claude_code.subprocess, "Popen", record_popen)
+    integration = eng._ProcessIntegration(
+        command_wrapper=lambda command: ["isolation-wrapper", *command]
+    )
+    runner = eng.Runner._with_process_integration(
+        {
+            "backend": "claude-code",
+            "run_dir": os.environ["AR_RUN_DIR"],
+            "sandbox": False,
+        },
+        discover_config_files=False,
+        provider_snapshot=None,
+        integration=integration,
+    )
+
+    runner._agent_once("prompt", "spawn", [])
+
+    assert popen_calls[0][0] == [
+        "isolation-wrapper",
+        "claude",
+        "-p",
+        "prompt",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "acceptEdits",
+    ]
+
+
+def test_public_runner_constructor_signature_stays_exact() -> None:
+    parameters = inspect.signature(eng.Runner.__init__).parameters
+
+    assert tuple(parameters) == (
+        "self",
+        "config_overrides",
+        "discover_config_files",
+    )
+    assert parameters["config_overrides"].default is None
+    assert parameters["discover_config_files"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["discover_config_files"].default is True
 
 
 # ── success on first try ──────────────────────────────────────────────────
