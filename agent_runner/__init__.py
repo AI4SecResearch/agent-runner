@@ -18,6 +18,11 @@
 供后续 resume/fork 续接)、``text``(成功尝试的结果文本)。``int(Result)``/
 ``bool(Result)`` 保留退出码习惯。
 
+显式 ``Runner`` 的 new/resume/fork 入口另接受 keyword-only
+``working_directory``、``cancellation``和``lifecycle_sink``。后两者使用本包
+自己的通用 Protocol；``Result.outcome``在不改变旧 ``rc`` 的前提下区分
+stall/attempt timeout、canceled、failed、quota_exhausted 与 succeeded。
+
 **多线程**:`Runner` 类封装一条独立编排链(持自己的 ``Config``/backend/``KeyPool``);
 模块级函数委托一个 thread-local 默认 ``Runner``,故老调用方零改动即可跨线程并发使用。
 多 Agent 微调/显式隔离场景用 ``Runner(config_overrides={...})`` —— 各实例配置全隔离

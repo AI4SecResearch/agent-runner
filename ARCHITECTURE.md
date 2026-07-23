@@ -19,9 +19,9 @@ classDiagram
         -_config: Config
         -_backend: Backend
         -_kp: KeyPool
-        +agent_with_retry_session_new(prompt, log_name, *extra, working_directory=None)
-        +agent_with_retry_session_resume(prompt, log_name, sid, *extra, working_directory=None)
-        +agent_with_retry_session_fork(prompt, log_name, sid, *extra, working_directory=None)
+        +agent_with_retry_session_new(prompt, log_name, *extra, working_directory=None, cancellation=None, lifecycle_sink=None)
+        +agent_with_retry_session_resume(prompt, log_name, sid, *extra, working_directory=None, cancellation=None, lifecycle_sink=None)
+        +agent_with_retry_session_fork(prompt, log_name, sid, *extra, working_directory=None, cancellation=None, lifecycle_sink=None)
         +agent_once_session_resume(prompt, log_name, sid, *extra)
         +agent_with_retry(prompt, log_name, *extra)
         -_agent_once_with_check(prompt, log_name, extra, key_ctx, working_directory=None)
@@ -105,6 +105,17 @@ classDiagram
         +rc
         +session_id
         +text
+        +outcome: RunOutcome
+    }
+
+    class CancellationSource {
+        <<interface>>
+        +is_cancellation_requested: bool
+    }
+
+    class LifecycleSink {
+        <<interface>>
+        +on_lifecycle_event(event)
     }
 
     %% ── ownership / composition ──
@@ -120,6 +131,8 @@ classDiagram
 
     %% ── dependency / data flow ──
     Runner ..> Result : returns
+    Runner ..> CancellationSource : polls
+    Runner ..> LifecycleSink : reports stable facts
     Runner ..> KeyContext : passes to backend.invoke()
     Runner ..> REGISTRY : resolves backend
     KeyPool ..> Config : reads model wish
@@ -138,7 +151,7 @@ The two concrete backends are shown as leaves to emphasize pluggability.
 
 ## Layered orchestration
 
-For each invocation the engine: (1) selects a key + provider config from the pool, (2) runs the agent in a backgrounded process group, (3) watches for early completion / stall / hard timeout (killing the whole tree on timeout), (4) on failure **reactively** classifies the error and applies one recovery step (disable bad key / rotate to next / downgrade model) then retries, re-classifying each new failure.
+For each invocation the engine: (1) checks cancellation, selects a key + provider config from the pool, then rechecks cancellation immediately before spawn, (2) runs the agent in a backgrounded process group, (3) watches for cancellation / early completion / stall / hard timeout (killing and reaping the whole tree on cancellation or timeout), (4) on failure **reactively** classifies the error and applies one recovery step (disable bad key / rotate to next / downgrade model), then rechecks cancellation before dispatching a retry. The legacy `Result.rc` remains `0/1/2`; `Result.outcome` preserves the stable reason (`stall_timeout`, `attempt_timeout`, `canceled`, and so on).
 
 **Layers (each adds one capability):**
 

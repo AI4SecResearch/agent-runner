@@ -1,6 +1,6 @@
 # agent-runner (Python)
 
-一个可靠的 agent-CLI 执行层 —— 具备 **watchdog 超时、带模型降级的反应式重试、多 provider 密钥池轮换、会话复用** —— 以 **Python 库** 与 **进程**（`python -m` 或薄 `.sh` 封装）两种形态提供，既可充当 bash 流水线的"高可靠 agent"父进程，也可作为依赖嵌入 Python 代码库。项目独立、跨平台(POSIX)、无运行时依赖 bash 或 `jq`；内置的 `llm-provider-manager`（lpm）位于 `llm-provider-manager/`。实现与并发设计见 **[ARCHITECTURE.md](ARCHITECTURE.md)**。
+一个可靠的 agent-CLI 执行层 —— 具备 **watchdog 超时、主动取消、稳定生命周期 hook、带模型降级的反应式重试、多 provider 密钥池轮换、会话复用** —— 以 **Python 库** 与 **进程**（`python -m` 或薄 `.sh` 封装）两种形态提供，既可充当 bash 流水线的"高可靠 agent"父进程，也可作为依赖嵌入 Python 代码库。项目独立、跨平台(POSIX)、无运行时依赖 bash 或 `jq`；内置的 `llm-provider-manager`（lpm）位于 `llm-provider-manager/`。实现与并发设计见 **[ARCHITECTURE.md](ARCHITECTURE.md)**。
 
 ## 两种调用形态
 
@@ -52,6 +52,35 @@ res = r_claude.agent_with_retry_session_new(
 keyword-only 参数，并逐次透传到所有内部重试的`Popen(cwd=...)`。默认`None`
 保持既有调用行为；Runner 不调用进程级`os.chdir()`，因此不同线程可以安全使用
 不同工作目录。目录存在性和授权范围仍由嵌入方负责。
+
+### 主动取消、生命周期 hook 与 typed outcome
+
+显式 `Runner` 的 new/resume/fork 入口还接受 keyword-only
+`cancellation`和`lifecycle_sink`。`CancellationSource`只读报告是否请求
+取消；`LifecycleSink`接收不含 prompt、Key 或 backend 原始 payload 的
+`LifecycleEvent`。Runner 报告首次 backend 启动、带正整数 `retry_index`的
+内部 retry、取消请求、attempt/stall timeout 与最终事实。sink 抛出的普通异常
+只写安全 stderr 诊断，不改变执行结果。
+
+```python
+from agent_runner import RunOutcome, Runner
+
+result = Runner(config_overrides={...}).agent_with_retry_session_new(
+    "执行任务",
+    "run",
+    cancellation=cancellation_source,
+    lifecycle_sink=lifecycle_sink,
+)
+if result.outcome is RunOutcome.CANCELED:
+    ...
+```
+
+`Result.rc`继续保持旧进程契约（`0/1/2`）；`Result.outcome`额外区分
+`succeeded`、`failed`、`quota_exhausted`、`stall_timeout`、
+`attempt_timeout`和`canceled`。取消只在复用平台 `kill_tree()`终止整个
+进程组、回收 leader 且 reader 已结束后返回；观察到取消后不再派发内部 retry。
+可靠主动取消要求 `PLATFORM.supports_process_tree_kill=True`；当前 POSIX 实现
+支持，Windows stub 明确报告不支持。
 
 隔离的实现机制(`KeyContext` 纯值透传、`Popen(env=...)` 隔离快照、per-call err 句柄脱单例、线程安全 ⟹ 进程安全的推理)见 [ARCHITECTURE.md § Concurrency model](ARCHITECTURE.md#concurrency-model-multi-threaded)。`tests/test_threading.py` 端到端验证了这些保证。
 
@@ -109,6 +138,9 @@ python -m pytest -q
 - `test_engine.py` —— watchdog 早退、反应式重试、续接 vs 重跑分支、退出码(mock backend,不起真 agent)。
 - `test_working_directory.py` —— new/resume/fork逐调用工作目录透传、两种 backend 的`Popen(cwd=...)`映射，以及内部重试保持同一目录。
 - `test_platform.py` —— POSIX 进程组拉起 + 树杀契约。
+- `test_cancellation.py` —— 启动前/运行中取消、无 retry、typed timeout、
+  真实 POSIX 进程组回收和晚到写入阻止。
+- `test_lifecycle_hooks.py` —— 稳定 hook 顺序、retry_index 与 sink 故障隔离。
 - `test_cli.py` —— `python -m agent_runner` 派发、参数顺序、退出码映射。
 - `test_threading.py` —— 多线程隔离:per-thread key/子进程 env 隔离、err 句柄脱单例、thread-local 默认 `Runner`、`Runner(config_overrides=...)` 配置隔离。
 
@@ -124,6 +156,7 @@ agent-runner/
 │   ├── __init__.py              # 公开 API(库形态)
 │   ├── __main__.py              # `python -m agent_runner`(进程形态)
 │   ├── engine.py                # 编排(Runner)
+│   ├── hooks.py                 # cancellation/lifecycle Protocol 与事件
 │   ├── config.py                # Config(per-实例配置视图)
 │   ├── platform.py              # 跨平台进程树抽象
 │   ├── keypool.py               # KeyPool 包装 + KeyContext

@@ -67,6 +67,8 @@ class Result:
                    ``.part.text``) from the successful attempt. Captured only so
                    library callers can read it without re-parsing the jsonl;
                    the process mode does NOT print it to stdout.
+      outcome:     typed stable outcome. It preserves timeout and cancellation
+                   distinctions without changing ``rc``.
 
     ``__int__``/``__bool__`` keep exit-code idioms working (``int(res)`` for the
     CLI; ``if res:`` for success)."""
@@ -224,8 +226,8 @@ class Runner:
         lifecycle_sink: LifecycleSink | None = None,
     ) -> tuple[int, RunOutcome]:
         """后台启动 agent,reader 线程把 stdout 流式写入 jsonl,主线程轮询早退/
-        超时,正常则等待、超时则杀。返回 (进程退出码, 看门狗状态):看门狗状态
-        0=正常结束、1=超时被杀。
+        超时/取消,正常则等待、超时或取消则复用平台树杀并回收。返回
+        (进程退出码, typed ``RunOutcome``)。
 
         reader 线程只把 stdout 逐行写入 <prefix>.jsonl(结果行一落地,is_complete
         即可见);**不**打印到 stdout——stdout 留给进程形态的 session_id 行,结果
