@@ -537,6 +537,12 @@ class Runner:
                 emit_cancel_requested=True,
             )
         key_ctx = self._ensure_keypool().init()
+        if _is_canceled(cancellation):
+            return _finish_result(
+                Result.canceled(),
+                lifecycle_sink,
+                emit_cancel_requested=True,
+            )
         _emit_lifecycle(lifecycle_sink, LifecycleEventType.BACKEND_STARTED)
         res = self._agent_once_with_check(
             prompt,
@@ -585,6 +591,12 @@ class Runner:
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()
         session_args = backend.resume_args(sid)
+        if _is_canceled(cancellation):
+            return _finish_result(
+                Result.canceled(),
+                lifecycle_sink,
+                emit_cancel_requested=True,
+            )
         _emit_lifecycle(lifecycle_sink, LifecycleEventType.BACKEND_STARTED)
         res = self._agent_once_with_check(
             prompt,
@@ -633,6 +645,12 @@ class Runner:
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()
         session_args = backend.fork_args(sid)
+        if _is_canceled(cancellation):
+            return _finish_result(
+                Result.canceled(),
+                lifecycle_sink,
+                emit_cancel_requested=True,
+            )
         _emit_lifecycle(lifecycle_sink, LifecycleEventType.BACKEND_STARTED)
         res = self._agent_once_with_check(
             prompt,

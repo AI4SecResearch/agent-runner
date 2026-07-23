@@ -162,6 +162,45 @@ def test_cancellation_before_start_does_not_spawn(
     assert result == Result.canceled()
 
 
+def test_cancellation_observed_after_key_selection_does_not_spawn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cancellation = _Cancellation()
+    runner = Runner(
+        config_overrides={
+            "backend": "claude-code",
+            "run_dir": str(tmp_path),
+        },
+        discover_config_files=False,
+    )
+
+    class _CancelingKeyPool(_KeyPool):
+        def init(self) -> None:
+            cancellation.requested = True
+            return None
+
+    monkeypatch.setattr(
+        runner,
+        "_ensure_keypool",
+        lambda: _CancelingKeyPool(),
+    )
+
+    def fail_spawn(*args: object, **kwargs: object) -> Result:
+        del args, kwargs
+        raise AssertionError("backend must not spawn after cancellation")
+
+    monkeypatch.setattr(runner, "_agent_once_with_check", fail_spawn)
+
+    result = runner.agent_with_retry_session_new(
+        "prompt",
+        "run",
+        cancellation=cancellation,
+    )
+
+    assert result.outcome is RunOutcome.CANCELED
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group proof")
 def test_running_cancellation_kills_group_and_reaps_before_return(
     tmp_path: Path,
