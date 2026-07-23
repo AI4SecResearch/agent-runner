@@ -67,9 +67,12 @@ class _ProcessBackend:
         del prompt, prefix, argv, key_ctx
         parent_pid_path = self.directory / "parent.pid"
         child_pid_path = self.directory / "child.pid"
+        late_success_path = self.directory / "late-success.txt"
         child_code = (
             "import os,time,pathlib;"
             f"pathlib.Path({str(child_pid_path)!r}).write_text(str(os.getpid()));"
+            "time.sleep(0.5);"
+            f"pathlib.Path({str(late_success_path)!r}).write_text('late success');"
             "time.sleep(30)"
         )
         code = (
@@ -211,6 +214,8 @@ def test_running_cancellation_kills_group_and_reaps_before_return(
         os.killpg(parent_pgid, 0)
     with pytest.raises(ChildProcessError):
         os.waitpid(parent_pid, os.WNOHANG)
+    time.sleep(0.6)
+    assert not (tmp_path / "late-success.txt").exists()
 
 
 def test_cancellation_after_failed_attempt_prevents_retry(
