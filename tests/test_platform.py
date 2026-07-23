@@ -27,6 +27,11 @@ def test_posix_selected_on_unix():
     if sys.platform == "win32":
         pytest.skip("POSIX-only check")
     assert isinstance(platform.PLATFORM, platform._PosixPlatform)
+    assert platform.PLATFORM.supports_process_tree_kill is True
+
+
+def test_windows_reports_process_tree_kill_is_not_supported():
+    assert platform._WindowsPlatform().supports_process_tree_kill is False
 
 
 def test_new_session_kwargs_is_a_separate_group():

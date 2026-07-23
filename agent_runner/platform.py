@@ -23,6 +23,10 @@ import sys
 class Platform:
     """Abstract platform API for process-tree lifecycle management."""
 
+    @property
+    def supports_process_tree_kill(self) -> bool:
+        raise NotImplementedError
+
     def new_session_kwargs(self) -> dict:
         """``subprocess.Popen`` kwargs that put the child in an independently-
         killable group (so the watchdog can tear down the whole tree on
@@ -36,6 +40,10 @@ class Platform:
 
 
 class _PosixPlatform(Platform):
+    @property
+    def supports_process_tree_kill(self) -> bool:
+        return True
+
     def new_session_kwargs(self) -> dict:
         # start_new_session=True → setsid() in the child, making it a new
         # session/group leader; killpg on its pid hits the whole tree.
@@ -59,6 +67,10 @@ class _WindowsPlatform(Platform):
     # approach is CREATE_NEW_PROCESS_GROUP on spawn + taskkill /T /F /PID
     # (or a Win32 Job Object) for tree kill. Surfacing a clear error here
     # is better than silent Unix semantics on Windows.
+    @property
+    def supports_process_tree_kill(self) -> bool:
+        return False
+
     def new_session_kwargs(self) -> dict:
         raise NotImplementedError(
             "agent-runner watchdog process-group kill is not yet "

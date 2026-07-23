@@ -25,17 +25,34 @@ keypool 的 ``init``/``rotate``/``on_success`` 返回纯 ``KeyContext``(不写
 from __future__ import annotations
 
 import os
-import signal
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 
 from . import config as _config_mod
 from .backends import REGISTRY, get_backend
+from .hooks import (
+    CancellationSource,
+    LifecycleEvent,
+    LifecycleEventType,
+    LifecycleSink,
+)
 from .keypool import KeyContext, KeyPool
+
+_WATCHDOG_POLL_SECONDS = 10
 
 
 # ── structured run outcome ────────────────────────────────────────────────
+class RunOutcome(str, Enum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    STALL_TIMEOUT = "stall_timeout"
+    ATTEMPT_TIMEOUT = "attempt_timeout"
+    CANCELED = "canceled"
+
+
 @dataclass
 class Result:
     """The outcome of one public agent invocation.
@@ -56,6 +73,23 @@ class Result:
     rc: int
     session_id: str = ""
     text: str = ""
+    outcome: RunOutcome | None = None
+
+    def __post_init__(self) -> None:
+        if self.outcome is None:
+            self.outcome = (
+                RunOutcome.SUCCEEDED
+                if self.rc == 0
+                else (
+                    RunOutcome.QUOTA_EXHAUSTED
+                    if self.rc == 2
+                    else RunOutcome.FAILED
+                )
+            )
+
+    @classmethod
+    def canceled(cls) -> Result:
+        return cls(1, outcome=RunOutcome.CANCELED)
 
     def __int__(self) -> int:
         return self.rc
@@ -186,7 +220,9 @@ class Runner:
         key_ctx: KeyContext | None = None,
         *,
         working_directory: str | os.PathLike[str] | None = None,
-    ) -> tuple[int, int]:
+        cancellation: CancellationSource | None = None,
+        lifecycle_sink: LifecycleSink | None = None,
+    ) -> tuple[int, RunOutcome]:
         """后台启动 agent,reader 线程把 stdout 流式写入 jsonl,主线程轮询早退/
         超时,正常则等待、超时则杀。返回 (进程退出码, 看门狗状态):看门狗状态
         0=正常结束、1=超时被杀。
@@ -219,12 +255,23 @@ class Runner:
         start = time.time()
         last_size = 0
         last_growth = start
-        timed_out = False
+        watchdog_outcome = RunOutcome.SUCCEEDED
         timeout_reason = ""
 
         while proc.poll() is None:
             now = time.time()
             elapsed = now - start
+
+            if (
+                cancellation is not None
+                and cancellation.is_cancellation_requested
+            ):
+                watchdog_outcome = RunOutcome.CANCELED
+                _emit_lifecycle(
+                    lifecycle_sink,
+                    LifecycleEventType.CANCEL_REQUESTED,
+                )
+                break
 
             # agent emitted its final result → early exit (don't wait for teardown)
             if backend.is_complete(prefix):
@@ -232,7 +279,7 @@ class Runner:
 
             # total hard timeout
             if max_timeout > 0 and elapsed >= max_timeout:
-                timed_out = True
+                watchdog_outcome = RunOutcome.ATTEMPT_TIMEOUT
                 timeout_reason = f"总超时 {int(elapsed)}s >= {max_timeout}s"
                 break
 
@@ -247,24 +294,40 @@ class Runner:
 
             stall_elapsed = now - last_growth
             if stall_timeout > 0 and stall_elapsed >= stall_timeout:
-                timed_out = True
+                watchdog_outcome = RunOutcome.STALL_TIMEOUT
                 timeout_reason = f"无进展 {int(stall_elapsed)}s >= {stall_timeout}s"
                 break
 
-            time.sleep(10)
+            time.sleep(_WATCHDOG_POLL_SECONDS)
 
-        if timed_out:
+        if watchdog_outcome is not RunOutcome.SUCCEEDED:
             # Kill the whole process group (agent + its children) — the Popen
             # used start_new_session=True so the agent is its own group leader;
             # -SIGKILL the group, then reap.
             self._kill_process_group(proc)
+            if proc.poll() is None:
+                raise RuntimeError(
+                    "watchdog process leader was not reaped after kill_tree"
+                )
             reader.join(timeout=5)
+            if reader.is_alive():
+                raise RuntimeError("watchdog reader did not finish after process reap")
+            if watchdog_outcome is RunOutcome.CANCELED:
+                return proc.returncode or 0, watchdog_outcome
+            _emit_lifecycle(
+                lifecycle_sink,
+                (
+                    LifecycleEventType.STALL_TIMEOUT
+                    if watchdog_outcome is RunOutcome.STALL_TIMEOUT
+                    else LifecycleEventType.ATTEMPT_TIMEOUT
+                ),
+            )
             sys_stderr_write(f"          ⚠️ 超时({timeout_reason}): {log_name}\n")
-            return proc.returncode or 0, 1
+            return proc.returncode or 0, watchdog_outcome
 
         # normal: wait for the reader to finish draining stdout
         reader.join()
-        return proc.returncode or 0, 0
+        return proc.returncode or 0, RunOutcome.SUCCEEDED
 
     def _kill_process_group(self, proc) -> None:
         """Kill the agent's process tree via the platform abstraction (POSIX:
@@ -282,6 +345,8 @@ class Runner:
         key_ctx: KeyContext | None = None,
         *,
         working_directory: str | os.PathLike[str] | None = None,
+        cancellation: CancellationSource | None = None,
+        lifecycle_sink: LifecycleSink | None = None,
     ) -> Result:
         """看门狗 + 业务面结果检查。成功时返回带 session_id 与结果文本的 Result;
         失败(含超时被杀)返回 rc=1 的 Result。不碰密钥池——disable 由调用方决策
@@ -290,15 +355,17 @@ class Runner:
         session_id 与结果文本都从成功日志读回(单一真相,与后端是否流式无关)。"""
         output = self._config.get("run_dir", "")
         backend = self._get_backend()
-        _rc, wd = self._agent_once_with_watchdog(
+        _rc, watchdog_outcome = self._agent_once_with_watchdog(
             prompt,
             log_name,
             extra,
             key_ctx,
             working_directory=working_directory,
+            cancellation=cancellation,
+            lifecycle_sink=lifecycle_sink,
         )
-        if wd == 1:
-            return Result(1)  # 超时被杀 → 视为可重试失败
+        if watchdog_outcome is not RunOutcome.SUCCEEDED:
+            return Result(1, outcome=watchdog_outcome)
         if self._check_agent_result(log_name):
             prefix = f"{output}/{log_name}"
             sid = backend.session_id(prefix)
@@ -335,6 +402,9 @@ class Runner:
         key_ctx: KeyContext | None = None,
         *,
         working_directory: str | os.PathLike[str] | None = None,
+        cancellation: CancellationSource | None = None,
+        lifecycle_sink: LifecycleSink | None = None,
+        last_result: Result | None = None,
     ) -> Result:
         """共享的反应式重试循环。前置:调用方已 ``key_pool_init`` 并跑完一次失败的
         主试(日志 base_log)。``session_args`` 是主试所用的会话 flag(""=全新 /
@@ -363,11 +433,20 @@ class Runner:
         cur_log = base_log  # 最近一次失败的日志(react 读它)
 
         while attempt < max_attempts:
+            if (
+                cancellation is not None
+                and cancellation.is_cancellation_requested
+            ):
+                _emit_lifecycle(
+                    lifecycle_sink,
+                    LifecycleEventType.CANCEL_REQUESTED,
+                )
+                return Result.canceled()
             text = backend.result_text(f"{output}/{cur_log}")
             step = kp.react(text)
             if step == "stop":
                 sys_stderr_write(f"          ⚠️ 资源耗尽（无可用 key/模型）: {cur_log}\n")
-                return Result(1)
+                return last_result if last_result is not None else Result(1)
 
             # 执行策略里的原子
             atoms = f",{step},".split(",")
@@ -379,6 +458,11 @@ class Runner:
             model = "downgrade" if "downgrade" in atoms else "primary"
 
             attempt += 1
+            _emit_lifecycle(
+                lifecycle_sink,
+                LifecycleEventType.INTERNAL_RETRY_STARTED,
+                retry_index=attempt,
+            )
             name = f"{base_log}-r{attempt}"
             resolved_model = (key_ctx.downgrade_model if model == "downgrade"
                               else key_ctx.primary_model) if key_ctx else ""
@@ -398,6 +482,8 @@ class Runner:
                     cont_resume + retry_extra,
                     key_ctx=key_ctx,
                     working_directory=working_directory,
+                    cancellation=cancellation,
+                    lifecycle_sink=lifecycle_sink,
                 )
             else:
                 # 无 session 可接续 → 按主试原样重跑
@@ -408,17 +494,22 @@ class Runner:
                     list(session_args) + retry_extra,
                     key_ctx=key_ctx,
                     working_directory=working_directory,
+                    cancellation=cancellation,
+                    lifecycle_sink=lifecycle_sink,
                 )
 
             if res.rc == 0:
                 if model != "downgrade":
                     kp.on_success()
                 return res  # 带这次成功重试的 session_id + 结果文本
+            if res.outcome is RunOutcome.CANCELED:
+                return res
+            last_result = res
             # 失败 → 下次循环 react 读这次重试的日志
             cur_log = name
 
         sys_stderr_write(f"          ⚠️ 重试次数达上限 ({max_attempts}): {base_log}\n")
-        return Result(1)
+        return last_result if last_result is not None else Result(1)
 
     # ── 公开入口(new / resume / fork)────────────────────────────────────────
 
@@ -428,28 +519,44 @@ class Runner:
         log_name: str,
         *extra: str,
         working_directory: str | os.PathLike[str] | None = None,
+        cancellation: CancellationSource | None = None,
+        lifecycle_sink: LifecycleSink | None = None,
     ) -> Result:
         """全新会话运行。返回 Result(rc=0 成功 / 1=均失败)。"""
         extra_list = list(extra)
+        if _is_canceled(cancellation):
+            return _finish_result(
+                Result.canceled(),
+                lifecycle_sink,
+                emit_cancel_requested=True,
+            )
         key_ctx = self._ensure_keypool().init()
+        _emit_lifecycle(lifecycle_sink, LifecycleEventType.BACKEND_STARTED)
         res = self._agent_once_with_check(
             prompt,
             log_name,
             extra_list,
             key_ctx=key_ctx,
             working_directory=working_directory,
+            cancellation=cancellation,
+            lifecycle_sink=lifecycle_sink,
         )
         if res.rc == 0:
             self._ensure_keypool().on_success()
-            return res
-        return self._agent_retry_loop(
+            return _finish_result(res, lifecycle_sink)
+        if res.outcome is RunOutcome.CANCELED:
+            return _finish_result(res, lifecycle_sink)
+        return _finish_result(self._agent_retry_loop(
             prompt,
             log_name,
             [],
             extra_list,
             key_ctx=key_ctx,
             working_directory=working_directory,
-        )
+            cancellation=cancellation,
+            lifecycle_sink=lifecycle_sink,
+            last_result=res,
+        ), lifecycle_sink)
 
     def agent_with_retry_session_resume(
         self,
@@ -458,30 +565,46 @@ class Runner:
         sid: str,
         *extra: str,
         working_directory: str | os.PathLike[str] | None = None,
+        cancellation: CancellationSource | None = None,
+        lifecycle_sink: LifecycleSink | None = None,
     ) -> Result:
         """在 session_id 上续接(resume:同一会话,积累上下文)。返回 Result(rc=0/1)。"""
         extra_list = list(extra)
+        if _is_canceled(cancellation):
+            return _finish_result(
+                Result.canceled(),
+                lifecycle_sink,
+                emit_cancel_requested=True,
+            )
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()
         session_args = backend.resume_args(sid)
+        _emit_lifecycle(lifecycle_sink, LifecycleEventType.BACKEND_STARTED)
         res = self._agent_once_with_check(
             prompt,
             log_name,
             session_args + extra_list,
             key_ctx=key_ctx,
             working_directory=working_directory,
+            cancellation=cancellation,
+            lifecycle_sink=lifecycle_sink,
         )
         if res.rc == 0:
             self._ensure_keypool().on_success()
-            return res
-        return self._agent_retry_loop(
+            return _finish_result(res, lifecycle_sink)
+        if res.outcome is RunOutcome.CANCELED:
+            return _finish_result(res, lifecycle_sink)
+        return _finish_result(self._agent_retry_loop(
             prompt,
             log_name,
             session_args,
             extra_list,
             key_ctx=key_ctx,
             working_directory=working_directory,
-        )
+            cancellation=cancellation,
+            lifecycle_sink=lifecycle_sink,
+            last_result=res,
+        ), lifecycle_sink)
 
     def agent_with_retry_session_fork(
         self,
@@ -490,30 +613,46 @@ class Runner:
         sid: str,
         *extra: str,
         working_directory: str | os.PathLike[str] | None = None,
+        cancellation: CancellationSource | None = None,
+        lifecycle_sink: LifecycleSink | None = None,
     ) -> Result:
         """从 session_id 分叉(fork:拷贝一份独立会话再跑)。返回 Result(rc=0/1)。"""
         extra_list = list(extra)
+        if _is_canceled(cancellation):
+            return _finish_result(
+                Result.canceled(),
+                lifecycle_sink,
+                emit_cancel_requested=True,
+            )
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()
         session_args = backend.fork_args(sid)
+        _emit_lifecycle(lifecycle_sink, LifecycleEventType.BACKEND_STARTED)
         res = self._agent_once_with_check(
             prompt,
             log_name,
             session_args + extra_list,
             key_ctx=key_ctx,
             working_directory=working_directory,
+            cancellation=cancellation,
+            lifecycle_sink=lifecycle_sink,
         )
         if res.rc == 0:
             self._ensure_keypool().on_success()
-            return res
-        return self._agent_retry_loop(
+            return _finish_result(res, lifecycle_sink)
+        if res.outcome is RunOutcome.CANCELED:
+            return _finish_result(res, lifecycle_sink)
+        return _finish_result(self._agent_retry_loop(
             prompt,
             log_name,
             session_args,
             extra_list,
             key_ctx=key_ctx,
             working_directory=working_directory,
-        )
+            cancellation=cancellation,
+            lifecycle_sink=lifecycle_sink,
+            last_result=res,
+        ), lifecycle_sink)
 
     def agent_once_session_resume(self, prompt: str, log_name: str, sid: str, *extra: str) -> Result:
         """单次续接(无重试循环)。运行一次,后端支持则续接已有 session(否则退化为
@@ -597,3 +736,44 @@ def sys_stderr_write(s: str) -> None:
     import sys
     sys.stderr.write(s)
     sys.stderr.flush()
+
+
+def _is_canceled(cancellation: CancellationSource | None) -> bool:
+    return (
+        cancellation is not None
+        and cancellation.is_cancellation_requested
+    )
+
+
+def _emit_lifecycle(
+    sink: LifecycleSink | None,
+    event_type: LifecycleEventType,
+    *,
+    retry_index: int | None = None,
+) -> None:
+    if sink is None:
+        return
+    try:
+        sink.on_lifecycle_event(
+            LifecycleEvent(type=event_type, retry_index=retry_index)
+        )
+    except Exception:
+        sys_stderr_write(
+            f"agent_runner: lifecycle sink failed for {event_type.value}\n"
+        )
+
+
+def _finish_result(
+    result: Result,
+    sink: LifecycleSink | None,
+    *,
+    emit_cancel_requested: bool = False,
+) -> Result:
+    if emit_cancel_requested:
+        _emit_lifecycle(sink, LifecycleEventType.CANCEL_REQUESTED)
+    terminal_type = {
+        RunOutcome.SUCCEEDED: LifecycleEventType.SUCCEEDED,
+        RunOutcome.CANCELED: LifecycleEventType.CANCELED,
+    }.get(result.outcome, LifecycleEventType.FAILED)
+    _emit_lifecycle(sink, terminal_type)
+    return result

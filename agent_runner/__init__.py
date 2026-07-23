@@ -50,16 +50,28 @@
 
 from .engine import (
     Result,
+    RunOutcome,
     Runner,
     agent_with_retry,
     agent_with_retry_session_fork,
     agent_with_retry_session_new,
     agent_with_retry_session_resume,
 )
+from .hooks import (
+    CancellationSource,
+    LifecycleEvent,
+    LifecycleEventType,
+    LifecycleSink,
+)
 
 __all__ = [
     "Result",
+    "RunOutcome",
     "Runner",
+    "CancellationSource",
+    "LifecycleEvent",
+    "LifecycleEventType",
+    "LifecycleSink",
     "agent_with_retry",
     "agent_with_retry_session_new",
     "agent_with_retry_session_resume",
