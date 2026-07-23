@@ -97,9 +97,17 @@ def load(
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise OSError(f"{p}: provider config is not a regular file")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
-            descriptor = -1
-            text = stream.read()
+        if file_descriptor is not None and hasattr(os, "pread"):
+            offset = 0
+            content = bytearray()
+            while chunk := os.pread(descriptor, 64 * 1024, offset):
+                content.extend(chunk)
+                offset += len(chunk)
+            text = bytes(content).decode("utf-8")
+        else:
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                descriptor = -1
+                text = stream.read()
     finally:
         if descriptor >= 0:
             os.close(descriptor)

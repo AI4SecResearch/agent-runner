@@ -4,9 +4,11 @@ import io
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from llm_provider_manager import config as lpm_config
 
 from agent_runner.backends.claude_code import ClaudeCodeBackend
 from agent_runner.config import Config
@@ -275,3 +277,52 @@ def test_runner_uses_held_provider_descriptor_for_real_child_spawn(
 
     assert result.rc == 0
     assert capture_path.read_text(encoding="utf-8") == original_key
+
+
+def test_held_provider_descriptor_can_be_loaded_concurrently_without_offset_race(
+    tmp_path: Path,
+) -> None:
+    provider_path = tmp_path / "providers.jsonc"
+    text = json.dumps(
+        {
+            "providers": [
+                {
+                    "id": "provider-a",
+                    "type": "symmetric",
+                    "baseURLs": {
+                        "anthropic": "https://example.test/anthropic",
+                    },
+                    "keys": [{"id": "key-a", "key": "selected-key"}],
+                    "models": [
+                        {
+                            "id": "model-a",
+                            "context": 4096,
+                            "output": 1024,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    provider_path.write_text(text, encoding="utf-8")
+    descriptor = os.open(provider_path, os.O_RDONLY)
+    expected_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    try:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            catalogs = list(
+                executor.map(
+                    lambda _: lpm_config.load(
+                        provider_path,
+                        file_descriptor=descriptor,
+                        expected_sha256=expected_sha256,
+                    ),
+                    range(16),
+                )
+            )
+    finally:
+        os.close(descriptor)
+
+    assert {
+        catalog.providers[0].keys[0].key
+        for catalog in catalogs
+    } == {"selected-key"}
