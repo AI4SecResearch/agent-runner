@@ -268,6 +268,7 @@ class OpencodeAgent:
         *,
         selection: "UsePlan | None" = None,
         api_key_reference: str | None = None,
+        required_protocol: str | None = None,
     ) -> tuple[dict[str, dict], list[str]]:
         """Render canonical provider entries without writing a config file.
 
@@ -275,6 +276,8 @@ class OpencodeAgent:
         one child-process-only environment variable while reusing the same
         provider/model renderer as the CLI. It is mutually exclusive with an
         inline ``selection``, whose exports may contain real key values.
+        ``required_protocol`` restricts embedded consumers to one backend
+        protocol without reconstructing the canonical provider schema.
         """
         if selection is not None and api_key_reference is not None:
             raise ValueError(
@@ -293,11 +296,25 @@ class OpencodeAgent:
 
         for prov in config.providers:
             protocol = self._preferred_protocol(prov)
+            if required_protocol is not None:
+                protocol = (
+                    required_protocol
+                    if prov.usable_for(required_protocol)
+                    else None
+                )
             if protocol is None:
                 skipped.append(prov.id)
                 continue
+            usable_keys = [
+                key
+                for key in prov.keys
+                if not key.is_blacklisted_for("opencode")
+            ]
+            if not usable_keys:
+                skipped.append(prov.id)
+                continue
             if self._needs_per_key_entries(prov):
-                for k in prov.keys:
+                for k in usable_keys:
                     var = key_var(prov.id, k.id)
                     value = (
                         api_key_reference

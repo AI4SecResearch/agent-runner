@@ -12,19 +12,30 @@ protocol key determines which agents can consume it:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Literal
+import math
+from dataclasses import InitVar, dataclass, field
+from typing import Any, Literal
+
+from .providers import ATOMS
 
 ProviderType = Literal["symmetric", "asymmetric"]
 Protocol = str  # "anthropic" | "openai" | other
 
 KNOWN_PROTOCOLS = ("anthropic", "openai")
 
-# Recovery action vocabulary: composable atom strings defined in
-# providers/__init__.py (ATOMS = disable/rotate/downgrade). errorHandling values
-# in providers.jsonc are comma-joined atom strings, e.g. "disable,rotate".
-# The canonical default lives in providers.DEFAULT_ACTION (not here) so
-# the vocabulary has a single source next to the classify logic that consumes it.
+# Recovery action vocabulary is owned by providers/__init__.py. The schema
+# validates errorHandling against that canonical output contract.
+
+
+class StrictConfigError(ValueError):
+    """Structured strict-schema error that never stores rejected values."""
+
+    __slots__ = ("code", "path")
+
+    def __init__(self, *, code: str, path: str) -> None:
+        self.code = code
+        self.path = path
+        super().__init__(f"{path}: {code}")
 
 
 def _known_agents() -> list[str]:
@@ -39,6 +50,61 @@ def _known_agents() -> list[str]:
     return agents.known_agent_ids()
 
 
+def _strict_fail(code: str, path: str) -> None:
+    raise StrictConfigError(code=code, path=path)
+
+
+def _schema_fail(
+    *,
+    strict_path: str | None,
+    code: str,
+    compatibility_message: str,
+) -> None:
+    if strict_path is not None:
+        _strict_fail(code, strict_path)
+    raise ValueError(compatibility_message)
+
+
+def _strict_object(value: Any, path: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        _strict_fail("expected_object", path)
+    return value
+
+
+def _strict_only_keys(
+    value: dict[str, Any],
+    allowed: set[str],
+    path: str,
+) -> None:
+    if any(not isinstance(key, str) for key in value):
+        _strict_fail("unknown_fields", path)
+    if set(value) - allowed:
+        _strict_fail("unknown_fields", path)
+
+
+def _strict_text(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        _strict_fail("expected_non_empty_text", path)
+    return value
+
+
+def _strict_optional_text(value: Any, path: str) -> str | None:
+    if value is None:
+        return None
+    return _strict_text(value, path)
+
+
+def _strict_non_empty_list(value: Any, path: str) -> list[Any]:
+    if not isinstance(value, list) or not value:
+        _strict_fail("expected_non_empty_list", path)
+    return value
+
+
+def _strict_unique(values: list[str], path: str) -> None:
+    if len(set(values)) != len(values):
+        _strict_fail("duplicate_id", path)
+
+
 @dataclass
 class Model:
     id: str
@@ -47,12 +113,37 @@ class Model:
     output: int
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Model":
+    def from_dict(
+        cls,
+        document: dict,
+        *,
+        strict: bool = False,
+        path: str = "model",
+    ) -> Model:
+        if strict:
+            model = _strict_object(document, path)
+            _strict_only_keys(
+                model,
+                {"id", "displayName", "context", "output"},
+                path,
+            )
+            _strict_text(model.get("id"), f"{path}.id")
+            _strict_optional_text(
+                model.get("displayName"),
+                f"{path}.displayName",
+            )
+            for field_name in ("context", "output"):
+                amount = model.get(field_name)
+                if type(amount) is not int or amount <= 0:
+                    _strict_fail(
+                        "expected_positive_integer",
+                        f"{path}.{field_name}",
+                    )
         return cls(
-            id=d["id"],
-            display_name=d.get("displayName", d["id"]),
-            context=int(d["context"]),
-            output=int(d["output"]),
+            id=document["id"],
+            display_name=document.get("displayName", document["id"]),
+            context=int(document["context"]),
+            output=int(document["output"]),
         )
 
     def to_dict(self) -> dict:
@@ -80,34 +171,120 @@ class Key:
         return agent in self.agent_blacklist
 
     @classmethod
-    def from_dict(cls, d: dict, provider_type: ProviderType) -> "Key":
-        raw_models = d.get("models")
-        models = [Model.from_dict(m) for m in raw_models] if raw_models is not None else None
+    def from_dict(
+        cls,
+        document: dict,
+        provider_type: ProviderType,
+        *,
+        strict: bool = False,
+        path: str = "key",
+    ) -> Key:
+        if strict:
+            key_document = _strict_object(document, path)
+            _strict_only_keys(
+                key_document,
+                {
+                    "id",
+                    "key",
+                    "agentBlacklist",
+                    "models",
+                    "primaryModel",
+                    "downgradeModel",
+                },
+                path,
+            )
+            _strict_text(key_document.get("id"), f"{path}.id")
+            _strict_text(key_document.get("key"), f"{path}.key")
+            _strict_optional_text(
+                key_document.get("primaryModel"),
+                f"{path}.primaryModel",
+            )
+            _strict_optional_text(
+                key_document.get("downgradeModel"),
+                f"{path}.downgradeModel",
+            )
+
+        raw_models = document.get("models")
+        models = (
+            [
+                Model.from_dict(
+                    model,
+                    strict=strict,
+                    path=f"{path}.models[{index}]",
+                )
+                for index, model in enumerate(raw_models)
+            ]
+            if raw_models is not None
+            else None
+        )
         if provider_type == "asymmetric" and not models:
-            raise ValueError(
-                f"asymmetric provider key '{d['id']}' must declare its own 'models'"
+            _schema_fail(
+                strict_path=f"{path}.models" if strict else None,
+                code="invalid_model_location",
+                compatibility_message=(
+                    f"asymmetric provider key '{document['id']}' "
+                    "must declare its own 'models'"
+                ),
             )
         if provider_type == "symmetric" and models is not None:
-            raise ValueError(
-                f"symmetric provider key '{d['id']}' must not declare 'models' "
-                "(declared at provider level)"
+            _schema_fail(
+                strict_path=f"{path}.models" if strict else None,
+                code="invalid_model_location",
+                compatibility_message=(
+                    f"symmetric provider key '{document['id']}' "
+                    "must not declare 'models' (declared at provider level)"
+                ),
             )
-        raw_bl = d.get("agentBlacklist") or []
-        if not isinstance(raw_bl, list) or not all(isinstance(x, str) for x in raw_bl):
-            raise ValueError(
-                f"key '{d['id']}' agentBlacklist must be a list of agent names"
+        if strict and models is not None:
+            _strict_unique(
+                [model.id for model in models],
+                f"{path}.models Model id",
             )
-        known = _known_agents()
-        bad = [a for a in raw_bl if a not in known]
-        if bad:
-            raise ValueError(
-                f"key '{d['id']}' agentBlacklist has unknown agents {bad}; "
-                f"known: {known}"
+
+        raw_blacklist = document.get("agentBlacklist") or []
+        if not isinstance(raw_blacklist, list) or not all(
+            isinstance(agent, str)
+            for agent in raw_blacklist
+        ):
+            _schema_fail(
+                strict_path=(
+                    f"{path}.agentBlacklist"
+                    if strict
+                    else None
+                ),
+                code="expected_string_list",
+                compatibility_message=(
+                    f"key '{document['id']}' agentBlacklist must be "
+                    "a list of agent names"
+                ),
             )
-        return cls(id=d["id"], key=d["key"], models=models,
-                   agent_blacklist=tuple(raw_bl),
-                   primary_model=d.get("primaryModel"),
-                   downgrade_model=d.get("downgradeModel"))
+        known_agents = _known_agents()
+        bad_agents = [
+            agent
+            for agent in raw_blacklist
+            if agent not in known_agents
+        ]
+        if bad_agents:
+            _schema_fail(
+                strict_path=(
+                    f"{path}.agentBlacklist"
+                    if strict
+                    else None
+                ),
+                code="invalid_agent",
+                compatibility_message=(
+                    f"key '{document['id']}' agentBlacklist has unknown "
+                    f"agents {bad_agents}; known: {known_agents}"
+                ),
+            )
+        return cls(
+            id=document["id"],
+            key=document["key"],
+            models=models,
+            agent_blacklist=tuple(raw_blacklist),
+            primary_model=document.get("primaryModel"),
+            downgrade_model=document.get("downgradeModel"),
+        )
 
 
 @dataclass
@@ -122,53 +299,148 @@ class Provider:
     error_handling: dict[str, str] = field(default_factory=dict)
     primary_model: str | None = None    # symmetric: optional override of models[0]
     downgrade_model: str | None = None  # symmetric: optional override of models[1]/models[0]
+    _strict_path: InitVar[str | None] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _strict_path: str | None) -> None:
         if self.type == "symmetric" and not self.models:
-            raise ValueError(
-                f"symmetric provider '{self.id}' must declare provider-level 'models'"
+            _schema_fail(
+                strict_path=(
+                    f"{_strict_path}.models"
+                    if _strict_path is not None
+                    else None
+                ),
+                code="invalid_model_location",
+                compatibility_message=(
+                    f"symmetric provider '{self.id}' must declare "
+                    "provider-level 'models'"
+                ),
             )
         if self.type == "asymmetric" and self.models is not None:
-            raise ValueError(
-                f"asymmetric provider '{self.id}' must not declare provider-level 'models'"
+            _schema_fail(
+                strict_path=(
+                    f"{_strict_path}.models"
+                    if _strict_path is not None
+                    else None
+                ),
+                code="invalid_model_location",
+                compatibility_message=(
+                    f"asymmetric provider '{self.id}' must not declare "
+                    "provider-level 'models'"
+                ),
             )
         if self.type == "asymmetric":
-            for label, model_id in (
+            for field_name, model_id in (
                 ("primaryModel", self.primary_model),
                 ("downgradeModel", self.downgrade_model),
             ):
                 if model_id is not None:
-                    raise ValueError(
-                        f"asymmetric provider '{self.id}' must not declare "
-                        f"provider-level '{label}'"
+                    _schema_fail(
+                        strict_path=(
+                            f"{_strict_path}.{field_name}"
+                            if _strict_path is not None
+                            else None
+                        ),
+                        code="invalid_model_location",
+                        compatibility_message=(
+                            f"asymmetric provider '{self.id}' must not "
+                            f"declare provider-level '{field_name}'"
+                        ),
                     )
-        key_ids = [k.id for k in self.keys]
+
+        key_ids = [key.id for key in self.keys]
         if len(set(key_ids)) != len(key_ids):
-            raise ValueError(f"provider '{self.id}' has duplicate key ids")
+            _schema_fail(
+                strict_path=(
+                    f"{_strict_path} Key id"
+                    if _strict_path is not None
+                    else None
+                ),
+                code="duplicate_id",
+                compatibility_message=(
+                    f"provider '{self.id}' has duplicate key ids"
+                ),
+            )
         if self.default_key and self.default_key not in key_ids:
-            raise ValueError(
-                f"provider '{self.id}' defaultKey '{self.default_key}' not among keys"
+            _schema_fail(
+                strict_path=(
+                    f"{_strict_path}.defaultKey"
+                    if _strict_path is not None
+                    else None
+                ),
+                code="invalid_reference",
+                compatibility_message=(
+                    f"provider '{self.id}' defaultKey "
+                    f"'{self.default_key}' not among keys"
+                ),
             )
         if not self.base_urls:
-            raise ValueError(f"provider '{self.id}' must declare at least one baseURLs entry")
+            _schema_fail(
+                strict_path=(
+                    f"{_strict_path}.baseURLs"
+                    if _strict_path is not None
+                    else None
+                ),
+                code="expected_non_empty_object",
+                compatibility_message=(
+                    f"provider '{self.id}' must declare at least one "
+                    "baseURLs entry"
+                ),
+            )
+
         # optional model-tier overrides must reference real models in scope.
         # Provider-level only meaningful for symmetric (where models live); the
         # per-key check covers both shapes via models_for_key().
         if self.type == "symmetric":
-            valid = {m.id for m in (self.models or [])}
-            for label, mid in (("primaryModel", self.primary_model),
-                               ("downgradeModel", self.downgrade_model)):
-                if mid is not None and mid not in valid:
-                    raise ValueError(
-                        f"provider '{self.id}' {label} '{mid}' not among its models {sorted(valid)}")
-        for k in self.keys:
-            valid = {m.id for m in self.models_for_key(k.id)}
-            for label, mid in (("primaryModel", k.primary_model),
-                               ("downgradeModel", k.downgrade_model)):
-                if mid is not None and mid not in valid:
-                    raise ValueError(
-                        f"provider '{self.id}' key '{k.id}' {label} '{mid}' "
-                        f"not among its models {sorted(valid)}")
+            valid = {model.id for model in self.models or []}
+            self._validate_model_references(
+                valid,
+                self.primary_model,
+                self.downgrade_model,
+                path=_strict_path,
+            )
+        for index, key in enumerate(self.keys):
+            valid = {
+                model.id
+                for model in self.models_for_key(key.id)
+            }
+            key_path = (
+                f"{_strict_path}.keys[{index}]"
+                if _strict_path is not None
+                else None
+            )
+            self._validate_model_references(
+                valid,
+                key.primary_model,
+                key.downgrade_model,
+                path=key_path,
+            )
+
+    def _validate_model_references(
+        self,
+        valid: set[str],
+        primary: str | None,
+        downgrade: str | None,
+        *,
+        path: str | None,
+    ) -> None:
+        for field_name, model_id in (
+            ("primaryModel", primary),
+            ("downgradeModel", downgrade),
+        ):
+            if model_id is not None and model_id not in valid:
+                _schema_fail(
+                    strict_path=(
+                        f"{path}.{field_name}"
+                        if path is not None
+                        else None
+                    ),
+                    code="invalid_reference",
+                    compatibility_message=(
+                        f"provider '{self.id}' {field_name} "
+                        f"'{model_id}' not among its models "
+                        f"{sorted(valid)}"
+                    ),
+                )
 
     def default_key_id(self) -> str:
         if self.default_key:
@@ -200,37 +472,191 @@ class Provider:
         return protocol in self.base_urls
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Provider":
-        ptype: ProviderType = d["type"]  # validated below
-        if ptype not in ("symmetric", "asymmetric"):
-            raise ValueError(f"provider '{d.get('id')}' type must be symmetric|asymmetric")
-        base_urls = d["baseURLs"]
+    def from_dict(
+        cls,
+        document: dict,
+        *,
+        strict: bool = False,
+        path: str = "provider",
+    ) -> Provider:
+        if strict:
+            provider_document = _strict_object(document, path)
+            _strict_only_keys(
+                provider_document,
+                {
+                    "id",
+                    "type",
+                    "displayName",
+                    "defaultKey",
+                    "baseURLs",
+                    "keys",
+                    "models",
+                    "primaryModel",
+                    "downgradeModel",
+                    "errorHandling",
+                },
+                path,
+            )
+            _strict_text(provider_document.get("id"), f"{path}.id")
+            _strict_optional_text(
+                provider_document.get("displayName"),
+                f"{path}.displayName",
+            )
+            _strict_optional_text(
+                provider_document.get("defaultKey"),
+                f"{path}.defaultKey",
+            )
+            _strict_optional_text(
+                provider_document.get("primaryModel"),
+                f"{path}.primaryModel",
+            )
+            _strict_optional_text(
+                provider_document.get("downgradeModel"),
+                f"{path}.downgradeModel",
+            )
+
+        provider_type = document.get("type")
+        if provider_type not in ("symmetric", "asymmetric"):
+            _schema_fail(
+                strict_path=f"{path}.type" if strict else None,
+                code="invalid_provider_type",
+                compatibility_message=(
+                    f"provider '{document.get('id')}' type must be "
+                    "symmetric|asymmetric"
+                ),
+            )
+
+        base_urls = document.get("baseURLs")
         if not isinstance(base_urls, dict) or not base_urls:
-            raise ValueError(f"provider '{d.get('id')}' baseURLs must be a non-empty object")
-        keys = [Key.from_dict(k, ptype) for k in d.get("keys", [])]
+            _schema_fail(
+                strict_path=f"{path}.baseURLs" if strict else None,
+                code="expected_non_empty_object",
+                compatibility_message=(
+                    f"provider '{document.get('id')}' baseURLs must be "
+                    "a non-empty object"
+                ),
+            )
+        if strict:
+            for index, (protocol, url) in enumerate(base_urls.items()):
+                _strict_text(
+                    protocol,
+                    f"{path}.baseURLs key[{index}]",
+                )
+                _strict_text(
+                    url,
+                    f"{path}.baseURLs value[{index}]",
+                )
+
+        raw_keys = document.get("keys", [])
+        if strict:
+            raw_keys = _strict_non_empty_list(
+                raw_keys,
+                f"{path}.keys",
+            )
+        keys = [
+            Key.from_dict(
+                key,
+                provider_type,
+                strict=strict,
+                path=f"{path}.keys[{index}]",
+            )
+            for index, key in enumerate(raw_keys)
+        ]
         if not keys:
-            raise ValueError(f"provider '{d.get('id')}' must declare at least one key")
+            _schema_fail(
+                strict_path=f"{path}.keys" if strict else None,
+                code="expected_non_empty_list",
+                compatibility_message=(
+                    f"provider '{document.get('id')}' must declare "
+                    "at least one key"
+                ),
+            )
+
         models = None
-        if ptype == "symmetric":
-            raw = d.get("models")
-            if not raw:
-                raise ValueError(f"symmetric provider '{d['id']}' needs 'models'")
-            models = [Model.from_dict(m) for m in raw]
-        eh = d.get("errorHandling") or {}
-        if not isinstance(eh, dict):
-            raise ValueError(f"provider '{d.get('id')}' errorHandling must be an object")
+        raw_models = document.get("models")
+        if provider_type == "symmetric":
+            if strict:
+                raw_models = _strict_non_empty_list(
+                    raw_models,
+                    f"{path}.models",
+                )
+            elif not raw_models:
+                raise ValueError(
+                    f"symmetric provider '{document['id']}' needs 'models'"
+                )
+            models = [
+                Model.from_dict(
+                    model,
+                    strict=strict,
+                    path=f"{path}.models[{index}]",
+                )
+                for index, model in enumerate(raw_models)
+            ]
+        elif strict and "models" in document:
+            _strict_fail("invalid_model_location", f"{path}.models")
+
+        if strict:
+            _strict_unique(
+                [key.id for key in keys],
+                f"{path} Key id",
+            )
+            if models is not None:
+                _strict_unique(
+                    [model.id for model in models],
+                    f"{path}.models Model id",
+                )
+
+        error_handling = document.get("errorHandling") or {}
+        if not isinstance(error_handling, dict):
+            _schema_fail(
+                strict_path=(
+                    f"{path}.errorHandling"
+                    if strict
+                    else None
+                ),
+                code="expected_object",
+                compatibility_message=(
+                    f"provider '{document.get('id')}' errorHandling "
+                    "must be an object"
+                ),
+            )
+        if strict:
+            _validate_error_handling(
+                error_handling,
+                path=f"{path}.errorHandling",
+            )
+
         return cls(
-            id=d["id"],
-            type=ptype,
-            display_name=d.get("displayName", d["id"]),
+            id=document["id"],
+            type=provider_type,
+            display_name=document.get("displayName", document["id"]),
             base_urls=dict(base_urls),
             keys=keys,
             models=models,
-            default_key=d.get("defaultKey"),
-            error_handling=dict(eh),
-            primary_model=d.get("primaryModel"),
-            downgrade_model=d.get("downgradeModel"),
+            default_key=document.get("defaultKey"),
+            error_handling=dict(error_handling),
+            primary_model=document.get("primaryModel"),
+            downgrade_model=document.get("downgradeModel"),
+            _strict_path=path if strict else None,
         )
+
+
+def _validate_error_handling(
+    handling: dict[Any, Any],
+    *,
+    path: str,
+) -> None:
+    for error_code, action_text in handling.items():
+        _strict_text(error_code, f"{path} error code")
+        action_text = _strict_text(action_text, path)
+        actions = tuple(action_text.split(","))
+        if (
+            not actions
+            or any(action not in ATOMS for action in actions)
+            or len(set(actions)) != len(actions)
+            or tuple(sorted(actions, key=ATOMS.index)) != actions
+        ):
+            _strict_fail("invalid_error_handling", path)
 
 
 @dataclass
@@ -239,11 +665,50 @@ class Settings:
     disable_ttl_hours: float = 5.0
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> "Settings":
-        d = d or {}
+    def from_dict(
+        cls,
+        document: dict | None,
+        *,
+        strict: bool = False,
+    ) -> Settings:
+        if strict and document is not None:
+            settings = _strict_object(document, "settings")
+            _strict_only_keys(
+                settings,
+                {"rotateEvery", "disableTtlHours"},
+                "settings",
+            )
+            rotate_every = settings.get("rotateEvery", 5)
+            if type(rotate_every) is not int or rotate_every < 0:
+                _strict_fail(
+                    "expected_non_negative_integer",
+                    "settings.rotateEvery",
+                )
+            disable_ttl = settings.get("disableTtlHours", 5)
+            if (
+                isinstance(disable_ttl, bool)
+                or not isinstance(disable_ttl, (int, float))
+                or disable_ttl <= 0
+            ):
+                _strict_fail(
+                    "expected_positive_number",
+                    "settings.disableTtlHours",
+                )
+            try:
+                finite = math.isfinite(float(disable_ttl))
+            except (OverflowError, ValueError):
+                finite = False
+            if not finite:
+                _strict_fail(
+                    "expected_positive_number",
+                    "settings.disableTtlHours",
+                )
+        document = document or {}
         return cls(
-            rotate_every=int(d.get("rotateEvery", 5)),
-            disable_ttl_hours=float(d.get("disableTtlHours", 5.0)),
+            rotate_every=int(document.get("rotateEvery", 5)),
+            disable_ttl_hours=float(
+                document.get("disableTtlHours", 5.0)
+            ),
         )
 
 
@@ -277,33 +742,118 @@ class Config:
         raise KeyError(f"no provider '{pid}'")
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Config":
-        raw = d.get("providers")
-        if not isinstance(raw, list) or not raw:
+    def from_dict(
+        cls,
+        document: dict,
+        *,
+        strict: bool = False,
+    ) -> Config:
+        if strict:
+            root = _strict_object(document, "$")
+            _strict_only_keys(
+                root,
+                {"settings", "default", "providers"},
+                "$",
+            )
+
+        raw_providers = document.get("providers")
+        if not isinstance(raw_providers, list) or not raw_providers:
+            if strict:
+                _strict_fail("expected_non_empty_list", "providers")
             raise ValueError("providers must be a non-empty array")
-        providers = [Provider.from_dict(p) for p in raw]
-        ids = [p.id for p in providers]
-        if len(set(ids)) != len(ids):
-            raise ValueError(f"duplicate provider ids: {ids}")
-        default: Default | None = None
-        raw_default = d.get("default")
+        providers = [
+            Provider.from_dict(
+                provider,
+                strict=strict,
+                path=f"providers[{index}]",
+            )
+            for index, provider in enumerate(raw_providers)
+        ]
+        provider_ids = [provider.id for provider in providers]
+        if len(set(provider_ids)) != len(provider_ids):
+            if strict:
+                _strict_fail("duplicate_id", "Provider id")
+            raise ValueError(f"duplicate provider ids: {provider_ids}")
+
+        default = None
+        raw_default = document.get("default")
         if raw_default is not None:
-            if not isinstance(raw_default, dict) or "provider" not in raw_default:
-                raise ValueError("default must be an object with 'provider' (and optional 'key'/'agent')")
-            pid = raw_default["provider"]
-            if pid not in ids:
-                raise ValueError(f"default.provider '{pid}' not among providers")
-            p = next(p for p in providers if p.id == pid)
-            dk = raw_default.get("key")
-            if dk is not None and dk not in [k.id for k in p.keys]:
-                raise ValueError(f"default.key '{dk}' not among provider '{pid}' keys")
-            da = raw_default.get("agent")
-            if da is not None:
-                known_agents = _known_agents()
-                if da not in known_agents:
-                    raise ValueError(
-                        f"default.agent '{da}' not a registered agent; "
-                        f"known: {known_agents}"
+            if strict:
+                default_document = _strict_object(
+                    raw_default,
+                    "default",
+                )
+                _strict_only_keys(
+                    default_document,
+                    {"provider", "key", "agent"},
+                    "default",
+                )
+                _strict_text(
+                    default_document.get("provider"),
+                    "default.provider",
+                )
+                _strict_optional_text(
+                    default_document.get("key"),
+                    "default.key",
+                )
+                _strict_optional_text(
+                    default_document.get("agent"),
+                    "default.agent",
+                )
+            elif (
+                not isinstance(raw_default, dict)
+                or "provider" not in raw_default
+            ):
+                raise ValueError(
+                    "default must be an object with 'provider' "
+                    "(and optional 'key'/'agent')"
+                )
+
+            provider_id = raw_default["provider"]
+            if provider_id not in provider_ids:
+                if strict:
+                    _strict_fail(
+                        "invalid_reference",
+                        "default.provider",
                     )
-            default = Default(provider=pid, key=dk, agent=da)
-        return cls(settings=Settings.from_dict(d.get("settings")), providers=providers, default=default)
+                raise ValueError(
+                    f"default.provider '{provider_id}' not among providers"
+                )
+            provider = next(
+                item
+                for item in providers
+                if item.id == provider_id
+            )
+            key_id = raw_default.get("key")
+            if (
+                key_id is not None
+                and key_id not in [key.id for key in provider.keys]
+            ):
+                if strict:
+                    _strict_fail("invalid_reference", "default.key")
+                raise ValueError(
+                    f"default.key '{key_id}' not among provider "
+                    f"'{provider_id}' keys"
+                )
+            agent_id = raw_default.get("agent")
+            if agent_id is not None and agent_id not in _known_agents():
+                if strict:
+                    _strict_fail("invalid_agent", "default.agent")
+                raise ValueError(
+                    f"default.agent '{agent_id}' not a registered agent; "
+                    f"known: {_known_agents()}"
+                )
+            default = Default(
+                provider=provider_id,
+                key=key_id,
+                agent=agent_id,
+            )
+
+        return cls(
+            settings=Settings.from_dict(
+                document.get("settings"),
+                strict=strict,
+            ),
+            providers=providers,
+            default=default,
+        )

@@ -1,5 +1,7 @@
 """Tests for config loading + schema validation + JSONC stripping."""
 from __future__ import annotations
+
+import json
 import os
 from pathlib import Path
 
@@ -7,7 +9,12 @@ import pytest
 
 from llm_provider_manager import config as config_mod
 from llm_provider_manager.agents.opencode import opencode_entry_id_for
-from llm_provider_manager.config import parse_text, check_permissions, looks_unfilled
+from llm_provider_manager.config import (
+    StrictConfigError,
+    check_permissions,
+    looks_unfilled,
+    parse_text,
+)
 from llm_provider_manager.schema import Config, Key, Model, Provider
 
 
@@ -67,6 +74,177 @@ def test_jsonc_comments_stripped(tmp_path: Path):
     assert cfg.settings.rotate_every == 2
     # the // inside the string literal must be preserved, not treated as a comment
     assert cfg.providers[0].keys[0].key == "secret-with-//-inside"
+
+
+def test_strict_mode_rejects_unknown_top_level_fields_only_when_enabled():
+    text = """{
+      "unexpected": true,
+      "providers": [{
+        "id": "p", "type": "symmetric",
+        "baseURLs": {"openai": "https://x"},
+        "keys": [{"id": "k", "key": "secret"}],
+        "models": [{"id": "m", "context": 1, "output": 1}]
+      }]
+    }"""
+
+    assert parse_text(text).providers[0].id == "p"
+    with pytest.raises(StrictConfigError) as captured:
+        parse_text(text, strict=True)
+
+    assert captured.value.code == "unknown_fields"
+    assert captured.value.path == "$"
+
+
+@pytest.mark.parametrize(
+    ("case", "code", "path"),
+    [
+        (
+            "settings_type",
+            "expected_non_negative_integer",
+            "settings.rotateEvery",
+        ),
+        ("provider_field", "unknown_fields", "providers[0]"),
+        ("duplicate_key", "duplicate_id", "providers[0] Key id"),
+        (
+            "model_output",
+            "expected_positive_integer",
+            "providers[0].models[0].output",
+        ),
+        ("duplicate_model", "duplicate_id", "providers[0].models Model id"),
+        (
+            "primary_reference",
+            "invalid_reference",
+            "providers[0].primaryModel",
+        ),
+        (
+            "error_handling",
+            "invalid_error_handling",
+            "providers[0].errorHandling",
+        ),
+        (
+            "model_location",
+            "invalid_model_location",
+            "providers[0].keys[0].models",
+        ),
+        ("default_field", "unknown_fields", "default"),
+    ],
+)
+def test_strict_mode_rejects_noncanonical_schema(
+    case: str,
+    code: str,
+    path: str,
+):
+    document = {
+        "settings": {"rotateEvery": 5, "disableTtlHours": 5},
+        "default": {"provider": "p", "key": "k", "agent": "opencode"},
+        "providers": [{
+            "id": "p",
+            "type": "symmetric",
+            "baseURLs": {"openai": "https://x"},
+            "defaultKey": "k",
+            "keys": [{"id": "k", "key": "secret"}],
+            "models": [
+                {"id": "m", "context": 4096, "output": 1024},
+                {"id": "m2", "context": 4096, "output": 1024},
+            ],
+            "primaryModel": "m",
+            "downgradeModel": "m2",
+            "errorHandling": {"_default": "disable,rotate,downgrade"},
+        }],
+    }
+    provider = document["providers"][0]
+    if case == "settings_type":
+        document["settings"]["rotateEvery"] = "5"
+    elif case == "provider_field":
+        provider["unexpected"] = True
+    elif case == "duplicate_key":
+        provider["keys"].append({"id": "k", "key": "other-secret"})
+    elif case == "model_output":
+        provider["models"][0]["output"] = 0
+    elif case == "duplicate_model":
+        provider["models"][1]["id"] = "m"
+    elif case == "primary_reference":
+        provider["primaryModel"] = "missing"
+    elif case == "error_handling":
+        provider["errorHandling"]["_default"] = "rotate,disable"
+    elif case == "model_location":
+        provider["keys"][0]["models"] = [
+            {"id": "wrong-level", "context": 1, "output": 1}
+        ]
+    else:
+        document["default"]["unexpected"] = True
+
+    with pytest.raises(StrictConfigError) as captured:
+        parse_text(json.dumps(document), strict=True)
+
+    assert captured.value.code == code
+    assert captured.value.path == path
+
+
+def test_strict_mode_rejects_unclosed_jsonc_comment_only_when_enabled():
+    text = """{
+      "providers": [{
+        "id": "p", "type": "symmetric",
+        "baseURLs": {"openai": "https://x"},
+        "keys": [{"id": "k", "key": "secret"}],
+        "models": [{"id": "m", "context": 1, "output": 1}]
+      }]
+    } /* unclosed"""
+
+    assert parse_text(text).providers[0].id == "p"
+    with pytest.raises(StrictConfigError) as captured:
+        parse_text(text, strict=True)
+
+    assert captured.value.code == "invalid_jsonc"
+    assert captured.value.path == "$"
+
+
+def test_load_forwards_strict_mode_to_schema_validation(tmp_path: Path):
+    path = tmp_path / "providers.jsonc"
+    path.write_text(
+        """{
+          "unexpected": true,
+          "providers": [{
+            "id": "p", "type": "symmetric",
+            "baseURLs": {"openai": "https://x"},
+            "keys": [{"id": "k", "key": "secret"}],
+            "models": [{"id": "m", "context": 1, "output": 1}]
+          }]
+        }""",
+        encoding="utf-8",
+    )
+
+    assert config_mod.load(path).providers[0].id == "p"
+    with pytest.raises(StrictConfigError) as captured:
+        config_mod.load(path, strict=True)
+
+    assert captured.value.code == "unknown_fields"
+    assert captured.value.path == "$"
+
+
+def test_strict_error_path_never_contains_provider_values():
+    secret = "protocol-name-is-a-secret"
+    text = json.dumps(
+        {
+            "providers": [
+                {
+                    "id": "p",
+                    "type": "symmetric",
+                    "baseURLs": {secret: ""},
+                    "keys": [{"id": "k", "key": secret}],
+                    "models": [
+                        {"id": "m", "context": 1, "output": 1}
+                    ],
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(StrictConfigError) as captured:
+        parse_text(text, strict=True)
+
+    assert secret not in captured.value.path
+    assert secret not in str(captured.value)
 
 
 def test_symmetric_key_must_not_have_models():

@@ -85,6 +85,75 @@ def test_opencode_provider_entries_support_one_runtime_key_reference(
     assert set(providers["bailian-account-a"]["models"]) == {"glm-5.2"}
 
 
+def test_opencode_provider_entries_exclude_blacklisted_keys(
+    tmp_path: Path,
+) -> None:
+    sample = {
+        "providers": [
+            {
+                "id": "asymmetric",
+                "type": "asymmetric",
+                "baseURLs": {"openai": "https://example.test"},
+                "keys": [
+                    {
+                        "id": "blocked",
+                        "key": "blocked-secret",
+                        "agentBlacklist": ["opencode"],
+                        "models": [
+                            {"id": "blocked-model", "context": 1, "output": 1}
+                        ],
+                    },
+                    {
+                        "id": "usable",
+                        "key": "usable-secret",
+                        "models": [
+                            {"id": "usable-model", "context": 1, "output": 1}
+                        ],
+                    },
+                ],
+            }
+        ]
+    }
+    sample_path = tmp_path / "providers.jsonc"
+    sample_path.write_text(json.dumps(sample), encoding="utf-8")
+    config = config_mod.load(sample_path)
+
+    providers, skipped = agents_mod.get_agent(
+        "opencode"
+    ).provider_entries_for(
+        config,
+        api_key_reference="{env:Z_AI_API_KEY}",
+    )
+
+    assert set(providers) == {"asymmetric-usable"}
+    assert skipped == []
+
+
+def test_opencode_provider_entries_can_require_one_protocol(
+    sample_config_file: Path,
+) -> None:
+    config = config_mod.load(sample_config_file)
+
+    providers, skipped = agents_mod.get_agent(
+        "opencode"
+    ).provider_entries_for(
+        config,
+        api_key_reference="{env:Z_AI_API_KEY}",
+        required_protocol="openai",
+    )
+
+    assert "zhipu" in providers
+    assert all(
+        block["options"]["baseURL"].startswith("https://")
+        for block in providers.values()
+    )
+    assert all(
+        provider.usable_for("openai")
+        for provider in config.providers
+        if provider.id not in skipped
+    )
+
+
 def test_opencode_provider_entries_reject_canonical_id_collision(
     tmp_path: Path,
 ) -> None:

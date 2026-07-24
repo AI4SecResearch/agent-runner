@@ -16,7 +16,7 @@ import stat
 import threading
 from pathlib import Path
 
-from .schema import Config
+from .schema import Config, StrictConfigError
 
 # Permit reading group/other-readable configs but warn loudly: the file
 # contains real API keys.
@@ -24,7 +24,7 @@ INSECURE_PERM_WARN = 0o077  # any group/other read/write/exec bits
 _HELD_DESCRIPTOR_READ_LOCK = threading.Lock()
 
 
-def _strip_jsonc_comments(text: str) -> str:
+def _strip_jsonc_comments(text: str, *, strict: bool = False) -> str:
     """Remove // and /* */ comments from JSONC, respecting string literals."""
     out: list[str] = []
     i = 0
@@ -60,22 +60,35 @@ def _strip_jsonc_comments(text: str) -> str:
             if nxt == "*":
                 # block comment
                 j = text.find("*/", i + 2)
-                i = n if j == -1 else j + 2
+                if j == -1:
+                    if strict:
+                        raise StrictConfigError(
+                            code="invalid_jsonc",
+                            path="$",
+                        )
+                    i = n
+                else:
+                    i = j + 2
                 continue
         out.append(ch)
         i += 1
     return "".join(out)
 
 
-def parse_text(text: str, source: str = "<string>") -> Config:
-    cleaned = _strip_jsonc_comments(text)
+def parse_text(
+    text: str,
+    source: str = "<string>",
+    *,
+    strict: bool = False,
+) -> Config:
+    cleaned = _strip_jsonc_comments(text, strict=strict)
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError as e:
         raise ValueError(f"{source}: invalid JSON ({e})") from e
     if not isinstance(data, dict):
         raise ValueError(f"{source}: top-level must be an object")
-    return Config.from_dict(data)
+    return Config.from_dict(data, strict=strict)
 
 
 def load(
@@ -83,6 +96,7 @@ def load(
     *,
     file_descriptor: int | None = None,
     expected_sha256: str | None = None,
+    strict: bool = False,
 ) -> Config:
     p = Path(path)
     descriptor = (
@@ -139,7 +153,7 @@ def load(
         != expected_sha256
     ):
         raise ValueError(f"{p}: provider config changed after startup")
-    return parse_text(text, source=str(p))
+    return parse_text(text, source=str(p), strict=strict)
 
 
 def check_permissions(path: str | os.PathLike[str]) -> list[str]:
