@@ -114,18 +114,30 @@ class KeyPool:
 
     def __init__(self, config_path: str, state_path: str, agent_id: str, config):
         _ensure_lpm(config)
-        self._kp = _LpmKeyPool(config_path, state_path, agent_id=agent_id)
+        # agent-runner backends and lpm agents are separate registries: a
+        # backend may carry an agent_id that has NO lpm counterpart — it
+        # brings its own auth and by design does not participate in key-pool
+        # rotation. lpm's KeyPool eagerly calls ``agents.get_agent(agent_id)``,
+        # which raises ``ValueError`` for such an id. Catch it here and treat
+        # the backend as a no-pool backend: every op no-ops and react/classify
+        # take lpm's no-pool branch. Everything else still reads off ``self._kp``
+        # as before; only the None case short-circuits.
+        try:
+            self._kp = _LpmKeyPool(config_path, state_path, agent_id=agent_id)
+        except ValueError:
+            self._kp = None
         self._config = config
         self._current_key_ctx: KeyContext | None = None
         self._has_config = os.path.isfile(config_path)
 
-    # ── config-presence guard (mirrors runner.py dispatch's has_config) ──
+    # ── config-presence / opt-out guard (mirrors runner.py dispatch's
+    #    has_config) ────────────────────────────────────────────────────────
     # lpm's KeyPool raises on a missing config; runner.py's dispatch short-
-    # circuits to no-ops/zeros. We reproduce that here so a missing config
-    # (the no-key-pool case) behaves identically to the bash path.
+    # circuits to no-ops/zeros. We reproduce that here, AND treat a backend
+    # with no lpm counterpart (self._kp is None) the same way.
     def _noop_guard(self) -> bool:
-        """True when there's no config → the op should be a no-op."""
-        return not self._has_config
+        """True when there's no config OR this backend has no lpm counterpart."""
+        return self._kp is None or not self._has_config
 
     # ── resolve an entry to a KeyContext (pure, no env writes) ───────────
     def _resolve_entry(self, entry) -> KeyContext:
@@ -200,7 +212,7 @@ class KeyPool:
         """Disable the currently-applied key (value tracked in instance)."""
         if self._current_key_ctx is None or not self._current_key_ctx.key:
             return
-        if not (self._has_config and os.path.isfile(self._kp.state_path)):
+        if self._kp is None or not (self._has_config and os.path.isfile(self._kp.state_path)):
             return
         self._kp.disable(self._current_key_ctx.key)
 
@@ -210,6 +222,11 @@ class KeyPool:
         return self._kp.available_size()
 
     def react(self, payload_text: str) -> str:
+        # No lpm counterpart (self._kp is None): pass empties so lpm takes
+        # its no-pool branch(no get_agent → no crash); react then strips
+        # disable/rotate and keeps only downgrade. Normal case reads off _kp.
+        if self._kp is None:
+            return _lpm_react(payload_text, "", "", agent_id="")
         return _lpm_react(
             payload_text,
             self._kp.config_path,
@@ -218,6 +235,8 @@ class KeyPool:
         )
 
     def classify(self, payload_text: str) -> str:
+        if self._kp is None:
+            return _lpm_classify_error(payload_text, "", "", agent_id="")
         return _lpm_classify_error(
             payload_text,
             self._kp.config_path,
