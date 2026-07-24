@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from .claude_code import ClaudeCodeBackend
+from .codex import CodexBackend
 from .opencode import OpencodeBackend
 
 
@@ -126,6 +127,7 @@ class Backend(Protocol):
 # own backend with its own Config, so multi-threaded callers are isolated.
 REGISTRY: dict[str, type] = {
     "claude-code": ClaudeCodeBackend,
+    "codex": CodexBackend,
     "opencode": OpencodeBackend,
 }
 
