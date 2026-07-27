@@ -26,6 +26,32 @@ from ._jsonl import ensure_parent as _ensure_parent
 from ._jsonl import first_matching, iter_lines, read_jsonl
 
 
+def _message_args(prompt: str, prefix: str) -> list[str]:
+    """Build the ``opencode run`` message positionals for ``prompt``.
+
+    On a non-Windows host with a short prompt, the prompt goes straight on
+    the command line as a positional. Otherwise (Windows always; or any host
+    once the prompt crosses the threshold) the prompt is written to
+    ``{prefix}.prompt.md`` and the message becomes a meta-instruction plus
+    ``--file <path>`` — sidestepping Windows CMD's 8191-char command-line cap
+    and its fragile quoting of arbitrary prompt text (quotes, ``%``, ``!``).
+    Linux has no practical limit (``ARG_MAX`` ~128KB-2MB, ``MAX_ARG_STRLEN``
+    32KB per arg), so the file path is never taken for typical prompts there.
+    opencode supports ``-f``/``--file`` (file(s) to attach to the message).
+    """
+    if os.name != "nt" and len(prompt) < 6000:
+        return [prompt]
+    prompt_path = f"{prefix}.prompt.md"
+    _ensure_parent(prompt_path)
+    with open(prompt_path, "w", encoding="utf-8") as handle:
+        handle.write(prompt)
+    return [
+        "Read the attached prompt file and execute its instructions exactly.",
+        "--file",
+        prompt_path,
+    ]
+
+
 # 模型名不在此写死——经 config 层取(AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL)。
 class OpencodeBackend:
     """OpenCode — ``run`` subcommand, ``--format json`` event stream."""
@@ -52,7 +78,7 @@ class OpencodeBackend:
         _ensure_parent(err_path)  # defensive: callers normally create AR_RUN_DIR
         err = open(err_path, "w")  # attached to proc; stream closes it
         from ..platform import PLATFORM
-        cmd = ["opencode", "run", prompt, "--format", "json", *argv]
+        cmd = ["opencode", "run", *_message_args(prompt, prefix), "--format", "json", *argv]
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err, text=True,
             env=self._build_env(key_ctx),

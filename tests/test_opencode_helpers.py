@@ -3,11 +3,13 @@
 Pure-Python unit tests for the invoke-construction helpers in
 ``agent_runner.backends.opencode`` that have no bash/jq counterpart (so they
 don't fit the jq-equivalence suite). Covers ``model_args`` (the
-provider-qualification of ``--model``).
+provider-qualification of ``--model``) and ``_message_args`` (prompt
+transport: positional vs prompt file).
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -17,7 +19,10 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
-from agent_runner.backends.opencode import OpencodeBackend  # noqa: E402
+from agent_runner.backends.opencode import (  # noqa: E402
+    OpencodeBackend,
+    _message_args,
+)
 from agent_runner.config import Config  # noqa: E402
 
 
@@ -86,3 +91,39 @@ def test_model_args_bare_tier_id_gets_prefixed():
     assert b.model_args("glm-5.2", provider_id="bailian") == [
         "--model", "bailian/glm-5.2",
     ]
+
+
+# ── _message_args: prompt transport (positional vs prompt file) ──────────
+# Windows CMD caps the command line at 8191 chars and mangles quoting of
+# arbitrary prompt text (%, !, quotes); Linux has no such limit. So short
+# prompts on non-Windows go positional, everything else goes via a file.
+
+def test_message_args_short_prompt_positional_on_posix():
+    # Default test host is POSIX; a short prompt stays a positional, no file.
+    assert os.name != "nt"  # sanity: this test machine is the POSIX path
+    assert _message_args("do the thing", "/tmp/ar-run-001") == ["do the thing"]
+
+
+def test_message_args_long_prompt_goes_to_file(tmp_path):
+    # At the boundary (len == 6000) the < 6000 guard is False → file path.
+    prompt = "x" * 6000
+    prefix = str(tmp_path / "run-001")
+    args = _message_args(prompt, prefix)
+    prompt_path = f"{prefix}.prompt.md"
+    assert args == [
+        "Read the attached prompt file and execute its instructions exactly.",
+        "--file", prompt_path,
+    ]
+    assert (tmp_path / "run-001.prompt.md").read_text(encoding="utf-8") == prompt
+
+
+def test_message_args_file_is_utf8(tmp_path):
+    # Non-ASCII content round-trips through the prompt file as UTF-8. The
+    # prompt is long enough to force the file path on POSIX (the < 6000 guard
+    # is what's active on this host; the os.name=="nt" branch is the same
+    # file-writing code, exercised identically on Windows).
+    prompt = "用中文写一段测试用的提示词。" * 500  # len ~6500 → file path
+    prefix = str(tmp_path / "run-003")
+    _message_args(prompt, prefix)
+    raw = (tmp_path / "run-003.prompt.md").read_bytes()
+    assert raw == prompt.encode("utf-8")
