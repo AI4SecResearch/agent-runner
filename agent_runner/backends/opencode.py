@@ -176,7 +176,8 @@ class OpencodeBackend:
             return ["--dangerously-skip-permissions"]
         return []
 
-    def model_args(self, tier: str, resolved_model: str = "") -> list[str]:
+    def model_args(self, tier: str, resolved_model: str = "",
+                   *, provider_id: str = "") -> list[str]:
         # resolved_model (keypool-resolved) 优先;空 → 回落 config。
         if resolved_model:
             m = resolved_model
@@ -186,6 +187,11 @@ class OpencodeBackend:
             m = self._config.get("downgrade_model", "")
         else:
             m = tier
+        # opencode 的 --model 需要 provider 前缀形式(provider/model);keypool
+        # 解析出的是裸 id,这里用 provider_id 补前缀。已带前缀或无 provider_id
+        # (无 key pool——调用方需在 AR_PRIMARY_MODEL 里写全 provider/model)则不动。
+        if m and provider_id and "/" not in m:
+            m = f"{provider_id}/{m}"
         return ["--model", m] if m else []
 
     def resume_args(self, sid: str) -> list[str]:

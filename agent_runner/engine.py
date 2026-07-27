@@ -145,7 +145,10 @@ class Runner:
         if not has_model:
             # key_ctx.primary_model 为空时回落 config(启动期 AR_* env / TOML)
             resolved_model = key_ctx.primary_model if key_ctx else ""
-            argv += backend.model_args("primary", resolved_model=resolved_model)
+            argv += backend.model_args(
+                "primary", resolved_model=resolved_model,
+                provider_id=key_ctx.provider_id if key_ctx else "",
+            )
         argv += list(extra)
 
         return backend.invoke(prompt, prefix, argv, key_ctx=key_ctx)
@@ -323,7 +326,10 @@ class Runner:
             name = f"{base_log}-r{attempt}"
             resolved_model = (key_ctx.downgrade_model if model == "downgrade"
                               else key_ctx.primary_model) if key_ctx else ""
-            model_args = backend.model_args(model, resolved_model=resolved_model)
+            model_args = backend.model_args(
+                model, resolved_model=resolved_model,
+                provider_id=key_ctx.provider_id if key_ctx else "",
+            )
             sys_stderr_write(
                 f"          ⚠️ 重试 {attempt}/{max_attempts} ({model} / {step}): {base_log}\n"
             )

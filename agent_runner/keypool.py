@@ -91,16 +91,19 @@ class KeyContext:
     Carries the resolved API key, base_url, and provider-constrained models.
     The backend maps ``key``/``base_url`` to its own env-var names and builds
     the subprocess env (extra env vars); the engine threads ``primary_model``/
-    ``downgrade_model`` to ``backend.model_args`` as ``resolved_model`` (bypassing
-    the config layer's env round-trip). Empty fields = no value to apply.
+    ``downgrade_model`` to ``backend.model_args`` as ``resolved_model`` and
+    ``provider_id`` as ``provider_id`` — so a backend whose ``--model`` needs a
+    provider prefix (e.g. opencode's ``provider/model``) can qualify the id
+    without the framework knowing that rule. Bypasses the config layer's env
+    round-trip. Empty fields = no value to apply.
     """
     key: str = ""
     base_url: str = ""
     primary_model: str = ""
     downgrade_model: str = ""
-    # for debugging / disable() value lookup
+    # threaded to backend.model_args (opencode qualifies --model with it)
     provider_id: str = ""
-    key_id: str = ""
+    key_id: str = ""  # debugging only (no op consumes it)
 
 
 class KeyPool:

@@ -95,13 +95,19 @@ class Backend(Protocol):
         """Permission flag fragment (e.g. --dangerously-skip-permissions)."""
         ...
 
-    def model_args(self, tier: str, resolved_model: str = "") -> list[str]:
+    def model_args(self, tier: str, resolved_model: str = "",
+                   *, provider_id: str = "") -> list[str]:
         """Model flag fragment; tier is ``primary``/``downgrade``/a bare id.
 
         ``resolved_model`` (the keypool's resolved model id, from ``KeyContext``)
         takes priority over the config layer — this is the multi-thread path
         that bypasses the ``AR_*`` env round-trip. Empty → fall back to config
-        (the startup-time ``AR_PRIMARY_MODEL``/``AR_DOWNGRADE_MODEL`` env or TOML)."""
+        (the startup-time ``AR_PRIMARY_MODEL``/``AR_DOWNGRADE_MODEL`` env or TOML).
+
+        ``provider_id`` (the keypool's resolved provider id, keyword-only) lets a
+        backend qualify the model id for agents that require a provider prefix
+        (e.g. opencode's ``provider/model``). Backends whose ``--model`` takes a
+        bare id ignore it."""
         ...
 
     def resume_args(self, sid: str) -> list[str]:

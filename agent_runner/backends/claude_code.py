@@ -169,9 +169,12 @@ class ClaudeCodeBackend:
             return ["--dangerously-skip-permissions"]
         return ["--permission-mode", "acceptEdits"]
 
-    def model_args(self, tier: str, resolved_model: str = "") -> list[str]:
+    def model_args(self, tier: str, resolved_model: str = "",
+                   *, provider_id: str = "") -> list[str]:
         # resolved_model (keypool-resolved, multi-thread path) 优先于 config 层,
         # 绕过 AR_* env 回环。空 resolved_model → 回落 config(启动期 AR_* env / TOML)。
+        # provider_id 对 claude 无意义——其 --model 接受裸 id(由
+        # ANTHROPIC_BASE_URL 路由到对应 provider),故忽略。
         if resolved_model:
             m = resolved_model
         elif tier == "primary":
