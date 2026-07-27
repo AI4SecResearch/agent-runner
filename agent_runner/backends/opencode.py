@@ -81,6 +81,7 @@ class OpencodeBackend:
         cmd = ["opencode", "run", *_message_args(prompt, prefix), "--format", "json", *argv]
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err, text=True,
+            encoding="utf-8", errors="replace",
             env=self._build_env(key_ctx),
             **PLATFORM.new_session_kwargs(),
         )
@@ -107,7 +108,7 @@ class OpencodeBackend:
     def stream(self, proc, prefix: str) -> None:
         jsonl_path = f"{prefix}.jsonl"
         try:
-            with open(jsonl_path, "w") as jl:
+            with open(jsonl_path, "w", encoding="utf-8", errors="replace") as jl:
                 assert proc.stdout is not None
                 for line in proc.stdout:
                     jl.write(line)
