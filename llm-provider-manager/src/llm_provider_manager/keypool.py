@@ -60,17 +60,31 @@ try:
 except ImportError:  # Windows: fcntl unavailable → msvcrt byte-range lock
     import msvcrt
 
+    def _locking_byte_zero(f, mode: int) -> None:
+        # msvcrt.locking(fd, mode, nbytes) locks an nbytes range starting at
+        # the *current* file pointer, not a fixed offset. Our callers pass 1
+        # (a single byte), so the locked byte's position tracks the pointer:
+        # without seeking, lock and unlock land on different bytes once
+        # json.load/json.dump move the pointer, and the byte-0 lock is never
+        # released (deadlocking the next process on LK_LOCK).
+        pos = f.tell()
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), mode, 1)
+        finally:
+            f.seek(pos)
+
     def _flock_sh(f) -> None:
         # No shared/exclusive distinction on Windows — exclusive everywhere.
         # Lock the first byte (state files always start with '{', so byte 0
         # exists); locking a region past EOF is permitted by msvcrt too.
-        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        _locking_byte_zero(f, msvcrt.LK_LOCK)
 
     def _flock_ex(f) -> None:
-        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        _locking_byte_zero(f, msvcrt.LK_LOCK)
 
     def _flock_un(f) -> None:
-        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        _locking_byte_zero(f, msvcrt.LK_UNLCK)
 
     _PLATFORM_LOCK = "msvcrt"
 
