@@ -28,7 +28,7 @@ def read_jsonl(path: str) -> list[dict]:
     partial file). Returns ``[]`` if the file is absent or empty.
     """
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             out: list[dict] = []
             for line in f:
                 line = line.strip()
@@ -65,7 +65,7 @@ def iter_lines(path: str) -> Iterator[str]:
     """Yield raw lines from a file (used for the grep-style is_complete fast
     path on the claude-code side)."""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 yield line
     except FileNotFoundError:
