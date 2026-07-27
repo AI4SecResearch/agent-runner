@@ -50,7 +50,7 @@ SPECS: list[Spec] = [
     Spec("key_pool_config"),
     Spec("keypool_state"),         # 运行时派生(key_pool_config 同目录),表里占位
     Spec("run_dir"),
-    Spec("sandbox",        type=bool, default=False),
+    Spec("skip_permissions", type=bool, default=False),
     Spec("stall_timeout",  type=int,  default=300, toml_path="timeouts.stall"),
     Spec("total_timeout",  type=int,  default=0,   toml_path="timeouts.total"),
     Spec("opencode_auth_env_var",   default="Z_AI_API_KEY"),

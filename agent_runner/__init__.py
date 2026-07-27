@@ -44,7 +44,7 @@
         print("session:", res.session_id)
 
 后端/密钥池/认证全部经环境变量配置(``AR_RUN_DIR`` / ``AR_BACKEND`` /
-``AR_SANDBOX`` / ``AR_KEY_POOL_CONFIG`` / ``AR_LPM_SRC`` / ``AR_STALL_TIMEOUT`` /
+``AR_SKIP_PERMISSIONS`` / ``AR_KEY_POOL_CONFIG`` / ``AR_LPM_SRC`` / ``AR_STALL_TIMEOUT`` /
 ``AR_TOTAL_TIMEOUT`` 等)。优先级:实例 ``config_overrides`` > ``AR_`` env > TOML > 默认。
 """
 

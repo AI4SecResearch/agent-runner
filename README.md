@@ -71,7 +71,7 @@ entry(进程形态取一):`new` / `resume` / `fork` / `once` / `agent_with_retry
 | `key_pool_config` | `AR_KEY_POOL_CONFIG` | (无) | providers.jsonc 路径 |
 | `keypool_state` | `AR_KEYPOOL_STATE` | = key_pool_config 同目录 | 密钥池状态文件 |
 | `run_dir` | `AR_RUN_DIR` | (必填) | 产出根(jsonl/err/产物) |
-| `sandbox` | `AR_SANDBOX` | `false` | 跳过权限提示 |
+| `skip_permissions` | `AR_SKIP_PERMISSIONS` | `false` | 跳过权限提示 |
 | `stall_timeout` | `AR_STALL_TIMEOUT` | `300` | 无输出多少秒后杀掉 |
 | `total_timeout` | `AR_TOTAL_TIMEOUT` | `0` | 硬总超时(0 = 不限) |
 | `lpm_src` | `AR_LPM_SRC` | 内置副本 | lpm 源目录覆盖(进程级) |

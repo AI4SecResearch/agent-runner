@@ -7,7 +7,7 @@ The engine never references ``claude`` directly — same isolation as the bash
 side.
 
 Env vars (agent-agnostic; the key pool overrides per provider):
-  AR_SANDBOX           → --dangerously-skip-permissions
+  AR_SKIP_PERMISSIONS  → --dangerously-skip-permissions
   AR_PRIMARY_MODEL     模型 id(经 config 层;keypool 按供应校验覆盖)
   AR_DOWNGRADE_MODEL   降级模型 id
   ANTHROPIC_BASE_URL   base_url(由 `claude` 二进制读;keypool 写)
@@ -165,7 +165,7 @@ class ClaudeCodeBackend:
 
     # ── flag fragments ────────────────────────────────────────────────────
     def perm_args(self) -> list[str]:
-        if self._config.get("sandbox", False):
+        if self._config.get("skip_permissions", False):
             return ["--dangerously-skip-permissions"]
         return ["--permission-mode", "acceptEdits"]
 

@@ -34,7 +34,7 @@ def test_specs_cover_all_expected_keys():
     keys = {s.key for s in SPECS}
     expected = {
         "backend", "primary_model", "downgrade_model", "key_pool_config",
-        "keypool_state", "run_dir", "sandbox", "stall_timeout", "total_timeout",
+        "keypool_state", "run_dir", "skip_permissions", "stall_timeout", "total_timeout",
         "opencode_auth_env_var", "lpm_src",
     }
     assert keys == expected
@@ -57,13 +57,13 @@ def test_each_spec_has_consistent_type_and_key():
 
 def test_defaults_without_toml_or_env(monkeypatch):
     monkeypatch.delenv("AR_BACKEND", raising=False)
-    monkeypatch.delenv("AR_SANDBOX", raising=False)
+    monkeypatch.delenv("AR_SKIP_PERMISSIONS", raising=False)
     monkeypatch.delenv("AR_STALL_TIMEOUT", raising=False)
     monkeypatch.delenv("AR_TOTAL_TIMEOUT", raising=False)
     monkeypatch.delenv("AR_OPENCODE_AUTH_ENV_VAR", raising=False)
     c = Config(toml={})
     assert c.get("backend") == "claude-code"
-    assert c.get("sandbox") is False
+    assert c.get("skip_permissions") is False
     assert c.get("stall_timeout") == 300
     assert c.get("total_timeout") == 0
     assert c.get("opencode_auth_env_var") == "Z_AI_API_KEY"
@@ -143,13 +143,13 @@ def test_config_overrides_none_falls_through(monkeypatch):
 
 # ── 类型转换 ───────────────────────────────────────────────────────────────
 
-def test_sandbox_env_coerced_to_bool(monkeypatch):
+def test_skip_permissions_env_coerced_to_bool(monkeypatch):
     for truthy in ("1", "true", "yes", "on"):
-        monkeypatch.setenv("AR_SANDBOX", truthy)
-        assert Config(toml={}).get("sandbox") is True, f"{truthy} should be True"
+        monkeypatch.setenv("AR_SKIP_PERMISSIONS", truthy)
+        assert Config(toml={}).get("skip_permissions") is True, f"{truthy} should be True"
     for falsy in ("0", "false", "no", "off", ""):
-        monkeypatch.setenv("AR_SANDBOX", falsy)
-        assert Config(toml={}).get("sandbox") is False, f"{falsy} should be False"
+        monkeypatch.setenv("AR_SKIP_PERMISSIONS", falsy)
+        assert Config(toml={}).get("skip_permissions") is False, f"{falsy} should be False"
 
 
 def test_timeout_env_coerced_to_int(monkeypatch):

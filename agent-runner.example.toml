@@ -26,9 +26,9 @@
 # jsonl/err 日志与产物存放目录。
 #run_dir = "/var/run/mytask"
 
-# ── 沙箱 ────────────────────────────────────────────────────────────────
+# ── 跳过权限确认 ────────────────────────────────────────────────────────
 # true → --dangerously-skip-permissions
-#sandbox = false
+#skip_permissions = false
 
 # ── lpm 源(默认用 vendored 副本) ────────────────────────────────────────
 # 指向另一份 lpm 的 src/(如 dev checkout)。空 = 用 vendored。

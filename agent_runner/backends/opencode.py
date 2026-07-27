@@ -6,7 +6,7 @@ log is parsed, and the flag vocabulary (``--model``/``-s``/``--fork``). The
 engine never references ``opencode`` directly.
 
 Env vars (agent-agnostic; the key pool overrides per provider):
-  AR_SANDBOX          → --dangerously-skip-permissions
+  AR_SKIP_PERMISSIONS → --dangerously-skip-permissions
   AR_PRIMARY_MODEL    模型 id(provider 前缀形式,如 bailian/glm-5.2;经 config 层)
   AR_DOWNGRADE_MODEL  降级模型 id
 
@@ -171,8 +171,8 @@ class OpencodeBackend:
 
     # ── flag fragments ────────────────────────────────────────────────────
     def perm_args(self) -> list[str]:
-        # 非 sandbox 不输出——OpenCode 的权限模型在 opencode.json 里,非 CLI flag。
-        if self._config.get("sandbox", False):
+        # 非 skip_permissions 不输出——OpenCode 的权限模型在 opencode.json 里,非 CLI flag。
+        if self._config.get("skip_permissions", False):
             return ["--dangerously-skip-permissions"]
         return []
 
