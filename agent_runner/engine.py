@@ -72,8 +72,8 @@ class Result:
     """The outcome of one public agent invocation.
 
     Fields:
-      rc:          0 = success, 1 = all retries failed, 2 = quota exhausted
-                   (no key pool) — same semantics as the bash exit codes.
+      rc:          0 = success, 1 = backend failure, 2 = confirmed resource
+                   exhaustion with no executable key/model recovery.
       session_id:  the session id the agent recorded for the successful attempt
                    (empty when none / unsupported / the run failed). Library
                    callers thread this into a subsequent ``_resume``/``_fork``.
@@ -446,18 +446,26 @@ class Runner:
                                  extra: list[str],
                                  key_ctx: KeyContext | None = None) -> Result:
         """在 ``_agent_once_with_check`` 之上加 disable 副作用:失败时按错误分类决定
-        是否禁用当前 key。返回 rc=0 成功 / 1 失败(可重试)/ 2 额度耗尽且无密钥池
-        (放弃)。供无外层重试循环、需自行处理 disable 的单次执行场景使用。"""
+        是否禁用当前 key。返回 rc=0 成功 / 1 失败(可重试)/ 2 有结构化证据的
+        额度耗尽且无密钥池(放弃)。供无外层重试循环、需自行处理 disable 的
+        单次执行场景使用。"""
         res = self._agent_once_with_check(prompt, log_name, extra, key_ctx)
         if res.rc == 0:
             return res
-        strategy = self.classify_agent_error(log_name)
+        output = self._config.get("run_dir", "")
+        text = self._get_backend().result_text(f"{output}/{log_name}")
+        classification = self._ensure_keypool().classify_details(text)
+        strategy = classification.action
         if "disable" in f",{strategy},".split(","):
             if os.path.isfile(self._kp_config()):
                 self._ensure_keypool().disable()
-            else:
+            elif classification.resource_exhausted:
                 sys_stderr_write(f"          ⚠️ 额度耗尽且无 key pool: {log_name}\n")
                 return Result(2)
+        if not classification.matched:
+            sys_stderr_write(
+                f"          ⚠️ 后端执行失败，未找到可用的恢复策略: {log_name}\n"
+            )
         return Result(1)
 
     # ── 重试编排(反应式:每次失败决定一步) ────────────────────────────────────
@@ -512,10 +520,34 @@ class Runner:
                 )
                 return Result.canceled()
             text = backend.result_text(f"{output}/{cur_log}")
-            step = kp.react(text)
-            if step == "stop":
-                sys_stderr_write(f"          ⚠️ 资源耗尽（无可用 key/模型）: {cur_log}\n")
+            decision = kp.react(text)
+            if decision.stop_reason is not None:
+                stop_reason = decision.stop_reason.value
+                if stop_reason == "resource_exhausted":
+                    sys_stderr_write(
+                        f"          ⚠️ 资源耗尽（无可用 key/模型）: {cur_log}\n"
+                    )
+                    return Result(
+                        2,
+                        outcome=RunOutcome.QUOTA_EXHAUSTED,
+                    )
+                diagnostic = {
+                    "no_key_pool": (
+                        "后端执行失败：未配置 key pool，"
+                        "无法执行 rotate 恢复策略"
+                    ),
+                    "unclassified_backend_failure": (
+                        "后端执行失败，错误未分类且未找到可用的恢复策略"
+                    ),
+                    "no_actionable_recovery": (
+                        "后端执行失败，策略没有可执行的恢复动作"
+                    ),
+                }[stop_reason]
+                sys_stderr_write(
+                    f"          ⚠️ {diagnostic}: {cur_log}\n"
+                )
                 return last_result if last_result is not None else Result(1)
+            step = decision.action
 
             # 执行策略里的原子
             atoms = f",{step},".split(",")
@@ -583,7 +615,10 @@ class Runner:
             # 失败 → 下次循环 react 读这次重试的日志
             cur_log = name
 
-        sys_stderr_write(f"          ⚠️ 重试次数达上限 ({max_attempts}): {base_log}\n")
+        sys_stderr_write(
+            f"          ⚠️ 已完成允许的重试但后端仍失败 "
+            f"({max_attempts}): {base_log}\n"
+        )
         return last_result if last_result is not None else Result(1)
 
     # ── 公开入口(new / resume / fork)────────────────────────────────────────
@@ -750,8 +785,8 @@ class Runner:
     def agent_once_session_resume(self, prompt: str, log_name: str, sid: str, *extra: str) -> Result:
         """单次续接(无重试循环)。运行一次,后端支持则续接已有 session(否则退化为
         全新会话)。失败时按错误分类自行 disable 当前 key(单次入口自带 disable,
-        没有外层循环替它决策)。返回 Result(rc=0 成功 / 1 可重试失败 / 2 额度耗尽
-        且无密钥池,放弃)。"""
+        没有外层循环替它决策)。返回 Result(rc=0 成功 / 1 可重试失败 /
+        2 有结构化证据的额度耗尽且无密钥池,放弃)。"""
         extra_list = list(extra)
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()

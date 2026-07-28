@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -66,7 +67,7 @@ class _RetryKeyPool(_KeyPool):
         return 1
 
     def react(self, text):
-        return "rotate"
+        return SimpleNamespace(action="rotate", stop_reason=None)
 
     def rotate(self):
         return None

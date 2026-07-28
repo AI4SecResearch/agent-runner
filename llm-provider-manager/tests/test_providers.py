@@ -52,6 +52,30 @@ def test_classify_zhipu_builtin_defaults_no_config():
     assert providers_mod.classify("zhipu", '{"code": "9999"}', {}) == "rotate"
 
 
+def test_classify_details_marks_known_quota_as_resource_exhausted():
+    classification = providers_mod.classify_details(
+        "zhipu",
+        '{"code": "1308"}',
+        {},
+    )
+
+    assert classification.action == "disable,rotate"
+    assert classification.matched is True
+    assert classification.resource_exhausted is True
+
+
+def test_classify_details_keeps_unknown_failure_unclassified():
+    classification = providers_mod.classify_details(
+        "zhipu",
+        '{"code": "9999"}',
+        {},
+    )
+
+    assert classification.action == "rotate"
+    assert classification.matched is False
+    assert classification.resource_exhausted is False
+
+
 def test_classify_zhipu_1301_does_not_disable():
     # content-safety — rotate+downgrade but the key isn't bad, so no disable atom
     result = providers_mod.classify("zhipu", '{"code": "1301"}', {})
@@ -139,6 +163,18 @@ def test_classify_opencsitool_plain_429_disables_and_rotates():
     # or as a structured status field
     assert providers_mod.classify(
         "opencsitool", '{"status":"429","message":"rate limited"}', {}) == "disable,rotate"
+
+
+def test_classify_details_marks_opencsitool_rate_limit_as_resource_exhausted():
+    classification = providers_mod.classify_details(
+        "opencsitool",
+        '{"status":"429","message":"rate limited"}',
+        {},
+    )
+
+    assert classification.action == "disable,rotate"
+    assert classification.matched is True
+    assert classification.resource_exhausted is True
 
 
 def test_classify_opencsitool_other_error_falls_to_default():

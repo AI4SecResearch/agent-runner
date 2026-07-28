@@ -89,7 +89,7 @@ if result.outcome is RunOutcome.CANCELED:
 ```bash
 # 经 .sh 封装(自动设 PYTHONPATH,exec python -m):
 sid=$(agent-runner.sh new "总结这份文档" "summary")   # stdout = session_id
-echo $?    # 0 = 成功,1 = 均失败,2 = 额度耗尽且无密钥池
+echo $?    # 0 = 成功,1 = 后端失败,2 = 已确认资源耗尽且无可执行恢复
 
 # 多步会话:把上一步的 sid 传给 resume
 agent-runner.sh resume "精修 markdown" "refined" "$sid"

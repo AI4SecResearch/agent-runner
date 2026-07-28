@@ -24,6 +24,7 @@ ids fall back to ``DefaultProvider`` (see ``default.py``).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 
@@ -39,6 +40,15 @@ ATOMS = ("disable", "rotate", "downgrade")
 # rotate only: try a different key, but don't disable the current one (the key
 # may well be fine — the error is unrecognised) or downgrade the model yet.
 DEFAULT_ACTION = "rotate"
+
+
+@dataclass(frozen=True)
+class ErrorClassification:
+    """Provider-owned recovery action with conservative semantic evidence."""
+
+    action: str
+    matched: bool
+    resource_exhausted: bool = False
 
 
 # ── provider protocol + registry ──────────────────────────────────
@@ -58,6 +68,12 @@ class ProviderBackend(Protocol):
     default_error_handling: dict[str, str]
 
     def classify(self, payload_text: str, overrides: dict[str, str]) -> str: ...
+
+    def classify_details(
+        self,
+        payload_text: str,
+        overrides: dict[str, str],
+    ) -> ErrorClassification: ...
 
 
 def _build_registry() -> dict[str, ProviderBackend]:
@@ -93,6 +109,16 @@ def classify(
     """Full pipeline: dispatch raw payload → backend parses → atom strategy."""
     backend = get_backend(provider_id)
     return backend.classify(payload_text, overrides)
+
+
+def classify_details(
+    provider_id: str,
+    payload_text: str,
+    overrides: dict[str, str],
+) -> ErrorClassification:
+    """Classify while preserving whether the provider recognized the error."""
+    backend = get_backend(provider_id)
+    return backend.classify_details(payload_text, overrides)
 
 
 def effective_error_handling(

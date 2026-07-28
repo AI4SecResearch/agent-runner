@@ -41,6 +41,7 @@ _LPM_LOCK = threading.Lock()
 _LpmKeyPool = None  # set by _ensure_lpm
 _lpm_react = None
 _lpm_classify_error = None
+_lpm_classify_error_details = None
 _lpm_ready = False
 
 
@@ -50,7 +51,8 @@ def _ensure_lpm(cfg) -> None:
     在 ``KeyPool.__init__`` 首次触发(读实例 config 的 ``lpm_src``)。进程级:
     ``sys.path`` 是进程全局,首次设置后生效;``_lpm_ready`` 守卫避免重复。
     """
-    global _LpmKeyPool, _lpm_react, _lpm_classify_error, _lpm_ready
+    global _LpmKeyPool, _lpm_react, _lpm_classify_error
+    global _lpm_classify_error_details, _lpm_ready
     if _lpm_ready:
         return
     with _LPM_LOCK:
@@ -70,6 +72,7 @@ def _ensure_lpm(cfg) -> None:
                 KeyPool as _KP,
                 react as _r,
                 classify_error as _ce,
+                classify_error_details as _ced,
             )
         except ImportError as _e:  # pragma: no cover
             sys.stderr.write(
@@ -81,6 +84,7 @@ def _ensure_lpm(cfg) -> None:
         _LpmKeyPool = _KP
         _lpm_react = _r
         _lpm_classify_error = _ce
+        _lpm_classify_error_details = _ced
         _lpm_ready = True
 
 
@@ -251,7 +255,7 @@ class KeyPool:
             return 0
         return self._kp.available_size()
 
-    def react(self, payload_text: str) -> str:
+    def react(self, payload_text: str):
         return _lpm_react(
             payload_text,
             self._kp.config_path,
@@ -263,6 +267,16 @@ class KeyPool:
 
     def classify(self, payload_text: str) -> str:
         return _lpm_classify_error(
+            payload_text,
+            self._kp.config_path,
+            self._kp.state_path,
+            agent_id=self._kp.agent_id,
+            config_fd=self._config_fd,
+            expected_config_sha256=self._config_sha256,
+        )
+
+    def classify_details(self, payload_text: str):
+        return _lpm_classify_error_details(
             payload_text,
             self._kp.config_path,
             self._kp.state_path,

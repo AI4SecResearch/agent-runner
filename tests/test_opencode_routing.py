@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from agent_runner.backends.opencode import OpencodeBackend
 from agent_runner.engine import Runner
@@ -179,9 +180,9 @@ class _RotatingKeyPool:
         return 1
 
     @staticmethod
-    def react(text: str) -> str:
+    def react(text: str):
         del text
-        return "rotate"
+        return SimpleNamespace(action="rotate", stop_reason=None)
 
     @staticmethod
     def on_success() -> None:

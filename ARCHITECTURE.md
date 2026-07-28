@@ -51,8 +51,9 @@ classDiagram
         +rotate() KeyContext
         +on_success() KeyContext
         +disable()
-        +react(text) str
+        +react(text) RecoveryDecision
         +classify(text) str
+        +classify_details(text) ErrorClassification
     }
 
     class LpmKeyPool {
@@ -167,7 +168,7 @@ For each invocation the engine: (1) checks cancellation, selects a key + provide
 - **Disable watershed**: the public entries' primary attempt runs `_with_check` (does NOT disable). disable / rotate / downgrade are decided by `_retry_loop` at the top of each iteration via `react`, uniformly. Single-shot entries (`_with_disable`) self-disable because they have no outer loop.
 - **Reactive retry**: each failure is re-classified via `react`; after rotating to a new key, a different error code yields a befitting strategy.
 - **Continue vs redo**: prefer continuing on the session_id the primary recorded (`继续` prompt + `--resume <sid>`); with no session, replay the primary verbatim (re-send `$prompt` + `$session_args`). Fork re-forks from the source session — never bare-resumes a shared context (would pollute sibling forks).
-- **Exit codes**: `_with_check` → 0/1; `_retry_loop` and the public entries → 0/1; `_with_disable` → 0/1/2 (2 = quota exhausted, no key pool).
+- **Exit codes**: `_with_check` → 0/1; `_retry_loop`, `_with_disable`, and the public entries → 0/1/2. Code 2 requires structured Provider evidence plus KeyPool state showing no executable key/model recovery; ordinary or unclassified failures remain 1.
 - **Never trust the process returncode**: success is always judged by `result_ok` reading the jsonl.
 
 ## Backends: the 11-op contract

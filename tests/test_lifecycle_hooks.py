@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from agent_runner import (
     LifecycleEvent,
@@ -35,9 +36,9 @@ class _RetryingKeyPool:
     def available_size(self) -> int:
         return 1
 
-    def react(self, text: str) -> str:
+    def react(self, text: str):
         del text
-        return "rotate"
+        return SimpleNamespace(action="rotate", stop_reason=None)
 
     def rotate(self) -> None:
         return None

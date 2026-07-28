@@ -12,7 +12,7 @@ parsing — they don't inherit parsing from here.
 
 from __future__ import annotations
 
-from . import DEFAULT_ACTION
+from . import DEFAULT_ACTION, ErrorClassification
 
 
 class DefaultProvider:
@@ -21,8 +21,21 @@ class DefaultProvider:
     id = "_default"
     default_error_handling: dict[str, str] = {}
 
-    def classify(self, payload_text: str, overrides: dict[str, str]) -> str:
+    def _default_action(self, overrides: dict[str, str]) -> str:
         merged = dict(self.default_error_handling)
         merged.update(overrides)
         merged.setdefault("_default", DEFAULT_ACTION)
         return merged["_default"]
+
+    def classify(self, payload_text: str, overrides: dict[str, str]) -> str:
+        return self._default_action(overrides)
+
+    def classify_details(
+        self,
+        payload_text: str,
+        overrides: dict[str, str],
+    ) -> ErrorClassification:
+        return ErrorClassification(
+            action=self._default_action(overrides),
+            matched=False,
+        )

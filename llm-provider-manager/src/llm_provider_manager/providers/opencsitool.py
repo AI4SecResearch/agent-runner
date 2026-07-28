@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 
+from . import ErrorClassification
 from .default import DefaultProvider
 
 
@@ -26,6 +27,13 @@ class OpencsitoolProvider(DefaultProvider):
     default_error_handling: dict[str, str] = {}
 
     def classify(self, payload_text: str, overrides: dict[str, str]) -> str:
+        return self.classify_details(payload_text, overrides).action
+
+    def classify_details(
+        self,
+        payload_text: str,
+        overrides: dict[str, str],
+    ) -> ErrorClassification:
         # Parse the payload just enough to get message + HTTP status — a JSON
         # object with those fields, or else the raw text as the message.
         message = payload_text or ""
@@ -42,5 +50,9 @@ class OpencsitoolProvider(DefaultProvider):
         is_budget = "budget" in msg and "exceed" in msg
         is_429 = status == "429" or "429" in msg
         if is_budget or is_429:
-            return "disable,rotate"
-        return super().classify(payload_text, overrides)
+            return ErrorClassification(
+                action="disable,rotate",
+                matched=True,
+                resource_exhausted=True,
+            )
+        return super().classify_details(payload_text, overrides)

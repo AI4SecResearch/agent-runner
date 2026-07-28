@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,9 +34,12 @@ class _KeyPool:
     def available_size(self) -> int:
         return 0
 
-    def react(self, text: str) -> str:
+    def react(self, text: str):
         del text
-        return "stop"
+        return SimpleNamespace(
+            action="",
+            stop_reason=SimpleNamespace(value="no_actionable_recovery"),
+        )
 
 
 class _ProcessBackend:
@@ -305,10 +309,10 @@ def test_cancellation_observed_during_retry_decision_prevents_spawn(
     )
 
     class _CancelingKeyPool(_KeyPool):
-        def react(self, text: str) -> str:
+        def react(self, text: str):
             del text
             cancellation.requested = True
-            return "rotate"
+            return SimpleNamespace(action="rotate", stop_reason=None)
 
         def rotate(self) -> None:
             return None

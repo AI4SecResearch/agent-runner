@@ -34,6 +34,8 @@ import os
 import stat
 import sys
 import time
+from dataclasses import dataclass
+from enum import Enum
 
 # ── cross-platform advisory file locking ────────────────────────────────
 # The state file (current_index / disabled / success_count) is shared across
@@ -105,9 +107,32 @@ if "_with_lock_at_start" not in globals():
 from . import agents as agents_mod
 from . import config as config_mod
 from . import providers as providers_mod
+from .providers import ErrorClassification
 from .schema import Config, Provider
 
 DEBUG = bool(os.environ.get("LPM_KEYPOOL_DEBUG"))
+
+
+class RecoveryStopReason(str, Enum):
+    RESOURCE_EXHAUSTED = "resource_exhausted"
+    NO_KEY_POOL = "no_key_pool"
+    UNCLASSIFIED_BACKEND_FAILURE = "unclassified_backend_failure"
+    NO_ACTIONABLE_RECOVERY = "no_actionable_recovery"
+
+
+@dataclass(frozen=True)
+class RecoveryDecision:
+    """One executable recovery action or a structured reason to stop."""
+
+    action: str
+    stop_reason: RecoveryStopReason | None
+    classification: ErrorClassification
+
+    def __post_init__(self) -> None:
+        if bool(self.action) == (self.stop_reason is not None):
+            raise ValueError(
+                "recovery decision must contain exactly one of action or stop_reason"
+            )
 
 
 def _dbg(msg: str) -> None:
@@ -522,6 +547,26 @@ def classify_error(
     interpretation is delegated to the providers package. Returns an atom
     strategy string (e.g. "disable,rotate", "downgrade").
     """
+    return classify_error_details(
+        payload_text,
+        config_path,
+        state_path,
+        agent_id=agent_id,
+        config_fd=config_fd,
+        expected_config_sha256=expected_config_sha256,
+    ).action
+
+
+def classify_error_details(
+    payload_text,
+    config_path,
+    state_path,
+    *,
+    agent_id,
+    config_fd=None,
+    expected_config_sha256=None,
+) -> ErrorClassification:
+    """Classify an error while preserving provider-owned semantic evidence."""
     provider_id = None
     handling: dict[str, str] = {}
     if config_fd is not None or os.path.exists(config_path):
@@ -532,11 +577,15 @@ def classify_error(
             config_fd=config_fd,
             expected_config_sha256=expected_config_sha256,
         )
-        p = pool._provider_for_current()
-        if p is not None:
-            provider_id = p.id
-            handling = p.error_handling
-    return providers_mod.classify(provider_id, payload_text, handling)
+        provider = pool._provider_for_current()
+        if provider is not None:
+            provider_id = provider.id
+            handling = provider.error_handling
+    return providers_mod.classify_details(
+        provider_id,
+        payload_text,
+        handling,
+    )
 
 
 def react(
@@ -553,8 +602,8 @@ def react(
     The reactive counterpart to the old pre-planned ``retry_plan``: instead of
     laying out the whole retry sequence up front, the runner calls this after
     each failure and applies just the returned step, then re-classifies the
-    next error. Returns either an atom strategy string (e.g. ``"disable,rotate"``,
-    ``"downgrade"``) or ``"stop"`` when no recovery is possible.
+    next error. Returns a ``RecoveryDecision`` containing either an atom
+    strategy or a structured stop reason.
 
     Stop rules (conservative, avoids infinite loops):
       * pool exhausted (available=0) AND strategy needs rotate → no key to move to.
@@ -563,7 +612,7 @@ def react(
       * strategy carries no actionable atom at all (e.g. bare ``disable`` with
         an empty pool) → stop.
     """
-    action = classify_error(
+    classification = classify_error_details(
         payload_text,
         config_path,
         state_path,
@@ -571,6 +620,8 @@ def react(
         config_fd=config_fd,
         expected_config_sha256=expected_config_sha256,
     )
+    action = classification.action
+    requested_atoms = tuple(a for a in action.split(",") if a)
 
     has_pool = config_fd is not None or os.path.exists(config_path)
     available = 0
@@ -594,11 +645,30 @@ def react(
 
     actionable = any(a in ("rotate", "downgrade") for a in action.split(",") if a)
     if not actionable:
-        _dbg(f"react: action={action} available={available} → stop")
-        return "stop"
+        if classification.resource_exhausted and has_pool and available == 0:
+            stop_reason = RecoveryStopReason.RESOURCE_EXHAUSTED
+        elif not has_pool and "rotate" in requested_atoms:
+            stop_reason = RecoveryStopReason.NO_KEY_POOL
+        elif not classification.matched:
+            stop_reason = RecoveryStopReason.UNCLASSIFIED_BACKEND_FAILURE
+        else:
+            stop_reason = RecoveryStopReason.NO_ACTIONABLE_RECOVERY
+        _dbg(
+            f"react: action={action} available={available} "
+            f"→ stop={stop_reason.value}"
+        )
+        return RecoveryDecision(
+            action="",
+            stop_reason=stop_reason,
+            classification=classification,
+        )
 
     _dbg(f"react: action={action} available={available}")
-    return action
+    return RecoveryDecision(
+        action=action,
+        stop_reason=None,
+        classification=classification,
+    )
 
 
 def _resolve_agent(agent_id, config_path):
@@ -668,7 +738,8 @@ def dispatch(argv) -> int:
         print(classify_error(text, args.config, args.state, agent_id=agent_id))
     elif args.command == "react":
         text = sys.stdin.read() if args.text == "-" else args.text
-        print(react(text, args.config, args.state, agent_id=agent_id))
+        decision = react(text, args.config, args.state, agent_id=agent_id)
+        print(decision.action or "stop")
     return 0
 
 

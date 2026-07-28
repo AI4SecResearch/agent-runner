@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -127,8 +128,11 @@ class ThreadFakeKP:
     def available_size(self) -> int:
         return 2
 
-    def react(self, t) -> str:
-        return "stop"
+    def react(self, t):
+        return SimpleNamespace(
+            action="",
+            stop_reason=SimpleNamespace(value="no_actionable_recovery"),
+        )
 
     def classify(self, t) -> str:
         return "rotate"

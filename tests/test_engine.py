@@ -27,6 +27,7 @@ from agent_runner.backends import claude_code, opencode  # noqa: E402
 from agent_runner.backends.claude_code import ClaudeCodeBackend  # noqa: E402
 from agent_runner.backends.opencode import OpencodeBackend  # noqa: E402
 from agent_runner.config import Config  # noqa: E402
+from agent_runner.keypool import KeyContext  # noqa: E402
 
 _REAL_GET_BACKEND = eng.Runner._get_backend
 
@@ -129,6 +130,37 @@ def make_result(text="ok", is_error=False, session_id=""):
     if session_id:
         e["session_id"] = session_id
     return e
+
+
+class FakeRecoveryDecision:
+    def __init__(self, action="", stop_reason=None):
+        self.action = action
+        self.stop_reason = (
+            None
+            if stop_reason is None
+            else type("FakeStopReason", (), {"value": stop_reason})()
+        )
+
+
+def recover(action):
+    return FakeRecoveryDecision(action=action)
+
+
+def stop_recovery(reason="no_actionable_recovery"):
+    return FakeRecoveryDecision(stop_reason=reason)
+
+
+class FakeErrorClassification:
+    def __init__(
+        self,
+        action,
+        *,
+        matched,
+        resource_exhausted=False,
+    ):
+        self.action = action
+        self.matched = matched
+        self.resource_exhausted = resource_exhausted
 
 
 class _FakeProc:
@@ -267,7 +299,7 @@ def test_internal_retry_wraps_every_backend_spawn_independently(
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 1
-        def react(self, text): return "rotate"
+        def react(self, text): return recover("rotate")
         def classify(self, text): return "rotate"
 
     monkeypatch.setattr(
@@ -310,7 +342,7 @@ def test_session_new_succeeds_first_try(monkeypatch):
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 0
-        def react(self, t): return "stop"
+        def react(self, t): return stop_recovery()
         def classify(self, t): return "rotate"
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     monkeypatch.setenv("AR_PRIMARY_MODEL", "test-model")
@@ -328,7 +360,7 @@ def test_session_new_succeeds_first_try(monkeypatch):
 
 # ── all retries fail → exit 1 ─────────────────────────────────────────────
 
-def test_session_new_all_fail(monkeypatch):
+def test_session_new_all_fail(monkeypatch, capsys):
     # primary fails, react always says "rotate" (never stop), but pool reports
     # size 0 → max_attempts=2 → exhausts.
     _MOCK.reset([{"events": [make_result("err", is_error=True)], "ok": False}] * 10)
@@ -339,17 +371,113 @@ def test_session_new_all_fail(monkeypatch):
         def rotate(self): pass
         def disable(self): self.disabled += 1
         def available_size(self): return 0
-        def react(self, t): return "rotate"  # always rotate, never stop
+        def react(self, t): return recover("rotate")
         def classify(self, t): return "rotate"
     kp = FakeKP()
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: kp)
-    rc = eng.agent_with_retry_session_new("prompt", "log2")
-    assert rc.rc == 1
+    result = eng.agent_with_retry_session_new("prompt", "log2")
+    assert result.rc == 1
+    assert result.outcome is eng.RunOutcome.FAILED
+    diagnostic = capsys.readouterr().err
+    assert "已完成允许的重试但后端仍失败" in diagnostic
+    assert "资源耗尽" not in diagnostic
 
 
-# ── react returns stop → exit 1 ───────────────────────────────────────────
+def test_retry_preserves_disable_and_rotate_behavior(monkeypatch):
+    _MOCK.reset([
+        {
+            "events": [
+                make_result("Error [1308] quota exceeded", is_error=True),
+            ],
+            "ok": False,
+        },
+        {"events": [make_result()], "ok": True},
+    ])
 
-def test_session_new_react_stop(monkeypatch):
+    class FakeKP:
+        def __init__(self):
+            self.disabled = 0
+            self.rotated = 0
+
+        def init(self): return KeyContext(primary_model="primary")
+        def on_success(self): pass
+        def rotate(self):
+            self.rotated += 1
+            return KeyContext(primary_model="primary")
+        def disable(self): self.disabled += 1
+        def available_size(self): return 1
+        def react(self, t): return recover("disable,rotate")
+        def classify(self, t): return "disable,rotate"
+
+    key_pool = FakeKP()
+    monkeypatch.setattr(
+        eng.Runner,
+        "_ensure_keypool",
+        lambda self: key_pool,
+    )
+
+    result = eng.agent_with_retry_session_new(
+        "prompt",
+        "disable-rotate",
+    )
+
+    assert result.rc == 0
+    assert key_pool.disabled == 1
+    assert key_pool.rotated == 1
+    assert len(_MOCK.calls) == 2
+
+
+def test_retry_executes_downgrade_without_rotating(monkeypatch):
+    _MOCK.reset([
+        {
+            "events": [
+                make_result("backend overloaded", is_error=True),
+            ],
+            "ok": False,
+        },
+        {"events": [make_result()], "ok": True},
+    ])
+
+    class FakeKP:
+        def __init__(self):
+            self.rotated = 0
+
+        def init(self):
+            return KeyContext(
+                primary_model="primary-model",
+                downgrade_model="downgrade-model",
+            )
+        def on_success(self): pass
+        def rotate(self):
+            self.rotated += 1
+            return KeyContext()
+        def disable(self): pass
+        def available_size(self): return 0
+        def react(self, t): return recover("downgrade")
+        def classify(self, t): return "downgrade"
+
+    key_pool = FakeKP()
+    monkeypatch.setattr(
+        eng.Runner,
+        "_ensure_keypool",
+        lambda self: key_pool,
+    )
+
+    result = eng.agent_with_retry_session_new(
+        "prompt",
+        "downgrade",
+    )
+
+    assert result.rc == 0
+    assert key_pool.rotated == 0
+    retry_argv = _MOCK.calls[1][2]
+    model_index = retry_argv.index("--model")
+    assert retry_argv[model_index + 1] == "downgrade-model"
+
+
+# ── react returns a stop reason → exit 1 ─────────────────────────────────
+
+def test_session_new_react_stop(monkeypatch, capsys):
     _MOCK.reset([{"events": [make_result("err", is_error=True)], "ok": False}])
     class FakeKP:
         def init(self): pass
@@ -357,12 +485,107 @@ def test_session_new_react_stop(monkeypatch):
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 1
-        def react(self, t): return "stop"
+        def react(self, t): return stop_recovery()
         def classify(self, t): return "stop"
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry_session_new("prompt", "log3")
     assert rc.rc == 1
     assert len(_MOCK.calls) == 1  # only the primary; retry loop stopped before retrying
+    diagnostic = capsys.readouterr().err
+    assert "策略没有可执行的恢复动作" in diagnostic
+    assert "资源耗尽" not in diagnostic
+
+
+def test_no_key_pool_unclassified_failure_is_not_resource_exhaustion(
+    capsys,
+):
+    secret = "backend-token-CANARY"
+    _MOCK.reset([
+        {
+            "events": [
+                make_result(
+                    f"ordinary backend failure token={secret}",
+                    is_error=True,
+                ),
+            ],
+            "ok": False,
+        },
+    ])
+
+    result = eng.agent_with_retry_session_new(
+        "prompt",
+        "unclassified-no-pool",
+    )
+
+    assert result.rc == 1
+    assert result.outcome is eng.RunOutcome.FAILED
+    diagnostic = capsys.readouterr().err
+    assert "资源耗尽" not in diagnostic
+    assert "后端执行失败" in diagnostic
+    assert secret not in diagnostic
+    assert secret not in repr(result)
+
+
+def test_confirmed_quota_with_exhausted_key_pool_reports_resource_exhaustion(
+    tmp_path: Path,
+    capsys,
+):
+    secret = "super-secret-quota-key"
+    config_path = tmp_path / "providers.jsonc"
+    state_path = tmp_path / "key-pool-state.json"
+    config_path.write_text(json.dumps({
+        "providers": [{
+            "id": "zhipu",
+            "type": "symmetric",
+            "displayName": "Zhipu",
+            "defaultKey": "main",
+            "baseURLs": {"anthropic": "https://example.invalid/anthropic"},
+            "keys": [{"id": "main", "key": secret}],
+            "models": [{
+                "id": "model",
+                "displayName": "Model",
+                "context": 1,
+                "output": 1,
+            }],
+        }],
+    }))
+    from agent_runner.keypool import KeyPool
+
+    key_pool = KeyPool(
+        str(config_path),
+        str(state_path),
+        agent_id="claude",
+        config=Config(toml={}),
+    )
+    key_pool.init()
+    key_pool.disable()
+    _MOCK.reset([{
+        "events": [
+            make_result("Error [1308] quota exceeded", is_error=True),
+        ],
+        "ok": False,
+    }])
+    runner = eng.Runner(
+        {
+            "backend": "claude-code",
+            "run_dir": os.environ["AR_RUN_DIR"],
+            "key_pool_config": str(config_path),
+            "keypool_state": str(state_path),
+        },
+        discover_config_files=False,
+    )
+
+    result = runner.agent_with_retry_session_new(
+        "prompt",
+        "confirmed-resource-exhaustion",
+    )
+
+    assert result.rc == 2
+    assert result.outcome is eng.RunOutcome.QUOTA_EXHAUSTED
+    diagnostic = capsys.readouterr().err
+    assert "资源耗尽" in diagnostic
+    assert secret not in diagnostic
+    assert secret not in repr(result)
 
 
 # ── resume entry: primary records a session_id → continue branch ─────────
@@ -380,7 +603,7 @@ def test_session_resume_uses_continue_branch(monkeypatch):
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 1
-        def react(self, t): return "rotate"
+        def react(self, t): return recover("rotate")
         def classify(self, t): return "rotate"
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry_session_resume("prompt", "log4", "s1")
@@ -410,7 +633,7 @@ def test_session_fork_continue_on_recorded_session(monkeypatch):
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 1
-        def react(self, t): return "rotate"
+        def react(self, t): return recover("rotate")
         def classify(self, t): return "rotate"
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry_session_fork("vote", "log5", "src")
@@ -437,7 +660,7 @@ def test_session_fork_no_session_replays_redo(monkeypatch):
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 1
-        def react(self, t): return "rotate"
+        def react(self, t): return recover("rotate")
         def classify(self, t): return "rotate"
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry_session_fork("vote", "log6", "src")
@@ -460,8 +683,14 @@ def test_once_session_resume_disable_on_failure(monkeypatch):
         def rotate(self): pass
         def disable(self): disabled["n"] += 1
         def available_size(self): return 1
-        def react(self, t): return "disable,rotate"
+        def react(self, t): return recover("disable,rotate")
         def classify(self, t): return "disable,rotate"
+        def classify_details(self, t):
+            return FakeErrorClassification(
+                "disable,rotate",
+                matched=True,
+                resource_exhausted=True,
+            )
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     # Make _kp_config point to an existing file so the disable branch fires
     # (otherwise it returns 2 = no key pool).
@@ -480,13 +709,48 @@ def test_once_session_resume_quota_exhausted_no_keypool(monkeypatch):
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 0
-        def react(self, t): return "disable,rotate"
+        def react(self, t): return recover("disable,rotate")
         def classify(self, t): return "disable,rotate"
+        def classify_details(self, t):
+            return FakeErrorClassification(
+                "disable,rotate",
+                matched=True,
+                resource_exhausted=True,
+            )
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     # _kp_config → nonexistent file → disable branch returns 2
     monkeypatch.setattr(eng.Runner, "_kp_config", lambda self: "/nonexistent/cfg.jsonc")
     rc = eng.agent_once_session_resume("prompt", "log8", "s1")
     assert rc.rc == 2  # quota exhausted, no key pool
+
+
+def test_once_session_resume_unclassified_no_keypool_is_not_quota_exhausted(
+    capsys,
+):
+    secret = "once-backend-token-CANARY"
+    _MOCK.reset([{
+        "events": [
+            make_result(
+                f"ordinary backend failure token={secret}",
+                is_error=True,
+            ),
+        ],
+        "ok": False,
+    }])
+
+    result = eng.agent_once_session_resume(
+        "prompt",
+        "unclassified-once",
+        "s1",
+    )
+
+    assert result.rc == 1
+    assert result.outcome is eng.RunOutcome.FAILED
+    diagnostic = capsys.readouterr().err
+    assert "资源耗尽" not in diagnostic
+    assert "后端执行失败" in diagnostic
+    assert secret not in diagnostic
+    assert secret not in repr(result)
 
 
 # ── agent_with_retry alias ─────────────────────────────────────────────────
@@ -500,7 +764,7 @@ def test_agent_with_retry_alias(monkeypatch):
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 0
-        def react(self, t): return "stop"
+        def react(self, t): return stop_recovery()
         def classify(self, t): return "rotate"
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     rc = eng.agent_with_retry("prompt", "log9")
@@ -521,7 +785,7 @@ def test_result_carries_session_id_and_text(monkeypatch):
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 0
-        def react(self, t): return "stop"
+        def react(self, t): return stop_recovery()
         def classify(self, t): return "rotate"
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     res = eng.agent_with_retry_session_new("prompt", "logSid")
@@ -543,7 +807,7 @@ def test_result_failure_has_no_session_id(monkeypatch):
         def rotate(self): pass
         def disable(self): pass
         def available_size(self): return 0
-        def react(self, t): return "stop"
+        def react(self, t): return stop_recovery()
         def classify(self, t): return "rotate"
     monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: FakeKP())
     res = eng.agent_with_retry_session_new("prompt", "logFail")

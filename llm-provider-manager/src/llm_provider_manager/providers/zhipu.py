@@ -23,7 +23,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from . import DEFAULT_ACTION
+from . import DEFAULT_ACTION, ErrorClassification
 from .default import DefaultProvider
 
 
@@ -84,6 +84,7 @@ class ZhipuProvider(DefaultProvider):
     """Zhipu — built-in GLM upstream code → action map."""
 
     id = "zhipu"
+    resource_exhaustion_codes = frozenset({"1308", "1310"})
     default_error_handling = {
         "1301": "rotate,downgrade",          # content safety — not the key's fault
         "1305": "downgrade",                 # traffic overload — same key, smaller model
@@ -93,12 +94,24 @@ class ZhipuProvider(DefaultProvider):
     }
 
     def classify(self, payload_text: str, overrides: dict[str, str]) -> str:
+        return self.classify_details(payload_text, overrides).action
+
+    def classify_details(
+        self,
+        payload_text: str,
+        overrides: dict[str, str],
+    ) -> ErrorClassification:
         signals = extract_signals(payload_text)
         merged = dict(self.default_error_handling)
         merged.update(overrides)
         code = signals.code or signals.status
-        return (
+        action = (
             merged.get(code, merged.get("_default", DEFAULT_ACTION))
             if code
             else merged.get("_default", DEFAULT_ACTION)
+        )
+        return ErrorClassification(
+            action=action,
+            matched=code is not None and code in merged,
+            resource_exhausted=code in self.resource_exhaustion_codes,
         )

@@ -86,7 +86,7 @@ src/llm_provider_manager/
 | `bailian.py` | （继承 default） | （空，待填充） | 当前靠配置或兜底 |
 | `opencsitool.py` | 自文本匹配 budget/429 | budget/429 | 预算耗尽 → `disable,rotate`；其余落 `_default` |
 
-动作词表（原子，逗号组合）：`disable` / `rotate` / `downgrade`。策略是有序原子串，如 `disable,rotate`、`rotate,downgrade`。`disable` 是一等原子——出现才禁用 key（不再像旧版那样隐含在 `rotate` 里），所以内容安全类错误（1301/1305）可以换 key/降级而**不**禁用 key。`classify` 返回原子策略串本身（如 `disable,rotate`、`downgrade`）。zhipu 内置：1301→`rotate,downgrade`、1305→`downgrade`、1308/1310→`disable,rotate`、`_default`→`rotate`（未知错误只换 key，不赌 key 坏或该降级）。
+动作词表（原子，逗号组合）：`disable` / `rotate` / `downgrade`。策略是有序原子串，如 `disable,rotate`、`rotate,downgrade`。`disable` 是一等原子——出现才禁用 key（不再像旧版那样隐含在 `rotate` 里），所以内容安全类错误（1301/1305）可以换 key/降级而**不**禁用 key。`classify` 保留原子策略串兼容契约；`classify_details` 额外返回 Provider 是否识别该错误以及是否有可靠的资源耗尽证据，不携带原始 payload。zhipu 内置：1301→`rotate,downgrade`、1305→`downgrade`、1308/1310→`disable,rotate`、`_default`→`rotate`（未知错误只换 key，不赌 key 坏或该降级）。
 
 反应式重试（§9）：消费者每步调 `react` 子命令拿单步策略，执行后重新分类下一个错误，而非一次性预算完整计划。
 
@@ -147,7 +147,7 @@ hook 内部用**绝对路径** `$HOME/.local/bin/lpm` 而非裸 `lpm` 调用 CLI
 
 ### 新增一个 provider
 
-1. 在 `providers/` 加 `<name>.py`，实现 `ProviderBackend` 协议（`id`/`default_error_handling`/`classify`）。`classify` 自行解析 payload（框架不做预解析）；可继承 `DefaultProvider` 拿到"直接返回 `_default`"的兜底行为，再按需 override。
+1. 在 `providers/` 加 `<name>.py`，实现 `ProviderBackend` 协议（`id`/`default_error_handling`/`classify`/`classify_details`）。Provider 自行解析 payload（框架不做预解析）；可继承 `DefaultProvider` 拿到 `_default` 兜底及未分类的结构化结果，识别已知错误或资源耗尽时 override `classify_details`。
 2. 在 `providers/__init__.py` 的 `_build_registry()` 加一行。
 3. 在 `providers.jsonc` 加该 provider 的配置（`errorHandling` 可选——覆盖内置默认）。
 
@@ -197,9 +197,9 @@ hook 内部用**绝对路径** `$HOME/.local/bin/lpm` 而非裸 `lpm` 调用 CLI
 
 模型分层：默认 `models[0]`=primary、`models[1]`=downgrade（单元素则两者相同）；可选 `primaryModel`/`downgradeModel`（provider/key 级，见 schema 校验）覆盖。
 
-错误分类复用 §4 的 provider 后端：从状态解析当前 provider → 取其 `errorHandling` 覆盖 → `providers.classify(pid, payload, handling)`。
+错误分类复用 §4 的 provider 后端：从状态解析当前 provider → 取其 `errorHandling` 覆盖 → `providers.classify_details(pid, payload, handling)`；恢复动作与是否命中已知错误、是否确认资源耗尽一起保留。
 
-`dispatch(argv)` 子命令：`init / rotate / on-success / disable / size / available-size / classify / react`。`init/rotate/on-success` 产出一行 JSON `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）；`classify` 与 `react` 均产出原子策略串（如 `disable,rotate`、`downgrade`），`react` 额外可产出 `stop`——批量消费者每步调用它驱动**反应式**重试（每步重新分类新错误），例如：
+`dispatch(argv)` 子命令：`init / rotate / on-success / disable / size / available-size / classify / react`。`init/rotate/on-success` 产出一行 JSON `{key, base_url, primary_model, downgrade_model}`（空行=无 key/未轮换）；库形态 `react()` 返回动作与结构化停止原因，`dispatch react` 为兼容现有进程调用仍只输出原子策略串或 `stop`。批量消费者每步调用它驱动**反应式**重试（每步重新分类新错误），例如：
 
 ```bash
 python -m llm_provider_manager.keypool init --config providers.jsonc --state /tmp/s.json --agent claude
