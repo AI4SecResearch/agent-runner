@@ -295,7 +295,7 @@ def test_opencode_is_complete_matches(tmp_path, opencode_backend):
 
 @needs_bash
 def test_perm_args_match_claude(monkeypatch):
-    for sandbox, expected in [(None, ["--permission-mode", "acceptEdits"]),
+    for sandbox, expected in [(None, ["--permission-mode", "dontAsk"]),
                               ("1", ["--dangerously-skip-permissions"])]:
         if sandbox is None:
             monkeypatch.delenv("SANDBOX", raising=False)

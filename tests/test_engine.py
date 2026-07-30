@@ -179,6 +179,8 @@ class _FakeProc:
 def test_private_process_integration_wraps_real_backend_spawn(
     monkeypatch,
 ) -> None:
+    from agent_runner import platform as runner_platform
+
     popen_calls = []
 
     def record_popen(command, **kwargs):
@@ -187,6 +189,11 @@ def test_private_process_integration_wraps_real_backend_spawn(
 
     monkeypatch.setattr(eng.Runner, "_get_backend", _REAL_GET_BACKEND)
     monkeypatch.setattr(claude_code.subprocess, "Popen", record_popen)
+    monkeypatch.setattr(
+        runner_platform.PLATFORM,
+        "new_session_kwargs",
+        lambda: {},
+    )
     integration = eng._ProcessIntegration(
         command_wrapper=lambda command: ["isolation-wrapper", *command]
     )
@@ -212,8 +219,14 @@ def test_private_process_integration_wraps_real_backend_spawn(
         "stream-json",
         "--verbose",
         "--permission-mode",
-        "acceptEdits",
+        "dontAsk",
     ]
+
+
+def test_claude_code_defaults_to_noninteractive_allowlist_mode() -> None:
+    backend = claude_code.ClaudeCodeBackend({"sandbox": False})
+
+    assert backend.perm_args() == ["--permission-mode", "dontAsk"]
 
 
 @pytest.mark.parametrize("backend_kind", ["claude-code", "opencode"])

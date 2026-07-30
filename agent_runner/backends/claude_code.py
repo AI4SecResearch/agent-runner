@@ -203,7 +203,7 @@ class ClaudeCodeBackend:
     def perm_args(self) -> list[str]:
         if self._config.get("sandbox", False):
             return ["--dangerously-skip-permissions"]
-        return ["--permission-mode", "acceptEdits"]
+        return ["--permission-mode", "dontAsk"]
 
     def model_args(self, tier: str, resolved_model: str = "") -> list[str]:
         # resolved_model (keypool-resolved, multi-thread path) 优先于 config 层,
