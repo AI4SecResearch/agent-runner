@@ -195,6 +195,42 @@ def test_backend_process_starts_in_requested_working_directory(
     assert popen_calls[0][1]["cwd"] == working_directory
 
 
+def test_claude_process_uses_execution_local_runtime_directories(
+    tmp_path,
+    monkeypatch,
+):
+    diagnostics = tmp_path / "execution" / "diagnostics"
+    diagnostics.mkdir(parents=True)
+    popen_calls = []
+
+    class _Process:
+        pass
+
+    def record_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return _Process()
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", record_popen)
+    backend = ClaudeCodeBackend()
+
+    process = backend.invoke(
+        "prompt",
+        str(diagnostics / "run"),
+        [],
+    )
+    process._ar_err.close()
+
+    expected_config = (
+        tmp_path / "execution" / "outputs" / ".claude-runtime"
+    )
+    expected_tmp = tmp_path / "execution" / "outputs" / ".claude-tmp"
+    process_environment = popen_calls[0][1]["env"]
+    assert process_environment["CLAUDE_CONFIG_DIR"] == str(expected_config)
+    assert process_environment["TMPDIR"] == str(expected_tmp)
+    assert expected_config.is_dir()
+    assert expected_tmp.is_dir()
+
+
 def test_internal_retry_keeps_requested_working_directory(tmp_path, monkeypatch):
     working_directory = tmp_path / "workspace"
     working_directory.mkdir()

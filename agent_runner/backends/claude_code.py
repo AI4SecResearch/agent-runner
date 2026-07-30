@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import subprocess
 from collections.abc import Callable
+from pathlib import Path
 
 from ._jsonl import ensure_parent as _ensure_parent
 from ._jsonl import first_matching, iter_lines, read_jsonl
@@ -91,9 +92,27 @@ class ClaudeCodeBackend:
         # create AR_RUN_DIR, but a missing parent shouldn't crash the run).
         _ensure_parent(err_path)
         err = _open_private_text(err_path)  # attached to proc; stream closes it
+        # Runtime supplies <execution>/diagnostics/<log>; keep Claude's
+        # mutable state in the sibling outputs directory already authorized.
+        config_directory = (
+            Path(prefix).parent.parent / "outputs" / ".claude-runtime"
+        )
+        temporary_directory = (
+            Path(prefix).parent.parent / "outputs" / ".claude-tmp"
+        )
+        config_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            config_directory.chmod(0o700)
+            temporary_directory.chmod(0o700)
+        process_environment = self._build_env(key_ctx)
+        if process_environment is None:
+            process_environment = dict(os.environ)
+        process_environment["CLAUDE_CONFIG_DIR"] = str(config_directory)
+        process_environment["TMPDIR"] = str(temporary_directory)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err, text=True,
-            env=self._build_env(key_ctx),
+            env=process_environment,
             cwd=working_directory,
             **PLATFORM.new_session_kwargs(),
         )
