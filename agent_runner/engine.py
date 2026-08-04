@@ -67,6 +67,14 @@ class RunOutcome(str, Enum):
     CANCELED = "canceled"
 
 
+@dataclass(frozen=True)
+class DiagnosticAttempt:
+    retry_index: int
+    log_name: str
+    provider: str = ""
+    model: str = ""
+
+
 @dataclass
 class Result:
     """The outcome of one public agent invocation.
@@ -90,6 +98,7 @@ class Result:
     session_id: str = ""
     text: str = ""
     outcome: RunOutcome | None = None
+    attempts: tuple[DiagnosticAttempt, ...] = ()
 
     def __post_init__(self) -> None:
         if self.outcome is None:
@@ -433,14 +442,43 @@ class Runner:
             cancellation=cancellation,
             lifecycle_sink=lifecycle_sink,
         )
+        attempt = self._diagnostic_attempt(log_name, extra, key_ctx)
         if watchdog_outcome is not RunOutcome.SUCCEEDED:
-            return Result(1, outcome=watchdog_outcome)
+            return Result(
+                1,
+                outcome=watchdog_outcome,
+                attempts=(attempt,),
+            )
         if self._check_agent_result(log_name):
             prefix = f"{output}/{log_name}"
             sid = backend.session_id(prefix)
             text = backend.result_body(prefix)
-            return Result(0, sid, text)
-        return Result(1)
+            return Result(0, sid, text, attempts=(attempt,))
+        return Result(1, attempts=(attempt,))
+
+    def _diagnostic_attempt(
+        self,
+        log_name: str,
+        extra: list[str],
+        key_ctx: KeyContext | None,
+    ) -> DiagnosticAttempt:
+        model = ""
+        if "--model" in extra:
+            index = extra.index("--model")
+            if index + 1 < len(extra):
+                model = extra[index + 1]
+        if not model:
+            model = (
+                key_ctx.primary_model
+                if key_ctx is not None and key_ctx.primary_model
+                else self._config.get("primary_model", "")
+            )
+        return DiagnosticAttempt(
+            retry_index=0,
+            log_name=log_name,
+            provider=(key_ctx.provider_id if key_ctx is not None else ""),
+            model=model,
+        )
 
     def _agent_once_with_disable(self, prompt: str, log_name: str,
                                  extra: list[str],
@@ -461,12 +499,12 @@ class Runner:
                 self._ensure_keypool().disable()
             elif classification.resource_exhausted:
                 sys_stderr_write(f"          ⚠️ 额度耗尽且无 key pool: {log_name}\n")
-                return Result(2)
+                return Result(2, attempts=res.attempts)
         if not classification.matched:
             sys_stderr_write(
                 f"          ⚠️ 后端执行失败，未找到可用的恢复策略: {log_name}\n"
             )
-        return Result(1)
+        return Result(1, attempts=res.attempts)
 
     # ── 重试编排(反应式:每次失败决定一步) ────────────────────────────────────
 
@@ -508,6 +546,9 @@ class Runner:
 
         attempt = 0
         cur_log = base_log  # 最近一次失败的日志(react 读它)
+        diagnostic_attempts = list(
+            () if last_result is None else last_result.attempts
+        )
 
         while attempt < max_attempts:
             if (
@@ -518,7 +559,9 @@ class Runner:
                     lifecycle_sink,
                     LifecycleEventType.CANCEL_REQUESTED,
                 )
-                return Result.canceled()
+                canceled = Result.canceled()
+                canceled.attempts = tuple(diagnostic_attempts)
+                return canceled
             text = backend.result_text(f"{output}/{cur_log}")
             decision = kp.react(text)
             if decision.stop_reason is not None:
@@ -530,6 +573,7 @@ class Runner:
                     return Result(
                         2,
                         outcome=RunOutcome.QUOTA_EXHAUSTED,
+                        attempts=tuple(diagnostic_attempts),
                     )
                 diagnostic = {
                     "no_key_pool": (
@@ -546,7 +590,11 @@ class Runner:
                 sys_stderr_write(
                     f"          ⚠️ {diagnostic}: {cur_log}\n"
                 )
-                return last_result if last_result is not None else Result(1)
+                return (
+                    last_result
+                    if last_result is not None
+                    else Result(1, attempts=tuple(diagnostic_attempts))
+                )
             step = decision.action
 
             # 执行策略里的原子
@@ -563,7 +611,9 @@ class Runner:
                     lifecycle_sink,
                     LifecycleEventType.CANCEL_REQUESTED,
                 )
-                return Result.canceled()
+                canceled = Result.canceled()
+                canceled.attempts = tuple(diagnostic_attempts)
+                return canceled
             attempt += 1
             _emit_lifecycle(
                 lifecycle_sink,
@@ -605,6 +655,16 @@ class Runner:
                     lifecycle_sink=lifecycle_sink,
                 )
 
+            retry_attempt = res.attempts[0]
+            diagnostic_attempts.append(
+                DiagnosticAttempt(
+                    retry_index=attempt,
+                    log_name=retry_attempt.log_name,
+                    provider=retry_attempt.provider,
+                    model=retry_attempt.model,
+                )
+            )
+            res.attempts = tuple(diagnostic_attempts)
             if res.rc == 0:
                 if model != "downgrade":
                     kp.on_success()
@@ -619,7 +679,11 @@ class Runner:
             f"          ⚠️ 已完成允许的重试但后端仍失败 "
             f"({max_attempts}): {base_log}\n"
         )
-        return last_result if last_result is not None else Result(1)
+        return (
+            last_result
+            if last_result is not None
+            else Result(1, attempts=tuple(diagnostic_attempts))
+        )
 
     # ── 公开入口(new / resume / fork)────────────────────────────────────────
 

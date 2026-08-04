@@ -459,6 +459,7 @@ def test_retry_executes_downgrade_without_rotating(monkeypatch):
             return KeyContext(
                 primary_model="primary-model",
                 downgrade_model="downgrade-model",
+                provider_id="provider-a",
             )
         def on_success(self): pass
         def rotate(self):
@@ -486,6 +487,18 @@ def test_retry_executes_downgrade_without_rotating(monkeypatch):
     retry_argv = _MOCK.calls[1][2]
     model_index = retry_argv.index("--model")
     assert retry_argv[model_index + 1] == "downgrade-model"
+    assert [
+        (
+            attempt.retry_index,
+            attempt.log_name,
+            attempt.provider,
+            attempt.model,
+        )
+        for attempt in result.attempts
+    ] == [
+        (0, "downgrade", "provider-a", "primary-model"),
+        (1, "downgrade-r1", "provider-a", "downgrade-model"),
+    ]
 
 
 # ── react returns a stop reason → exit 1 ─────────────────────────────────
