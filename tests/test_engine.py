@@ -89,7 +89,7 @@ def isolate(tmp_path, monkeypatch):
     _cfg._reset_default()
     eng._reset_default_runner()
     # Mock backend 注入到 Runner 类(所有实例可见);刷新其 config 吃到 setenv。
-    _MOCK._config = _cfg.Config(toml={})
+    _MOCK._config = _cfg.Config(config_dict={})
     monkeypatch.setattr(eng.Runner, "_get_backend", lambda self: _MOCK)
     yield
     _MOCK.calls.clear()
@@ -139,7 +139,7 @@ def test_session_new_succeeds_first_try(monkeypatch):
     monkeypatch.setenv("AR_PRIMARY_MODEL", "test-model")
     from agent_runner import config as _cfg
     # 刷新 mock backend 的 config,吃到刚设的 AR_PRIMARY_MODEL(无模块级缓存可清)。
-    _MOCK._config = _cfg.Config(toml={})
+    _MOCK._config = _cfg.Config(config_dict={})
     rc = eng.agent_with_retry_session_new("prompt", "log1")
     assert rc.rc == 0
     assert len(_MOCK.calls) == 1

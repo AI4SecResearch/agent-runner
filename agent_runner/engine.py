@@ -81,7 +81,7 @@ class Runner:
 
     # ── lazy resolution (config is fixed at construction; backend/kp on first use) ─
     def _get_backend(self):
-        """解析当前 backend(经 config 层,AR_BACKEND env > TOML > 默认 claude-code)。
+        """解析当前 backend(经 config 层,AR_BACKEND env > 配置文件 > 默认 claude-code)。
         按需懒解析,每个 Runner 实例独立。"""
         if self._backend is None:
             name = self._config.get("backend", "claude-code")
@@ -143,7 +143,7 @@ class Runner:
         argv = list(backend.perm_args())
         has_model = "--model" in extra
         if not has_model:
-            # key_ctx.primary_model 为空时回落 config(启动期 AR_* env / TOML)
+            # key_ctx.primary_model 为空时回落 config(启动期 AR_* env / 配置文件)
             resolved_model = key_ctx.primary_model if key_ctx else ""
             argv += backend.model_args(
                 "primary", resolved_model=resolved_model,

@@ -2,6 +2,7 @@
 #
 # 所有配置项都可写进 TOML,也都可经 AR_ 前缀环境变量覆盖(env 优先于本文件)。
 # 找到本文件的位置:1) $AR_CONFIG_FILE  2) ./agent-runner.toml  3) ~/.config/agent-runner/config.toml
+# 同样支持 JSON / JSONC(.json / .jsonc,可写注释),注释模板见 agent-runner.example.jsonc。
 # 复制为 agent-runner.toml 并按需修改。
 
 # ── agent 后端 ──────────────────────────────────────────────────────────

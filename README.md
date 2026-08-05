@@ -24,7 +24,7 @@ if res:
 
 模块级函数(`agent_with_retry` 等)内部委托一个 **thread-local 默认 `Runner`** —— 即:单线程调用方**零改动**即可跨线程并发使用,每线程各自独立的编排状态、keypool、env 快照,无跨线程竞态。
 
-需**多 Agent 微调**或显式隔离的场景,用 `Runner(config_overrides=...)` —— 每个实例持自己的 `Config`(优先级:`config_overrides` > `AR_` env > TOML > 默认),backend、keypool 全隔离:
+需**多 Agent 微调**或显式隔离的场景,用 `Runner(config_overrides=...)` —— 每个实例持自己的 `Config`(优先级:`config_overrides` > `AR_` env > 配置文件 > 默认),backend、keypool 全隔离:
 
 ```python
 from agent_runner import Runner
@@ -57,13 +57,17 @@ agent-runner.sh resume "精修 markdown" "refined" "$sid"
 
 entry(进程形态取一):`new` / `resume` / `fork` / `once` / `agent_with_retry`(全名如 `agent_with_retry_session_new` 亦接受)。`resume`/`fork`/`once` 在 `log_name` 之后还需 `session_id`;再之后的参数透传给 agent(如 `--model x`)。
 
-## 配置(TOML 文件 + `AR_` env)
+## 配置(TOML / JSON 文件 + `AR_` env)
 
-所有配置项走同一套机制：写进 TOML 文件，或用 `AR_` 前缀的环境变量覆盖(env 优先)，硬编码默认值兜底。优先级:**`AR_` env > TOML > 默认**。哪项放哪由调用方决定,agent-runner 不做规定。
+所有配置项走同一套机制：写进配置文件，或用 `AR_` 前缀的环境变量覆盖(env 优先)，硬编码默认值兜底。优先级:**`AR_` env > 配置文件 > 默认**。哪项放哪由调用方决定,agent-runner 不做规定。
 
-**TOML 查找**(取第一个存在的)：`$AR_CONFIG_FILE` → `./agent-runner.toml` → `~/.config/agent-runner/config.toml`。完整注释模板见 `agent-runner.example.toml`。无 TOML 也能跑(默认 + env)。
+支持两种格式(按扩展名自动识别):
+- **TOML** (`.toml`)
+- **JSON / JSONC** (`.json` / `.jsonc`) —— JSONC 支持写 `//` 与 `/* */` 注释(与 lpm 的 `providers.jsonc` 同一套约定);纯 JSON 是其子集。
 
-| TOML key | `AR_` env | 默认值 | 用途 |
+**配置文件查找**(取第一个存在的)：`$AR_CONFIG_FILE`(任意扩展名) → `./agent-runner.{toml,jsonc,json}` → `~/.config/agent-runner/config.{toml,jsonc,json}`。同一档里 `.toml` > `.jsonc` > `.json`(便于既有 TOML 用户零迁移)。注释模板见 `agent-runner.example.toml` / `agent-runner.example.jsonc`。无配置文件也能跑(默认 + env)。
+
+| 配置 key | `AR_` env | 默认值 | 用途 |
 |---|---|---|---|
 | `backend` | `AR_BACKEND` | `claude-code` | agent 后端 |
 | `primary_model` | `AR_PRIMARY_MODEL` | (无) | 调用方意愿的模型(provider 供应校验;见下) |
@@ -98,6 +102,8 @@ python -m pytest -q
 ```
 agent-runner/
 ├── agent-runner.sh              # bash → `python -m agent_runner` 封装(进程形态)
+├── agent-runner.example.toml    # 配置文件注释模板(TOML)
+├── agent-runner.example.jsonc   # 配置文件注释模板(JSON/JSONC)
 ├── pyproject.toml               # 包元数据(纯 stdlib;支持 pip -e .)
 ├── README.md                    # 本文件 — 使用指南
 ├── ARCHITECTURE.md              # 实现与并发设计

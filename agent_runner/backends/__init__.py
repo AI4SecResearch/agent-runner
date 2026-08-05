@@ -102,7 +102,7 @@ class Backend(Protocol):
         ``resolved_model`` (the keypool's resolved model id, from ``KeyContext``)
         takes priority over the config layer — this is the multi-thread path
         that bypasses the ``AR_*`` env round-trip. Empty → fall back to config
-        (the startup-time ``AR_PRIMARY_MODEL``/``AR_DOWNGRADE_MODEL`` env or TOML).
+        (the startup-time ``AR_PRIMARY_MODEL``/``AR_DOWNGRADE_MODEL`` env or config file).
 
         ``provider_id`` (the keypool's resolved provider id, keyword-only) lets a
         backend qualify the model id for agents that require a provider prefix

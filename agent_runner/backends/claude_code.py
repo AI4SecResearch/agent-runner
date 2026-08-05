@@ -35,7 +35,7 @@ except Exception:  # pragma: no cover - lpm not yet importable at module load
     _BASE_URL_VAR = "ANTHROPIC_BASE_URL"
 
 
-# 模型名不在此写死——经 config 层取(AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL,TOML 或 env),
+# 模型名不在此写死——经 config 层取(AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL,配置文件或 env),
 # keypool 按供应校验覆盖。无 config 值则 model_args 返回空(由调用方/agent 处理)。
 
 
@@ -172,7 +172,7 @@ class ClaudeCodeBackend:
     def model_args(self, tier: str, resolved_model: str = "",
                    *, provider_id: str = "") -> list[str]:
         # resolved_model (keypool-resolved, multi-thread path) 优先于 config 层,
-        # 绕过 AR_* env 回环。空 resolved_model → 回落 config(启动期 AR_* env / TOML)。
+        # 绕过 AR_* env 回环。空 resolved_model → 回落 config(启动期 AR_* env / 配置文件)。
         # provider_id 对 claude 无意义——其 --model 接受裸 id(由
         # ANTHROPIC_BASE_URL 路由到对应 provider),故忽略。
         if resolved_model:

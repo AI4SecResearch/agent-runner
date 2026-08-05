@@ -1,8 +1,9 @@
-"""config.py 测试:Config 类(解析视图)、SPECS 表驱动、TOML 加载、
-AR_ env 覆盖优先级、config_overrides 微调(多实例)、类型转换。
+"""config.py 测试:Config 类(解析视图)、SPECS 表驱动、配置文件加载
+(TOML / JSON / JSONC)、AR_ env 覆盖优先级、config_overrides 微调(多实例)、类型转换。
 
-新设计:配置经 ``Config(config_overrides=..., toml=...)`` 实例化,构造时一次性解析、
-无后续缓存污染(无 ``clear_cache``)。优先级:**config_overrides(实例) > AR_ env > TOML > 默认**。
+新设计:配置经 ``Config(config_overrides=..., config_dict=...)`` 实例化,构造时一次性
+解析、无后续缓存污染(无 ``clear_cache``)。优先级:**config_overrides(实例) > AR_ env
+> 配置文件 > 默认**。
 """
 
 from __future__ import annotations
@@ -17,7 +18,14 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
 from agent_runner import config  # noqa: E402
-from agent_runner.config import SPECS, Config, Spec  # noqa: E402
+from agent_runner.config import (  # noqa: E402
+    SPECS,
+    Config,
+    Spec,
+    _candidate_paths,
+    _load_config_file,
+    _parse_config_file,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -55,13 +63,13 @@ def test_each_spec_has_consistent_type_and_key():
 
 # ── 默认值 ─────────────────────────────────────────────────────────────────
 
-def test_defaults_without_toml_or_env(monkeypatch):
+def test_defaults_without_config_file_or_env(monkeypatch):
     monkeypatch.delenv("AR_BACKEND", raising=False)
     monkeypatch.delenv("AR_SKIP_PERMISSIONS", raising=False)
     monkeypatch.delenv("AR_STALL_TIMEOUT", raising=False)
     monkeypatch.delenv("AR_TOTAL_TIMEOUT", raising=False)
     monkeypatch.delenv("AR_OPENCODE_AUTH_ENV_VAR", raising=False)
-    c = Config(toml={})
+    c = Config(config_dict={})
     assert c.get("backend") == "claude-code"
     assert c.get("skip_permissions") is False
     assert c.get("stall_timeout") == 300
@@ -72,51 +80,135 @@ def test_defaults_without_toml_or_env(monkeypatch):
 def test_no_default_items_return_none(monkeypatch):
     monkeypatch.delenv("AR_PRIMARY_MODEL", raising=False)
     monkeypatch.delenv("AR_RUN_DIR", raising=False)
-    c = Config(toml={})
+    c = Config(config_dict={})
     assert c.get("primary_model") is None
     assert c.get("run_dir") is None
     assert c.get("primary_model", "fb") == "fb"
 
 
-# ── TOML 加载 ──────────────────────────────────────────────────────────────
+# ── 配置 dict 加载 ─────────────────────────────────────────────────────────
 
-def test_toml_loaded():
-    c = Config(toml={"backend": "opencode", "primary_model": "glm-5.1", "run_dir": "/tmp/x"})
+def test_config_dict_loaded():
+    c = Config(config_dict={"backend": "opencode", "primary_model": "glm-5.1", "run_dir": "/tmp/x"})
     assert c.get("backend") == "opencode"
     assert c.get("primary_model") == "glm-5.1"
     assert c.get("run_dir") == "/tmp/x"
 
 
-def test_toml_nested_timeouts():
-    """[timeouts] 子表经 toml_path 解析。"""
-    c = Config(toml={"timeouts": {"stall": 100, "total": 200}})
+def test_nested_timeouts():
+    """[timeouts] 子表(TOML 子表 / JSON 嵌套对象)经 dotted path 解析。"""
+    c = Config(config_dict={"timeouts": {"stall": 100, "total": 200}})
     assert c.get("stall_timeout") == 100
     assert c.get("total_timeout") == 200
 
 
-# ── env 覆盖 ───────────────────────────────────────────────────────────────
+# ── JSON / JSONC 配置文件加载 ──────────────────────────────────────────────
 
-def test_env_overrides_toml(monkeypatch):
+def test_parse_json_file(tmp_path: Path):
+    p = tmp_path / "agent-runner.json"
+    p.write_text('{"backend": "opencode", "primary_model": "glm-5.1"}', encoding="utf-8")
+    data = _parse_config_file(p)
+    assert data == {"backend": "opencode", "primary_model": "glm-5.1"}
+
+
+def test_parse_jsonc_strips_comments(tmp_path: Path):
+    """jsonc 的 // 与 /* */ 注释被剥离;串内 // 保留。"""
+    p = tmp_path / "agent-runner.jsonc"
+    p.write_text("""{
+  // a line comment
+  "backend": "opencode", /* block */ "primary_model": "glm-5.1",
+  "downgrade_model": "secret-with-//-inside"
+}""", encoding="utf-8")
+    data = _parse_config_file(p)
+    assert data["backend"] == "opencode"
+    assert data["primary_model"] == "glm-5.1"
+    # // inside a string literal must be preserved, not treated as a comment
+    assert data["downgrade_model"] == "secret-with-//-inside"
+
+
+def test_load_jsonc_file_via_ar_config_file(tmp_path: Path, monkeypatch):
+    """AR_CONFIG_FILE 指向 .jsonc → Config() 自动识别并加载(含嵌套超时)。"""
+    p = tmp_path / "config.jsonc"
+    p.write_text("""{
+  // backend 注释
+  "backend": "opencode",
+  "primary_model": "glm-5.1",
+  "timeouts": {"stall": 100, "total": 200}  /* 超时 */
+}""", encoding="utf-8")
+    monkeypatch.setenv("AR_CONFIG_FILE", str(p))
+    c = Config()
+    assert c.get("backend") == "opencode"
+    assert c.get("primary_model") == "glm-5.1"
+    assert c.get("stall_timeout") == 100
+    assert c.get("total_timeout") == 200
+
+
+def test_env_overrides_jsonc_file(tmp_path: Path, monkeypatch):
+    """AR_ env 优先于配置文件(.jsonc)。"""
+    p = tmp_path / "config.jsonc"
+    p.write_text('{"backend": "opencode", "stall_timeout": 100}', encoding="utf-8")
+    monkeypatch.setenv("AR_CONFIG_FILE", str(p))
     monkeypatch.setenv("AR_BACKEND", "claude-code")
     monkeypatch.setenv("AR_STALL_TIMEOUT", "999")
-    c = Config(toml={"backend": "opencode", "stall_timeout": 100})
+    c = Config()
     assert c.get("backend") == "claude-code"
     assert c.get("stall_timeout") == 999
 
 
-def test_env_overrides_default_when_no_toml(monkeypatch):
+def test_candidate_order_prefers_toml_over_json(tmp_path: Path, monkeypatch):
+    """同一档里 .toml 优先于 .jsonc 优先于 .json。"""
+    monkeypatch.delenv("AR_CONFIG_FILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent-runner.toml").write_text('backend = "opencode"', encoding="utf-8")
+    (tmp_path / "agent-runner.json").write_text('{"backend": "claude-code"}', encoding="utf-8")
+    c = Config()
+    assert c.get("backend") == "opencode"  # toml wins
+
+
+def test_candidate_order_prefers_jsonc_over_json(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("AR_CONFIG_FILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent-runner.jsonc").write_text('{"backend": "opencode"}', encoding="utf-8")
+    (tmp_path / "agent-runner.json").write_text('{"backend": "claude-code"}', encoding="utf-8")
+    c = Config()
+    assert c.get("backend") == "opencode"  # jsonc wins over json
+
+
+def test_json_file_loaded_when_only_json(tmp_path: Path, monkeypatch):
+    """仅有 .json 时正常加载。"""
+    monkeypatch.delenv("AR_CONFIG_FILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent-runner.json").write_text(
+        '{"backend": "opencode", "timeouts": {"stall": 50}}', encoding="utf-8"
+    )
+    c = Config()
+    assert c.get("backend") == "opencode"
+    assert c.get("stall_timeout") == 50
+
+
+# ── env 覆盖 ───────────────────────────────────────────────────────────────
+
+def test_env_overrides_config_dict(monkeypatch):
+    monkeypatch.setenv("AR_BACKEND", "claude-code")
+    monkeypatch.setenv("AR_STALL_TIMEOUT", "999")
+    c = Config(config_dict={"backend": "opencode", "stall_timeout": 100})
+    assert c.get("backend") == "claude-code"
+    assert c.get("stall_timeout") == 999
+
+
+def test_env_overrides_default_when_no_config_file(monkeypatch):
     monkeypatch.setenv("AR_PRIMARY_MODEL", "glm-5.2")
-    c = Config(toml={})
+    c = Config(config_dict={})
     assert c.get("primary_model") == "glm-5.2"
 
 
 # ── config_overrides(实例级微调,多线程/多 Agent) ─────────────────────────
 
-def test_config_overrides_beat_env_and_toml(monkeypatch):
-    """config_overrides 优先级最高:压过 env 与 TOML。"""
+def test_config_overrides_beat_env_and_config_dict(monkeypatch):
+    """config_overrides 优先级最高:压过 env 与配置文件。"""
     monkeypatch.setenv("AR_PRIMARY_MODEL", "env-model")
     c = Config(config_overrides={"primary_model": "override-model"},
-               toml={"primary_model": "toml-model"})
+               config_dict={"primary_model": "toml-model"})
     assert c.get("primary_model") == "override-model"
 
 
@@ -135,9 +227,9 @@ def test_config_overrides_isolate_instances(monkeypatch):
 
 
 def test_config_overrides_none_falls_through(monkeypatch):
-    """config_overrides 里某键为 None → 不覆盖(回落 env/TOML)。"""
+    """config_overrides 里某键为 None → 不覆盖(回落 env/配置文件)。"""
     monkeypatch.setenv("AR_PRIMARY_MODEL", "env-model")
-    c = Config(config_overrides={"primary_model": None}, toml={})
+    c = Config(config_overrides={"primary_model": None}, config_dict={})
     assert c.get("primary_model") == "env-model"
 
 
@@ -146,15 +238,15 @@ def test_config_overrides_none_falls_through(monkeypatch):
 def test_skip_permissions_env_coerced_to_bool(monkeypatch):
     for truthy in ("1", "true", "yes", "on"):
         monkeypatch.setenv("AR_SKIP_PERMISSIONS", truthy)
-        assert Config(toml={}).get("skip_permissions") is True, f"{truthy} should be True"
+        assert Config(config_dict={}).get("skip_permissions") is True, f"{truthy} should be True"
     for falsy in ("0", "false", "no", "off", ""):
         monkeypatch.setenv("AR_SKIP_PERMISSIONS", falsy)
-        assert Config(toml={}).get("skip_permissions") is False, f"{falsy} should be False"
+        assert Config(config_dict={}).get("skip_permissions") is False, f"{falsy} should be False"
 
 
 def test_timeout_env_coerced_to_int(monkeypatch):
     monkeypatch.setenv("AR_STALL_TIMEOUT", "42")
-    c = Config(toml={})
+    c = Config(config_dict={})
     assert c.get("stall_timeout") == 42
     assert isinstance(c.get("stall_timeout"), int)
 
@@ -162,13 +254,13 @@ def test_timeout_env_coerced_to_int(monkeypatch):
 # ── keypool_state 派生 ─────────────────────────────────────────────────────
 
 def test_keypool_state_derived_from_key_pool_config():
-    c = Config(toml={"key_pool_config": "/some/dir/providers.jsonc"})
+    c = Config(config_dict={"key_pool_config": "/some/dir/providers.jsonc"})
     assert c.get("keypool_state") == "/some/dir/key-pool-state.json"
 
 
 def test_keypool_state_override(monkeypatch):
     monkeypatch.setenv("AR_KEYPOOL_STATE", "/custom/state.json")
-    c = Config(toml={"key_pool_config": "/a/providers.jsonc"})
+    c = Config(config_dict={"key_pool_config": "/a/providers.jsonc"})
     assert c.get("keypool_state") == "/custom/state.json"
 
 

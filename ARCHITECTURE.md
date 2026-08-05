@@ -35,13 +35,13 @@ classDiagram
 
     class Config {
         -_config_overrides: dict
-        -_toml: dict
+        -_config_dict: dict
         -_resolved: dict
-        +\_\_init__(config_overrides, toml)
+        +\_\_init__(config_overrides, config_dict)
         +get(key, default)
         -_resolve() dict
     }
-    note for Config "config_overrides > AR_ env > TOML > default"
+    note for Config "config_overrides > AR_ env > config file (TOML/JSON/JSONC) > default"
 
     class KeyPool {
         -_kp: LpmKeyPool
