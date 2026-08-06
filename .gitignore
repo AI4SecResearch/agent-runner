@@ -2,6 +2,12 @@
 providers.jsonc
 key-pool-state.json
 
+# a real config placed in the package root (local default; like providers.jsonc,
+# not committed — copy from *.example.* templates instead).
+agent-runner.toml
+agent-runner.jsonc
+agent-runner.json
+
 # python
 .venv/
 __pycache__/

@@ -186,6 +186,60 @@ def test_json_file_loaded_when_only_json(tmp_path: Path, monkeypatch):
     assert c.get("stall_timeout") == 50
 
 
+# ── 包根目录(bundled 默认配置)发现 ────────────────────────────────────────
+
+def test_own_root_dir_in_candidate_paths(monkeypatch):
+    """_candidate_paths 含包根目录(_OWN_DIR)的三个候选。"""
+    monkeypatch.delenv("AR_CONFIG_FILE", raising=False)
+    paths = _candidate_paths()
+    for name in ("agent-runner.toml", "agent-runner.jsonc", "agent-runner.json"):
+        assert config._OWN_DIR / name in paths
+
+
+def test_own_root_discovered_when_no_cwd_or_explicit(tmp_path: Path, monkeypatch):
+    """无 AR_CONFIG_FILE、CWD 无配置时,自身根目录的 agent-runner.json 被发现。"""
+    own = tmp_path / "ownroot"
+    own.mkdir()
+    (own / "agent-runner.json").write_text(
+        '{"backend": "opencode", "timeouts": {"stall": 999}}', encoding="utf-8"
+    )
+    monkeypatch.setattr(config, "_OWN_DIR", own)
+    monkeypatch.delenv("AR_CONFIG_FILE", raising=False)
+    cwd = tmp_path / "cwd"  # 空 CWD
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    c = Config()
+    assert c.get("backend") == "opencode"
+    assert c.get("stall_timeout") == 999
+
+
+def test_cwd_beats_own_root(tmp_path: Path, monkeypatch):
+    """CWD 的配置优先于自身根目录的。"""
+    own = tmp_path / "ownroot"
+    own.mkdir()
+    (own / "agent-runner.json").write_text('{"backend": "from-own"}', encoding="utf-8")
+    monkeypatch.setattr(config, "_OWN_DIR", own)
+    monkeypatch.delenv("AR_CONFIG_FILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent-runner.json").write_text('{"backend": "from-cwd"}', encoding="utf-8")
+    c = Config()
+    assert c.get("backend") == "from-cwd"
+
+
+def test_explicit_beats_own_root(tmp_path: Path, monkeypatch):
+    """AR_CONFIG_FILE 优先于自身根目录的配置。"""
+    own = tmp_path / "ownroot"
+    own.mkdir()
+    (own / "agent-runner.json").write_text('{"backend": "from-own"}', encoding="utf-8")
+    monkeypatch.setattr(config, "_OWN_DIR", own)
+    explicit = tmp_path / "explicit.json"
+    explicit.write_text('{"backend": "from-explicit"}', encoding="utf-8")
+    monkeypatch.setenv("AR_CONFIG_FILE", str(explicit))
+    monkeypatch.chdir(tmp_path)
+    c = Config()
+    assert c.get("backend") == "from-explicit"
+
+
 # ── env 覆盖 ───────────────────────────────────────────────────────────────
 
 def test_env_overrides_config_dict(monkeypatch):

@@ -16,7 +16,9 @@
 配置文件查找顺序(取第一个存在的):
   1. ``$AR_CONFIG_FILE``(显式指定,任意扩展名)
   2. ``./agent-runner.{toml,jsonc,json}``(当前工作目录)
-  3. ``~/.config/agent-runner/config.{toml,jsonc,json}``(XDG 风格用户级)
+  3. ``<agent_runner 包所在目录>/agent-runner.{toml,jsonc,json}``(随包 bundled
+     的默认配置;与 agent-runner.example.* 模板同目录)
+  4. ``~/.config/agent-runner/config.{toml,jsonc,json}``(XDG 风格用户级)
 
 同一档里 ``.toml`` 优先于 ``.jsonc`` 优先于 ``.json``(便于既有 TOML 用户零迁移)。
 找不到任何文件时,配置为空——所有项回落到硬编码默认(或被 env 覆盖)。即**无配置文件也能跑**。
@@ -69,6 +71,11 @@ SPECS: list[Spec] = [
 # 规范键集合(供快速查找)
 _KEYS = {s.key for s in SPECS}
 
+# 含 agent_runner 包的根目录(本文件 parent.parent;agent-runner.example.* 模板所在)。
+# 作为随包 bundled 默认配置的查找位置——在此放一份 agent-runner.json 即可作为默认,
+# 无需 AR_CONFIG_FILE env 或 CWD 约定。暴露为模块常量便于测试 monkeypatch。
+_OWN_DIR = Path(__file__).resolve().parent.parent
+
 
 # ── 配置文件加载(查找 + 按扩展名解析) ────────────────────────────────────
 
@@ -78,8 +85,13 @@ def _candidate_paths() -> list[Path]:
     explicit = os.environ.get("AR_CONFIG_FILE")
     if explicit:
         out.append(Path(explicit))
+    # 当前工作目录(ad-hoc 覆盖)
     for name in ("agent-runner.toml", "agent-runner.jsonc", "agent-runner.json"):
         out.append(Path.cwd() / name)
+    # 含本包的根目录(随包 bundled 默认配置;agent-runner.example.* 所在)
+    for name in ("agent-runner.toml", "agent-runner.jsonc", "agent-runner.json"):
+        out.append(_OWN_DIR / name)
+    # XDG 风格用户级回退
     for name in ("config.toml", "config.jsonc", "config.json"):
         out.append(Path.home() / ".config" / "agent-runner" / name)
     return out

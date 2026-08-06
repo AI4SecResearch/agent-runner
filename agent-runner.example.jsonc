@@ -1,7 +1,8 @@
 // agent-runner 配置文件示例(JSONC,支持 // 与 /* */ 注释)
 //
 // 所有配置项都可写进此文件,也都可经 AR_ 前缀环境变量覆盖(env 优先于本文件)。
-// 找到本文件的位置:1) $AR_CONFIG_FILE  2) ./agent-runner.jsonc  3) ~/.config/agent-runner/config.jsonc
+// 找到本文件的位置:1) $AR_CONFIG_FILE  2) ./agent-runner.jsonc(当前目录)
+//   3) <agent-runner 自身根目录>/agent-runner.jsonc(随包 bundled)  4) ~/.config/agent-runner/config.jsonc
 // 复制为 agent-runner.jsonc 并按需修改。(.json 纯 JSON 亦可,但不能写注释。)
 {
   // ── agent 后端 ──────────────────────────────────────────────────────
