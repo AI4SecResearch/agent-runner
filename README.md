@@ -45,8 +45,14 @@ res = r_claude.agent_with_retry("总结这份文档", "summary")
 sid=$(agent-runner.sh new "总结这份文档" "summary")   # stdout = session_id
 echo $?    # 0 = 成功,1 = 均失败,2 = 额度耗尽且无密钥池
 
+# 轻量任务可指定降级档([ARGUMENTS] 紧跟 entry、在位置参数之前):
+agent-runner.sh new --tier downgrade "/fix-json $file" "$log"
+
 # 多步会话:把上一步的 sid 传给 resume
 agent-runner.sh resume "精修 markdown" "refined" "$sid"
+
+# 需给底层 agent 透传 flag 时,用 '--' 分隔:
+agent-runner.sh new "prompt" "log" -- --model x --verbose
 ```
 
 进程形态的输出通道分工:
@@ -55,7 +61,13 @@ agent-runner.sh resume "精修 markdown" "refined" "$sid"
 - **stderr —— 诊断**(重试 / 超时 / 资源耗尽通告,给人看)。
 - 结果文本不进 stdout —— 已全量留存于 `$run_dir/<log_name>.jsonl`;库形态则经 `Result.text` 给到调用方。
 
-entry(进程形态取一):`new` / `resume` / `fork` / `once` / `agent_with_retry`(全名如 `agent_with_retry_session_new` 亦接受)。`resume`/`fork`/`once` 在 `log_name` 之后还需 `session_id`;再之后的参数透传给 agent(如 `--model x`)。
+entry(进程形态取一):`new` / `resume` / `fork` / `agent_with_retry`(全名如 `agent_with_retry_session_new` 亦接受)。CLI 形态:
+
+```
+agent-runner.sh <entry> [--tier primary|downgrade] <prompt> <log_name> [session_id] [-- <透传>]
+```
+
+`[ARGUMENTS]`(`--tier`)紧跟 entry、在位置参数之前;`resume`/`fork` 在 `log_name` 之后还需 `session_id`;`--` 之后的参数透传给 agent(如 `--model x`)。`--tier` 选模型档(默认 `primary`),具体模型由密钥池按 provider 解析(见下)。
 
 ## 配置(TOML / JSON 文件 + `AR_` env)
 
@@ -82,6 +94,8 @@ entry(进程形态取一):`new` / `resume` / `fork` / `once` / `agent_with_retry
 | `opencode_auth_env_var` | `AR_OPENCODE_AUTH_ENV_VAR` | `Z_AI_API_KEY` | opencode 读 API key 的 env 变量 |
 
 **模型选择**：`primary_model`/`downgrade_model` 表达调用方意愿。运行时密钥池检查所求模型是否在 provider 的可用 `models` 列表(来自 providers.jsonc)里：在 → 用它；不在 → 回落 provider 声明的 `primaryModel`/`downgradeModel`。无密钥池 → 原样透传给 agent。agent-runner **从不硬编码**模型名——一律来自 config/provider。
+
+**模型档选择**：主尝试默认走主档(`primary_model`)。进程形态 `agent-runner.sh new --tier downgrade …` 显式以降级档起步(库形态传 `model_tier="downgrade"`)——适合轻量任务(如 JSON 修复)。降级档的具体模型由密钥池按 provider 解析,故轮到不同 provider 会各自落到其供应的降级模型(而非全局写死的 id)。
 
 ## 测试
 

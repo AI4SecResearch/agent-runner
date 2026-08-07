@@ -129,13 +129,15 @@ class Runner:
     # ── process execution (pure orchestration, generic) ─────────────────────
 
     def _agent_once(self, prompt: str, log_name: str, extra: list[str],
-                    key_ctx: KeyContext | None = None):
-        """Assemble argv (perm + primary-model unless caller gave --model + pass-
-        through) → backend.invoke(key_ctx=...)。Guarantees exactly one --model
-        (caller overrides primary)。``key_ctx`` 透传给 invoke 构造隔离 env 快照;
-        其 ``primary_model`` 作为 model_args 的 resolved_model(绕过 AR_* env 回环)。
-        Returns the ``Popen`` (NOT waited on) — the watchdog owns the lifecycle。
-        Success is never judged from the returncode (see result_ok)。"""
+                    key_ctx: KeyContext | None = None,
+                    model_tier: str = "primary"):
+        """组装 argv(权限 flag + 模型,除非调用方已给 --model)并交给
+        ``backend.invoke(key_ctx=...)``。保证只有一个 --model(调用方的 --model 优先)。
+        ``model_tier`` 选档:"primary"(默认)用 ``key_ctx.primary_model``、"downgrade"
+        用 ``key_ctx.downgrade_model``(均由 keypool 按 provider 解析;无 key_ctx 时留空,
+        backend.model_args 回落 config 的 primary_model/downgrade_model)。``key_ctx``
+        透传给 invoke 构造隔离的 env 快照。返回 ``Popen``(不等候结束——生命周期由看门狗
+        拥有);成功与否绝不看 returncode(见 result_ok)。"""
         output = self._config.get("run_dir", "")
         prefix = f"{output}/{log_name}"
         backend = self._get_backend()
@@ -143,10 +145,15 @@ class Runner:
         argv = list(backend.perm_args())
         has_model = "--model" in extra
         if not has_model:
-            # key_ctx.primary_model 为空时回落 config(启动期 AR_* env / 配置文件)
-            resolved_model = key_ctx.primary_model if key_ctx else ""
+            # 按 tier 取 keypool 已解析的模型;无 key_ctx 时留空 → backend.model_args
+            # 回落 config(primary_model / downgrade_model)。
+            if key_ctx:
+                resolved_model = (key_ctx.downgrade_model if model_tier == "downgrade"
+                                  else key_ctx.primary_model)
+            else:
+                resolved_model = ""
             argv += backend.model_args(
-                "primary", resolved_model=resolved_model,
+                model_tier, resolved_model=resolved_model,
                 provider_id=key_ctx.provider_id if key_ctx else "",
             )
         argv += list(extra)
@@ -155,7 +162,8 @@ class Runner:
 
     def _agent_once_with_watchdog(self, prompt: str, log_name: str,
                                   extra: list[str],
-                                  key_ctx: KeyContext | None = None) -> tuple[int, int]:
+                                  key_ctx: KeyContext | None = None,
+                                  model_tier: str = "primary") -> tuple[int, int]:
         """后台启动 agent,reader 线程把 stdout 流式写入 jsonl,主线程轮询早退/
         超时,正常则等待、超时则杀。返回 (进程退出码, 看门狗状态):看门狗状态
         0=正常结束、1=超时被杀。
@@ -173,7 +181,7 @@ class Runner:
         max_timeout = self._config.get("total_timeout", 0)
         backend = self._get_backend()
 
-        proc = self._agent_once(prompt, log_name, extra, key_ctx)
+        proc = self._agent_once(prompt, log_name, extra, key_ctx, model_tier=model_tier)
 
         # reader 线程:stdout → jsonl(阻塞至 stdout EOF,即进程退出——正常或被杀)。
         reader = threading.Thread(target=backend.stream, args=(proc, prefix), daemon=True)
@@ -239,7 +247,8 @@ class Runner:
 
     def _agent_once_with_check(self, prompt: str, log_name: str,
                                extra: list[str],
-                               key_ctx: KeyContext | None = None) -> Result:
+                               key_ctx: KeyContext | None = None,
+                               model_tier: str = "primary") -> Result:
         """看门狗 + 业务面结果检查。成功时返回带 session_id 与结果文本的 Result;
         失败(含超时被杀)返回 rc=1 的 Result。不碰密钥池——disable 由调用方决策
         (重试循环在循环顶部统一决策,单次执行不重复 disable)。
@@ -247,7 +256,8 @@ class Runner:
         session_id 与结果文本都从成功日志读回(单一真相,与后端是否流式无关)。"""
         output = self._config.get("run_dir", "")
         backend = self._get_backend()
-        _rc, wd = self._agent_once_with_watchdog(prompt, log_name, extra, key_ctx)
+        _rc, wd = self._agent_once_with_watchdog(prompt, log_name, extra, key_ctx,
+                                                  model_tier=model_tier)
         if wd == 1:
             return Result(1)  # 超时被杀 → 视为可重试失败
         if self._check_agent_result(log_name):
@@ -354,54 +364,67 @@ class Runner:
 
     # ── 公开入口(new / resume / fork)────────────────────────────────────────
 
-    def agent_with_retry_session_new(self, prompt: str, log_name: str, *extra: str) -> Result:
+    def agent_with_retry_session_new(self, prompt: str, log_name: str,
+                                     model_tier: str = "primary",
+                                     passthrough: tuple[str, ...] = ()) -> Result:
         """全新会话运行。返回 Result(rc=0 成功 / 1=均失败)。"""
-        extra_list = list(extra)
+        extra_list = list(passthrough)
         key_ctx = self._ensure_keypool().init()
-        res = self._agent_once_with_check(prompt, log_name, extra_list, key_ctx=key_ctx)
+        res = self._agent_once_with_check(prompt, log_name, extra_list, key_ctx=key_ctx,
+                                          model_tier=model_tier)
         if res.rc == 0:
             self._ensure_keypool().on_success()
             return res
         return self._agent_retry_loop(prompt, log_name, [], extra_list, key_ctx=key_ctx)
 
-    def agent_with_retry_session_resume(self, prompt: str, log_name: str, sid: str, *extra: str) -> Result:
+    def agent_with_retry_session_resume(self, prompt: str, log_name: str, sid: str,
+                                        model_tier: str = "primary",
+                                        passthrough: tuple[str, ...] = ()) -> Result:
         """在 session_id 上续接(resume:同一会话,积累上下文)。返回 Result(rc=0/1)。"""
-        extra_list = list(extra)
+        extra_list = list(passthrough)
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()
         session_args = backend.resume_args(sid)
-        res = self._agent_once_with_check(prompt, log_name, session_args + extra_list, key_ctx=key_ctx)
+        res = self._agent_once_with_check(prompt, log_name, session_args + extra_list,
+                                          key_ctx=key_ctx, model_tier=model_tier)
         if res.rc == 0:
             self._ensure_keypool().on_success()
             return res
         return self._agent_retry_loop(prompt, log_name, session_args, extra_list, key_ctx=key_ctx)
 
-    def agent_with_retry_session_fork(self, prompt: str, log_name: str, sid: str, *extra: str) -> Result:
+    def agent_with_retry_session_fork(self, prompt: str, log_name: str, sid: str,
+                                      model_tier: str = "primary",
+                                      passthrough: tuple[str, ...] = ()) -> Result:
         """从 session_id 分叉(fork:拷贝一份独立会话再跑)。返回 Result(rc=0/1)。"""
-        extra_list = list(extra)
+        extra_list = list(passthrough)
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()
         session_args = backend.fork_args(sid)
-        res = self._agent_once_with_check(prompt, log_name, session_args + extra_list, key_ctx=key_ctx)
+        res = self._agent_once_with_check(prompt, log_name, session_args + extra_list,
+                                          key_ctx=key_ctx, model_tier=model_tier)
         if res.rc == 0:
             self._ensure_keypool().on_success()
             return res
         return self._agent_retry_loop(prompt, log_name, session_args, extra_list, key_ctx=key_ctx)
 
-    def agent_once_session_resume(self, prompt: str, log_name: str, sid: str, *extra: str) -> Result:
+    def agent_once_session_resume(self, prompt: str, log_name: str, sid: str,
+                                  passthrough: tuple[str, ...] = ()) -> Result:
         """单次续接(无重试循环)。运行一次,后端支持则续接已有 session(否则退化为
         全新会话)。失败时按错误分类自行 disable 当前 key(单次入口自带 disable,
         没有外层循环替它决策)。返回 Result(rc=0 成功 / 1 可重试失败 / 2 额度耗尽
         且无密钥池,放弃)。"""
-        extra_list = list(extra)
+        extra_list = list(passthrough)
         backend = self._get_backend()
         key_ctx = self._ensure_keypool().init()
         resume_args = backend.resume_args(sid)
         return self._agent_once_with_disable(prompt, log_name, resume_args + extra_list, key_ctx=key_ctx)
 
-    def agent_with_retry(self, prompt: str, log_name: str, *extra: str) -> Result:
+    def agent_with_retry(self, prompt: str, log_name: str,
+                         model_tier: str = "primary",
+                         passthrough: tuple[str, ...] = ()) -> Result:
         """``agent_with_retry_session_new`` 的兼容别名。"""
-        return self.agent_with_retry_session_new(prompt, log_name, *extra)
+        return self.agent_with_retry_session_new(prompt, log_name, model_tier,
+                                                 passthrough)
 
 
 # ── 模块级透明双轨:thread-local 默认 Runner ──────────────────────────────
@@ -429,29 +452,41 @@ def _reset_default_runner() -> None:
         pass
 
 
-def agent_with_retry_session_new(prompt: str, log_name: str, *extra: str) -> Result:
+def agent_with_retry_session_new(prompt: str, log_name: str,
+                                 model_tier: str = "primary",
+                                 passthrough: tuple[str, ...] = ()) -> Result:
     """全新会话运行(模块级薄壳,委托 thread-local 默认 Runner)。"""
-    return _default_runner().agent_with_retry_session_new(prompt, log_name, *extra)
+    return _default_runner().agent_with_retry_session_new(prompt, log_name, model_tier,
+                                                          passthrough)
 
 
-def agent_with_retry_session_resume(prompt: str, log_name: str, sid: str, *extra: str) -> Result:
+def agent_with_retry_session_resume(prompt: str, log_name: str, sid: str,
+                                    model_tier: str = "primary",
+                                    passthrough: tuple[str, ...] = ()) -> Result:
     """在 session_id 上续接(模块级薄壳,委托 thread-local 默认 Runner)。"""
-    return _default_runner().agent_with_retry_session_resume(prompt, log_name, sid, *extra)
+    return _default_runner().agent_with_retry_session_resume(prompt, log_name, sid,
+                                                             model_tier, passthrough)
 
 
-def agent_with_retry_session_fork(prompt: str, log_name: str, sid: str, *extra: str) -> Result:
+def agent_with_retry_session_fork(prompt: str, log_name: str, sid: str,
+                                  model_tier: str = "primary",
+                                  passthrough: tuple[str, ...] = ()) -> Result:
     """从 session_id 分叉(模块级薄壳,委托 thread-local 默认 Runner)。"""
-    return _default_runner().agent_with_retry_session_fork(prompt, log_name, sid, *extra)
+    return _default_runner().agent_with_retry_session_fork(prompt, log_name, sid,
+                                                           model_tier, passthrough)
 
 
-def agent_once_session_resume(prompt: str, log_name: str, sid: str, *extra: str) -> Result:
+def agent_once_session_resume(prompt: str, log_name: str, sid: str,
+                              passthrough: tuple[str, ...] = ()) -> Result:
     """单次续接(模块级薄壳,委托 thread-local 默认 Runner)。"""
-    return _default_runner().agent_once_session_resume(prompt, log_name, sid, *extra)
+    return _default_runner().agent_once_session_resume(prompt, log_name, sid, passthrough)
 
 
-def agent_with_retry(prompt: str, log_name: str, *extra: str) -> Result:
+def agent_with_retry(prompt: str, log_name: str,
+                     model_tier: str = "primary",
+                     passthrough: tuple[str, ...] = ()) -> Result:
     """``agent_with_retry_session_new`` 的兼容别名。"""
-    return agent_with_retry_session_new(prompt, log_name, *extra)
+    return agent_with_retry_session_new(prompt, log_name, model_tier, passthrough)
 
 
 def classify_agent_error(log_name: str) -> str:

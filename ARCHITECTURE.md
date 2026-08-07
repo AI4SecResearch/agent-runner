@@ -19,12 +19,13 @@ classDiagram
         -_config: Config
         -_backend: Backend
         -_kp: KeyPool
-        +agent_with_retry_session_new(prompt, log_name, *extra)
-        +agent_with_retry_session_resume(prompt, log_name, sid, *extra)
-        +agent_with_retry_session_fork(prompt, log_name, sid, *extra)
-        +agent_once_session_resume(prompt, log_name, sid, *extra)
-        +agent_with_retry(prompt, log_name, *extra)
-        -_agent_once_with_check(prompt, log_name, extra, key_ctx)
+        +agent_with_retry_session_new(prompt, log_name, model_tier, passthrough)
+        +agent_with_retry_session_resume(prompt, log_name, sid, model_tier, passthrough)
+        +agent_with_retry_session_fork(prompt, log_name, sid, model_tier, passthrough)
+        +agent_once_session_resume(prompt, log_name, sid, passthrough)
+        +agent_with_retry(prompt, log_name, model_tier, passthrough)
+        -_agent_once(prompt, log_name, extra, key_ctx, model_tier)
+        -_agent_once_with_check(prompt, log_name, extra, key_ctx, model_tier)
         -_agent_once_with_disable(prompt, log_name, extra, key_ctx)
         -_agent_retry_loop(prompt, base_log, session_args, extra, key_ctx)
         -_get_backend()
@@ -156,6 +157,23 @@ For each invocation the engine: (1) selects a key + provider config from the poo
 - **Continue vs redo**: prefer continuing on the session_id the primary recorded (`继续` prompt + `--resume <sid>`); with no session, replay the primary verbatim (re-send `$prompt` + `$session_args`). Fork re-forks from the source session — never bare-resumes a shared context (would pollute sibling forks).
 - **Exit codes**: `_with_check` → 0/1; `_retry_loop` and the public entries → 0/1; `_with_disable` → 0/1/2 (2 = quota exhausted, no key pool).
 - **Never trust the process returncode**: success is always judged by `result_ok` reading the jsonl.
+
+**Model tier (main attempt vs retry)**: the primary attempt's tier is the caller's `model_tier` (`"primary"` default, or `"downgrade"` — e.g. via `--tier downgrade` in process mode); `_agent_once` maps it to `key_ctx.primary_model` / `key_ctx.downgrade_model` (both per-provider-resolved by the keypool). This affects **only the primary attempt** — the retry loop re-derives its tier each iteration from `react` (downgrade/rotate/disable), so `model_tier="downgrade"` simply starts where a reactive downgrade would have landed. Both paths read the same `key_ctx.{primary,downgrade}_model`.
+
+## Process-mode entry (`agent-runner.sh` + `__main__`)
+
+In process mode, bash consumers drive agent-runner as a "high-reliability agent" subprocess via `agent-runner.sh`. CLI flag parsing is split across two layers so the Python side receives clean positionals and does no flag parsing of its own:
+
+```
+user:    agent-runner.sh <entry> [--tier primary|downgrade] <prompt> <log_name> [session_id] [-- <passthrough>]
+           └─ agent-runner.sh parses the leading [ARGUMENTS] (--tier, default primary),
+              then reorders into the internal python form:
+python:    python -m agent_runner <entry> <model_tier> <prompt> <log_name> [session_id] [-- <passthrough>]
+           └─ __main__: entry=argv[0], model_tier=argv[1]; argv[2:] splits at '--' into
+              positionals + passthrough; dispatches (prompt, log_name, [sid,] model_tier, passthrough).
+```
+
+`[ARGUMENTS]` (agent-runner's own options, currently `--tier`) are kept structurally separate from the agent passthrough (`--` and after, forwarded verbatim to the underlying `claude`/`opencode`). bash owns the flag parse; `__main__` is a thin positional dispatcher; `model_tier` then threads through the engine public API (`agent_with_retry_session_*`) down to `_agent_once`. Library-mode callers bypass this entirely and pass `model_tier`/`passthrough` directly.
 
 ## Backends: the 11-op contract
 

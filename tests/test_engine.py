@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 import agent_runner.engine as eng  # noqa: E402
 from agent_runner.backends.claude_code import ClaudeCodeBackend  # noqa: E402
+from agent_runner.keypool import KeyContext  # noqa: E402
 
 
 def write_jsonl(prefix: str, events: list[dict]):
@@ -375,3 +376,41 @@ def test_result_failure_has_no_session_id(monkeypatch):
     assert res.text == ""
     assert int(res) == 1
     assert bool(res) is False
+
+
+# ── model_tier:主尝试按档选 key_ctx 的模型 ────────────────────────────────
+
+def _kp_returning(kctx):
+    """FakeKP,init/rotate 都返回给定 KeyContext(成功即止,不进重试)。"""
+    class FakeKP:
+        def init(self): return kctx
+        def on_success(self): pass
+        def rotate(self): return kctx
+        def disable(self): pass
+        def available_size(self): return 0
+        def react(self, t): return "stop"
+        def classify(self, t): return "rotate"
+    return FakeKP
+
+
+def test_model_tier_downgrade_uses_downgrade_model(monkeypatch):
+    """model_tier='downgrade' → _agent_once 用 key_ctx.downgrade_model(而非 primary)。"""
+    _MOCK.reset([{"events": [make_result()], "ok": True}])
+    kctx = KeyContext(primary_model="p-mod", downgrade_model="d-mod", provider_id="prov")
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: _kp_returning(kctx)())
+    eng.agent_with_retry_session_new("prompt", "logTier", model_tier="downgrade")
+    argv = _MOCK.calls[0][2]
+    assert "--model" in argv
+    assert "d-mod" in argv
+    assert "p-mod" not in argv
+
+
+def test_model_tier_default_uses_primary_model(monkeypatch):
+    """默认 model_tier='primary' → 用 key_ctx.primary_model。"""
+    _MOCK.reset([{"events": [make_result()], "ok": True}])
+    kctx = KeyContext(primary_model="p-mod", downgrade_model="d-mod", provider_id="prov")
+    monkeypatch.setattr(eng.Runner, "_ensure_keypool", lambda self: _kp_returning(kctx)())
+    eng.agent_with_retry_session_new("prompt", "logTierP")
+    argv = _MOCK.calls[0][2]
+    assert "p-mod" in argv
+    assert "d-mod" not in argv

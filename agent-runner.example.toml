@@ -14,6 +14,9 @@
 # primary_model 与 downgrade_model 若不在 provider 的可用 models 列表里,
 # 自动回落到 provider 声明的 primaryModel / downgradeModel。
 # 无密钥池时直传给 agent。
+# 运行档位(primary / downgrade)由调用方选择,不在本文件配:进程形态经
+# `--tier primary|downgrade`、库形态经 `model_tier=`(默认 primary)。降级档的
+# 具体模型同样由密钥池按 provider 解析——这里的 downgrade_model 只是"意愿"。
 #primary_model = "glm-5.1"
 #downgrade_model = "glm-4.7"
 

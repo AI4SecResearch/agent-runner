@@ -7,12 +7,15 @@
   - 进程形态:``python -m agent_runner`` 或经 ``agent-runner.sh`` 包装,供上层
     (尤其 bash 流水线)把本项目当作一个"高可靠 agent"子进程驱动。
 
-公开 API(签名一致:首参 prompt、次参 log_name、其后可变 extra):
+公开 API(签名一致:首参 prompt、次参 log_name、其后 model_tier、末参 passthrough):
 
-    agent_with_retry_session_new(prompt, log_name, *extra)          全新会话
-    agent_with_retry_session_resume(prompt, log_name, sid, *extra)  续接同一会话
-    agent_with_retry_session_fork(prompt, log_name, sid, *extra)    分叉独立会话
-    agent_with_retry(prompt, log_name, *extra)                      = _new 别名
+    agent_with_retry_session_new(prompt, log_name, model_tier="primary", passthrough=())          全新会话
+    agent_with_retry_session_resume(prompt, log_name, sid, model_tier="primary", passthrough=())  续接同一会话
+    agent_with_retry_session_fork(prompt, log_name, sid, model_tier="primary", passthrough=())    分叉独立会话
+    agent_with_retry(prompt, log_name, model_tier="primary", passthrough=())                      = _new 别名
+
+``model_tier`` = "primary"(默认)/ "downgrade"(降级档,具体模型由 keypool 按 provider
+解析);``passthrough`` = 透传给底层 agent 的 flag 序列(如 ``("--model", "x")``)。
 
 返回 ``Result``:``rc``(0 成功 / 1 均失败)、``session_id``(成功尝试记录的会话 id,
 供后续 resume/fork 续接)、``text``(成功尝试的结果文本)。``int(Result)``/

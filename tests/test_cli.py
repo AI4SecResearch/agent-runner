@@ -5,6 +5,11 @@ exit code.
 These call ``main()`` directly with monkeypatched engine functions, so no real
 agent binary is involved. The arg-ordering and exit-code-mapping contracts are
 the point — the engine functions themselves are covered by test_engine.py.
+
+Note: ``main()`` receives the INTERNAL form ``<entry> <model_tier> <prompt>
+<log_name> [session_id] [-- <passthrough>]`` — the user-facing ``--tier`` flag
+is parsed by ``agent-runner.sh`` (covered separately), which injects model_tier
+as argv[1].
 """
 
 from __future__ import annotations
@@ -30,69 +35,81 @@ def test_help_returns_zero(capsys):
 
 
 def test_unknown_entry_returns_2(capsys):
-    rc = main(["bogus", "p", "l"])
+    rc = main(["bogus", "primary", "p", "l"])
     assert rc == 2
+
+
+def test_missing_model_tier_returns_2(capsys, monkeypatch):
+    """entry 之后必须有 model_tier(argv[1],由 agent-runner.sh 注入)。"""
+    monkeypatch.setattr(eng, "agent_with_retry_session_new", lambda *a, **k: 0)
+    rc = main(["new"])  # 只有 entry,缺 model_tier
+    assert rc == 2
+    assert "model_tier" in capsys.readouterr().err
 
 
 def test_new_dispatches_to_session_new(monkeypatch):
     calls = []
     monkeypatch.setattr(eng, "agent_with_retry_session_new",
-                        lambda p, l, *e: (calls.append((p, l, e)), 0)[1])
-    rc = main(["new", "the prompt", "log1"])
+                        lambda prompt, log, model_tier, passthrough:
+                        (calls.append((prompt, log, model_tier, passthrough)), 0)[1])
+    rc = main(["new", "primary", "the prompt", "log1"])
     assert rc == 0
-    assert calls == [("the prompt", "log1", ())]
+    assert calls == [("the prompt", "log1", "primary", ())]
 
 
 def test_new_alias_agent_with_retry(monkeypatch):
     calls = []
     monkeypatch.setattr(eng, "agent_with_retry_session_new",
-                        lambda p, l, *e: (calls.append(e), 0)[1])
-    rc = main(["agent_with_retry", "p", "l"])
+                        lambda prompt, log, model_tier, passthrough:
+                        (calls.append((model_tier, passthrough)), 0)[1])
+    rc = main(["agent_with_retry", "primary", "p", "l"])
     assert rc == 0
-    assert calls == [()]
+    assert calls == [("primary", ())]
 
 
 def test_new_missing_log_returns_2(capsys, monkeypatch):
     monkeypatch.setattr(eng, "agent_with_retry_session_new", lambda *a, **k: 0)
-    rc = main(["new", "p"])  # missing log_name
+    rc = main(["new", "primary", "p"])  # missing log_name
     assert rc == 2
     assert "needs" in capsys.readouterr().err
 
 
 def test_resume_requires_session_id(capsys, monkeypatch):
     monkeypatch.setattr(eng, "agent_with_retry_session_resume", lambda *a, **k: 0)
-    rc = main(["resume", "p", "l"])  # missing sid
+    rc = main(["resume", "primary", "p", "l"])  # missing sid
     assert rc == 2
     assert "session_id" in capsys.readouterr().err
 
 
-def test_resume_dispatches_with_sid_and_extra(monkeypatch):
+def test_resume_dispatches_with_sid_and_passthrough(monkeypatch):
     calls = []
     monkeypatch.setattr(eng, "agent_with_retry_session_resume",
-                        lambda p, l, s, *e: (calls.append((p, l, s, e)), 0)[1])
-    rc = main(["resume", "p", "l", "sid-9", "--model", "x"])
+                        lambda prompt, log, sid, model_tier, passthrough:
+                        (calls.append((prompt, log, sid, model_tier, passthrough)), 0)[1])
+    rc = main(["resume", "primary", "p", "l", "sid-9", "--", "--model", "x"])
     assert rc == 0
-    assert calls == [("p", "l", "sid-9", ("--model", "x"))]
+    assert calls == [("p", "l", "sid-9", "primary", ("--model", "x"))]
 
 
 def test_fork_dispatches(monkeypatch):
     calls = []
     monkeypatch.setattr(eng, "agent_with_retry_session_fork",
-                        lambda p, l, s, *e: (calls.append((s, e)), 0)[1])
-    rc = main(["fork", "p", "l", "sid-1"])
+                        lambda prompt, log, sid, model_tier, passthrough:
+                        (calls.append((sid, model_tier, passthrough)), 0)[1])
+    rc = main(["fork", "primary", "p", "l", "sid-1"])
     assert rc == 0
-    assert calls == [("sid-1", ())]
+    assert calls == [("sid-1", "primary", ())]
 
 
-def test_double_dash_separator_consumed(monkeypatch):
-    """A leading `--` is consumed so callers can mark extra explicitly."""
+def test_passthrough_after_dashdash(monkeypatch):
+    """'--' 之后的参数原样作为 passthrough 透传给 agent。"""
     calls = []
     monkeypatch.setattr(eng, "agent_with_retry_session_new",
-                        lambda p, l, *e: (calls.append(e), 0)[1])
-    rc = main(["new", "p", "l", "--", "--model", "x"])
+                        lambda prompt, log, model_tier, passthrough:
+                        (calls.append(passthrough), 0)[1])
+    rc = main(["new", "primary", "p", "l", "--", "--model", "x", "--verbose"])
     assert rc == 0
-    # the literal leading '--' is dropped; '--model' 'x' kept as extra
-    assert calls == [("--model", "x")]
+    assert calls == [("--model", "x", "--verbose")]
 
 
 def test_subprocess_invocation_uses_main_module(tmp_path, monkeypatch):
@@ -119,9 +136,10 @@ def test_stdout_carries_session_id(monkeypatch, capsys):
     from agent_runner.engine import Result
     monkeypatch.setattr(
         eng, "agent_with_retry_session_new",
-        lambda p, l, *e: Result(0, session_id="sid-abc-123", text="agent answer"),
+        lambda prompt, log, model_tier, passthrough:
+        Result(0, session_id="sid-abc-123", text="agent answer"),
     )
-    rc = main(["new", "p", "l"])
+    rc = main(["new", "primary", "p", "l"])
     assert rc == 0
     out = capsys.readouterr().out
     assert out == "sid-abc-123\n"  # 一行 session_id,无别的
@@ -132,16 +150,42 @@ def test_stdout_empty_when_no_session_id(monkeypatch, capsys):
     from agent_runner.engine import Result
     monkeypatch.setattr(
         eng, "agent_with_retry_session_new",
-        lambda p, l, *e: Result(1),  # 均失败,无 session_id
+        lambda prompt, log, model_tier, passthrough: Result(1),
     )
-    rc = main(["new", "p", "l"])
+    rc = main(["new", "primary", "p", "l"])
     assert rc == 1
     assert capsys.readouterr().out == "\n"
 
 
 def test_int_result_still_works(monkeypatch, capsys):
     """engine 函数若返回裸 int(向后兼容),main() 也能处理:session_id 为空。"""
-    monkeypatch.setattr(eng, "agent_with_retry_session_new", lambda p, l, *e: 0)
-    rc = main(["new", "p", "l"])
+    monkeypatch.setattr(eng, "agent_with_retry_session_new",
+                        lambda prompt, log, model_tier, passthrough: 0)
+    rc = main(["new", "primary", "p", "l"])
     assert rc == 0
     assert capsys.readouterr().out == "\n"
+
+
+# ── model_tier(argv[1],由 agent-runner.sh 从 --tier 注入) ────────────────
+
+
+def test_model_tier_downgrade_forwarded(monkeypatch):
+    """argv[1]=downgrade → engine 收到 model_tier="downgrade"。"""
+    calls = []
+    monkeypatch.setattr(eng, "agent_with_retry_session_new",
+                        lambda prompt, log, model_tier, passthrough:
+                        (calls.append(model_tier), 0)[1])
+    rc = main(["new", "downgrade", "p", "l"])
+    assert rc == 0
+    assert calls == ["downgrade"]
+
+
+def test_model_tier_passthrough_independent(monkeypatch):
+    """model_tier 与 passthrough 各自独立:downgrade + 透传并存。"""
+    calls = []
+    monkeypatch.setattr(eng, "agent_with_retry_session_new",
+                        lambda prompt, log, model_tier, passthrough:
+                        (calls.append((model_tier, passthrough)), 0)[1])
+    rc = main(["new", "downgrade", "p", "l", "--", "--model", "x"])
+    assert rc == 0
+    assert calls == [("downgrade", ("--model", "x"))]

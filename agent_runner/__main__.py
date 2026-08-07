@@ -10,16 +10,17 @@
   - stderr   诊断(重试/超时/资源耗尽通告,给人看)。
 结果文本不进 stdout——已留存于 ``$OUTPUT_DIR/<log_name>.jsonl``。
 
-用法:
-    python -m agent_runner <entry> <prompt> <log_name> [session_id] [-- extra...]
+用法(经 ``agent-runner.sh``:bash 已把 ``--tier`` 解析为第 2 个位置参数):
+    python -m agent_runner <entry> <model_tier> <prompt> <log_name> [session_id] [-- extra...]
     python -m agent_runner --help
 
 <entry> 选操作(resume/fork 还需 session_id):
     new | resume | fork | agent_with_retry
     (全名亦接受:agent_with_retry_session_new 等)
 
-位置参数之后的全部透传给 agent 作为 extra(如 --model 等);开头的 ``--`` 分隔符
-会被吞掉(便于显式标记透传区)。
+<model_tier> = primary | downgrade(agent-runner.sh 从用户的 ``--tier`` 解析注入,
+默认 primary;直接调 ``python -m`` 时自行提供)。``--`` 之后的参数透传给 agent
+(如 --model)。CLI 标志解析在 agent-runner.sh;本模块只收干净的位置参数。
 """
 
 from __future__ import annotations
@@ -44,20 +45,23 @@ _ENTRIES = {
 _USAGE = """\
 agent-runner —— 可靠的 agent 执行(进程形态)
 
-用法:
-  agent-runner <entry> <prompt> <log_name> [session_id] [-- extra...]
+用户面(经 agent-runner.sh,bash 解析 [ARGUMENTS] 并重排):
+  agent-runner.sh <entry> [--tier primary|downgrade] <prompt> <log_name> [session_id] [-- <passthrough>]
+
+内部面(本模块直接接收):
+  python -m agent_runner <entry> <model_tier> <prompt> <log_name> [session_id] [-- <passthrough>]
 
 entry(取一):
   new / agent_with_retry_session_new        全新会话(== 别名 agent_with_retry)
   resume / agent_with_retry_session_resume  在已有 session 上续接
   fork / agent_with_retry_session_fork      从已有 session 分叉独立会话
 
-resume/fork 需 session_id。其后的参数透传给 agent(如 --model x);开头的
-'--' 分隔符会被吞掉。
+<model_tier> = primary | downgrade(agent-runner.sh 从 --tier 注入,默认 primary)。
+resume/fork 需 session_id。'--' 之后的参数透传给 agent(如 --model x)。
 
 输出通道:$? = 成败(0 成功 / 1 均失败),stdout = session_id 一行(供
 ``sid=$(...)`` 捕获),stderr = 诊断。配置经环境变量(OUTPUT_DIR、AGENT_BACKEND、
-SANDBOX、KEY_POOL_CONFIG 等),与库形态一致。
+KEY_POOL_CONFIG 等),与库形态一致。
 """
 
 
@@ -71,43 +75,40 @@ def main(argv: list[str]) -> int:
         sys.stderr.write(f"agent-runner: unknown entry '{entry}'.\n\n")
         sys.stdout.write(_USAGE)
         return 2
+    if len(argv) < 2:
+        sys.stderr.write(f"agent-runner: missing <model_tier> after entry '{entry}'.\n")
+        return 2
 
     fn_name, takes_sid = _ENTRIES[entry]
     fn = getattr(_engine, fn_name)
-    rest = list(argv[1:])
+    tier = argv[1]
+
+    # argv[2:] = 位置参数(prompt, log_name[, sid]) + 可选 '--' + 透传
+    rest = argv[2:]
+    try:
+        sep = rest.index("--")
+    except ValueError:
+        sep = len(rest)
+    positionals, passthrough = rest[:sep], tuple(rest[sep + 1:])
+
+    n_pos = 3 if takes_sid else 2
+    if len(positionals) < n_pos:
+        need = "<prompt> <log_name> <session_id>" if takes_sid else "<prompt> <log_name>"
+        sys.stderr.write(f"agent-runner: entry '{entry}' needs {need}.\n")
+        return 2
 
     if takes_sid:
-        if len(rest) < 3:
-            sys.stderr.write(
-                f"agent-runner: entry '{entry}' needs <prompt> <log_name> <session_id>.\n"
-            )
-            return 2
-        prompt, log_name, sid = rest[0], rest[1], rest[2]
-        extra = rest[3:]
+        prompt, log_name, sid = positionals[0], positionals[1], positionals[2]
+        res = fn(prompt, log_name, sid, tier, passthrough)
     else:
-        if len(rest) < 2:
-            sys.stderr.write(
-                f"agent-runner: entry '{entry}' needs <prompt> <log_name>.\n"
-            )
-            return 2
-        prompt, log_name = rest[0], rest[1]
-        extra = rest[2:]
-
-    # 吞掉 extra 开头的一个 '--' 分隔符(便于显式标记透传区,如
-    # `new p l -- --model x`)。非开头的 '--' 保留(那是真正的 agent 参数)。
-    if extra and extra[0] == "--":
-        extra = extra[1:]
-
-    if takes_sid:
-        res = fn(prompt, log_name, sid, *extra)
-    else:
-        res = fn(prompt, log_name, *extra)
+        prompt, log_name = positionals[0], positionals[1]
+        res = fn(prompt, log_name, tier, passthrough)
 
     # 进程形态的输出通道分工:$? = 成败(0/1/2),stdout = session_id 一行
     # (无则空行),stderr = 诊断(由 engine 内部写)。结果文本不进 stdout——
     # 它已全量留存于 <prefix>.jsonl,库形态则经 Result.text 给到调用方。
-    sid = getattr(res, "session_id", "") or ""
-    sys.stdout.write(sid + "\n")
+    sid_out = getattr(res, "session_id", "") or ""
+    sys.stdout.write(sid_out + "\n")
     sys.stdout.flush()
     return int(res)
 
