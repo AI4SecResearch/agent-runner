@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -263,6 +264,43 @@ def test_claude_process_reuses_explicit_config_directory_across_executions(
         call[1]["env"]["CLAUDE_CONFIG_DIR"] for call in popen_calls
     ] == [str(configured), str(configured)]
     assert configured.is_dir()
+
+
+def test_claude_resume_copies_source_session_into_current_project_directory(
+    tmp_path,
+    monkeypatch,
+):
+    configured = tmp_path / "agent-sessions" / "task-1" / "claude-code"
+    source = configured / "projects" / "-previous-execution" / "session-1.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text('{"type":"user"}\n', encoding="utf-8")
+    working_directory = tmp_path / "next.execution" / "outputs"
+    working_directory.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(configured))
+
+    class _Process:
+        pass
+
+    def record_popen(command, **kwargs):
+        return _Process()
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", record_popen)
+    backend = ClaudeCodeBackend()
+
+    process = backend.invoke(
+        "prompt",
+        str(tmp_path / "next.execution" / "diagnostics" / "run"),
+        ["--resume", "session-1", "--fork-session"],
+        working_directory=working_directory,
+    )
+    process._ar_err.close()
+
+    project_name = re.sub(
+        r"[^A-Za-z0-9-]", "-", str(working_directory.resolve())
+    )
+    copied = configured / "projects" / project_name / "session-1.jsonl"
+    assert copied.read_text(encoding="utf-8") == '{"type":"user"}\n'
+    assert copied.stat().st_mode & 0o777 == 0o600
 
 
 def test_internal_retry_keeps_requested_working_directory(tmp_path, monkeypatch):

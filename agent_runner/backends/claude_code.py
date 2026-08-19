@@ -16,7 +16,10 @@ Env vars (agent-agnostic; the key pool overrides per provider):
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -41,6 +44,68 @@ except Exception:  # pragma: no cover - lpm not yet importable at module load
 
 # 模型名不在此写死——经 config 层取(AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL,TOML 或 env),
 # keypool 按供应校验覆盖。无 config 值则 model_args 返回空(由调用方/agent 处理)。
+
+
+def _copy_resumed_session_to_current_project(
+    config_directory: Path,
+    *,
+    argv: list[str],
+    working_directory: str | os.PathLike[str] | None,
+) -> None:
+    try:
+        resume_index = argv.index("--resume")
+        session_id = argv[resume_index + 1]
+    except (ValueError, IndexError):
+        return
+    if (
+        not session_id
+        or session_id in {".", ".."}
+        or "/" in session_id
+        or "\\" in session_id
+        or "\0" in session_id
+    ):
+        return
+    projects = config_directory / "projects"
+    if not projects.is_dir() or projects.is_symlink():
+        return
+    project_name = re.sub(
+        r"[^A-Za-z0-9-]",
+        "-",
+        str(Path(working_directory or Path.cwd()).resolve()),
+    )
+    target_directory = projects / project_name
+    sources = []
+    for project in projects.iterdir():
+        if not project.is_dir() or project.is_symlink():
+            continue
+        candidate = project / f"{session_id}.jsonl"
+        if candidate.is_file() and not candidate.is_symlink():
+            sources.append(candidate)
+    if not sources:
+        return
+    source = max(sources, key=lambda candidate: candidate.stat().st_mtime_ns)
+    target = target_directory / source.name
+    if source == target:
+        return
+    target_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "posix":
+        target_directory.chmod(0o700)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=target_directory,
+            prefix=f".{session_id}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            with source.open("rb") as source_file:
+                shutil.copyfileobj(source_file, temporary)
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, target)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 class ClaudeCodeBackend:
@@ -110,6 +175,12 @@ class ClaudeCodeBackend:
         if os.name == "posix":
             config_directory.chmod(0o700)
             temporary_directory.chmod(0o700)
+        if configured_session_directory:
+            _copy_resumed_session_to_current_project(
+                config_directory,
+                argv=argv,
+                working_directory=working_directory,
+            )
         process_environment = self._build_env(key_ctx)
         if process_environment is None:
             process_environment = dict(os.environ)
