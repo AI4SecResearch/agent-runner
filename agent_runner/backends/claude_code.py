@@ -94,9 +94,14 @@ class ClaudeCodeBackend:
         err = _open_private_text(err_path)  # attached to proc; stream closes it
         # Runtime supplies <execution>/diagnostics/<log>; keep Claude's
         # mutable state in the sibling outputs directory already authorized.
+        configured_session_directory = os.environ.get("CLAUDE_CONFIG_DIR")
         config_directory = (
-            Path(prefix).parent.parent / "outputs" / ".claude-runtime"
+            Path(configured_session_directory)
+            if configured_session_directory
+            else Path(prefix).parent.parent / "outputs" / ".claude-runtime"
         )
+        if not config_directory.is_absolute():
+            raise RuntimeError("CLAUDE_CONFIG_DIR must be absolute")
         temporary_directory = (
             Path(prefix).parent.parent / "outputs" / ".claude-tmp"
         )

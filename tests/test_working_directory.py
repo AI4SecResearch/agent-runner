@@ -231,6 +231,40 @@ def test_claude_process_uses_execution_local_runtime_directories(
     assert expected_tmp.is_dir()
 
 
+def test_claude_process_reuses_explicit_config_directory_across_executions(
+    tmp_path,
+    monkeypatch,
+):
+    configured = tmp_path / "agent-sessions" / "task-1" / "claude-code"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(configured))
+    popen_calls = []
+
+    class _Process:
+        pass
+
+    def record_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return _Process()
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", record_popen)
+    backend = ClaudeCodeBackend()
+
+    for attempt in (1, 2):
+        diagnostics = tmp_path / f"execution-{attempt}" / "diagnostics"
+        diagnostics.mkdir(parents=True)
+        process = backend.invoke(
+            "prompt",
+            str(diagnostics / "run"),
+            [],
+        )
+        process._ar_err.close()
+
+    assert [
+        call[1]["env"]["CLAUDE_CONFIG_DIR"] for call in popen_calls
+    ] == [str(configured), str(configured)]
+    assert configured.is_dir()
+
+
 def test_internal_retry_keeps_requested_working_directory(tmp_path, monkeypatch):
     working_directory = tmp_path / "workspace"
     working_directory.mkdir()
