@@ -233,6 +233,66 @@ def test_claude_process_uses_execution_local_runtime_directories(
     assert expected_tmp.is_dir()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows command-line limit")
+def test_windows_claude_prompt_uses_stdin_instead_of_argv(
+    tmp_path,
+    monkeypatch,
+):
+    diagnostics = tmp_path / "execution" / "diagnostics"
+    diagnostics.mkdir(parents=True)
+    prompt = "security assessment\n" * 4_000
+    invocation = {}
+
+    class _Process:
+        pass
+
+    def record_popen(command, **kwargs):
+        invocation["command"] = command
+        invocation["prompt"] = kwargs["stdin"].read()
+        return _Process()
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", record_popen)
+
+    process = ClaudeCodeBackend().invoke(
+        prompt,
+        str(diagnostics / "run"),
+        [],
+    )
+    process._ar_err.close()
+
+    assert prompt not in invocation["command"]
+    assert invocation["prompt"] == prompt
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows open-handle cleanup")
+def test_claude_spawn_failure_closes_diagnostic_handle(
+    tmp_path,
+    monkeypatch,
+):
+    execution = tmp_path / "execution"
+    diagnostics = execution / "diagnostics"
+    diagnostics.mkdir(parents=True)
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError(206, "command line is too long")
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", fail_popen)
+
+    captured_error = None
+    try:
+        ClaudeCodeBackend().invoke(
+            "prompt",
+            str(diagnostics / "run"),
+            [],
+        )
+    except FileNotFoundError as error:
+        captured_error = error
+
+    assert captured_error is not None
+    assert captured_error.__traceback__ is not None
+    execution.rename(tmp_path / "released")
+
+
 def test_claude_process_uses_resolved_cli_path(tmp_path, monkeypatch):
     diagnostics = tmp_path / "execution" / "diagnostics"
     diagnostics.mkdir(parents=True)

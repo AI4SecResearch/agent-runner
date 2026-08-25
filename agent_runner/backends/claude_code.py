@@ -183,8 +183,10 @@ class ClaudeCodeBackend:
         ``os.environ`` as-is.
         """
         from ..platform import PLATFORM
+        prompt_via_stdin = os.name == "nt"
         cmd = [
-            _resolve_claude_executable(), "-p", prompt,
+            _resolve_claude_executable(), "-p",
+            *([] if prompt_via_stdin else [prompt]),
             "--output-format", "stream-json", "--verbose",
             *argv,
         ]
@@ -224,13 +226,34 @@ class ClaudeCodeBackend:
             process_environment = dict(os.environ)
         process_environment["CLAUDE_CONFIG_DIR"] = str(config_directory)
         process_environment["TMPDIR"] = str(temporary_directory)
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=err, text=True,
-            encoding="utf-8",
-            env=process_environment,
-            cwd=working_directory,
-            **PLATFORM.new_session_kwargs(),
-        )
+        prompt_input = None
+        try:
+            popen_kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": err,
+                "text": True,
+                "encoding": "utf-8",
+                "env": process_environment,
+                "cwd": working_directory,
+                **PLATFORM.new_session_kwargs(),
+            }
+            if prompt_via_stdin:
+                prompt_input = tempfile.TemporaryFile(
+                    mode="w+",
+                    encoding="utf-8",
+                    newline="",
+                    dir=_filesystem_path(temporary_directory),
+                )
+                prompt_input.write(prompt)
+                prompt_input.seek(0)
+                popen_kwargs["stdin"] = prompt_input
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except BaseException:
+            err.close()
+            raise
+        finally:
+            if prompt_input is not None:
+                prompt_input.close()
         proc._ar_err = err  # per-call; stream's finally closes it
         return proc
 

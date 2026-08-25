@@ -190,6 +190,11 @@ def test_private_process_integration_wraps_real_backend_spawn(
     monkeypatch.setattr(eng.Runner, "_get_backend", _REAL_GET_BACKEND)
     monkeypatch.setattr(claude_code.subprocess, "Popen", record_popen)
     monkeypatch.setattr(
+        claude_code,
+        "_resolve_claude_executable",
+        lambda: "claude",
+    )
+    monkeypatch.setattr(
         runner_platform.PLATFORM,
         "new_session_kwargs",
         lambda: {},
@@ -214,7 +219,7 @@ def test_private_process_integration_wraps_real_backend_spawn(
         "isolation-wrapper",
         "claude",
         "-p",
-        "prompt",
+        *([] if os.name == "nt" else ["prompt"]),
         "--output-format",
         "stream-json",
         "--verbose",
