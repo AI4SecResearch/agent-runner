@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -232,6 +233,49 @@ def test_claude_process_uses_execution_local_runtime_directories(
     assert expected_tmp.is_dir()
 
 
+def test_claude_process_uses_resolved_cli_path(tmp_path, monkeypatch):
+    diagnostics = tmp_path / "execution" / "diagnostics"
+    diagnostics.mkdir(parents=True)
+    shim = tmp_path / "npm" / "claude.CMD"
+    resolved = (
+        shim.parent
+        / "node_modules"
+        / "@anthropic-ai"
+        / "claude-code"
+        / "bin"
+        / "claude.exe"
+    )
+    resolved.parent.mkdir(parents=True)
+    resolved.write_bytes(b"native")
+    popen_calls = []
+
+    class _Process:
+        pass
+
+    monkeypatch.setattr(
+        claude_code.subprocess,
+        "Popen",
+        lambda command, **kwargs: (
+            popen_calls.append((command, kwargs)) or _Process()
+        ),
+    )
+    monkeypatch.setattr(
+        claude_code.shutil,
+        "which",
+        lambda command: str(shim) if command == "claude" else None,
+    )
+
+    process = ClaudeCodeBackend().invoke(
+        "prompt",
+        str(diagnostics / "run"),
+        [],
+    )
+    process._ar_err.close()
+
+    assert popen_calls[0][0][0] == str(resolved)
+    assert popen_calls[0][1]["encoding"] == "utf-8"
+
+
 def test_claude_process_reuses_explicit_config_directory_across_executions(
     tmp_path,
     monkeypatch,
@@ -299,8 +343,10 @@ def test_claude_resume_copies_source_session_into_current_project_directory(
         r"[^A-Za-z0-9-]", "-", str(working_directory.resolve())
     )
     copied = configured / "projects" / project_name / "session-1.jsonl"
-    assert copied.read_text(encoding="utf-8") == '{"type":"user"}\n'
-    assert copied.stat().st_mode & 0o777 == 0o600
+    filesystem_copy = Path(claude_code._filesystem_path(copied))
+    assert filesystem_copy.read_text(encoding="utf-8") == '{"type":"user"}\n'
+    if os.name == "posix":
+        assert filesystem_copy.stat().st_mode & 0o777 == 0o600
 
 
 def test_internal_retry_keeps_requested_working_directory(tmp_path, monkeypatch):

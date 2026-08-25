@@ -39,7 +39,35 @@ try:
     )
 except Exception:  # pragma: no cover - lpm not yet importable at module load
     _AUTH_VAR = "ANTHROPIC_AUTH_TOKEN"
-    _BASE_URL_VAR = "ANTHROPIC_BASE_URL"
+_BASE_URL_VAR = "ANTHROPIC_BASE_URL"
+
+
+def _filesystem_path(path: Path) -> str:
+    value = str(path.absolute())
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+def _resolve_claude_executable() -> str:
+    executable = shutil.which("claude")
+    if executable is None:
+        return "claude"
+    shim = Path(executable)
+    if shim.suffix.lower() in {".cmd", ".bat"}:
+        native = (
+            shim.parent
+            / "node_modules"
+            / "@anthropic-ai"
+            / "claude-code"
+            / "bin"
+            / "claude.exe"
+        )
+        if native.is_file():
+            return str(native)
+    return executable
 
 
 # 模型名不在此写死——经 config 层取(AR_PRIMARY_MODEL/AR_DOWNGRADE_MODEL,TOML 或 env),
@@ -87,25 +115,35 @@ def _copy_resumed_session_to_current_project(
     target = target_directory / source.name
     if source == target:
         return
-    target_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.makedirs(
+        _filesystem_path(target_directory),
+        mode=0o700,
+        exist_ok=True,
+    )
     if os.name == "posix":
         target_directory.chmod(0o700)
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            dir=target_directory,
+            dir=_filesystem_path(target_directory),
             prefix=f".{session_id}.",
             suffix=".tmp",
             delete=False,
         ) as temporary:
             temporary_path = Path(temporary.name)
-            with source.open("rb") as source_file:
+            with open(_filesystem_path(source), "rb") as source_file:
                 shutil.copyfileobj(source_file, temporary)
-        temporary_path.chmod(0o600)
-        os.replace(temporary_path, target)
+        os.chmod(_filesystem_path(temporary_path), 0o600)
+        os.replace(
+            _filesystem_path(temporary_path),
+            _filesystem_path(target),
+        )
     finally:
         if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+            try:
+                os.unlink(_filesystem_path(temporary_path))
+            except FileNotFoundError:
+                pass
 
 
 class ClaudeCodeBackend:
@@ -146,7 +184,7 @@ class ClaudeCodeBackend:
         """
         from ..platform import PLATFORM
         cmd = [
-            "claude", "-p", prompt,
+            _resolve_claude_executable(), "-p", prompt,
             "--output-format", "stream-json", "--verbose",
             *argv,
         ]
@@ -188,6 +226,7 @@ class ClaudeCodeBackend:
         process_environment["TMPDIR"] = str(temporary_directory)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err, text=True,
+            encoding="utf-8",
             env=process_environment,
             cwd=working_directory,
             **PLATFORM.new_session_kwargs(),

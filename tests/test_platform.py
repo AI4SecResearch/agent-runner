@@ -1,8 +1,8 @@
 """Platform abstraction tests — verify the POSIX path is selected on Linux/macOS
 and that the abstraction API behaves (process group spawn + tree kill).
 
-These exercise the supported (POSIX) platform. The Windows path is a stub that
-raises NotImplementedError; it's an extension point, not a tested path.
+These exercise both the POSIX implementation and the Windows process-group
+contract without requiring the host running the tests to be Windows.
 """
 
 from __future__ import annotations
@@ -30,8 +30,56 @@ def test_posix_selected_on_unix():
     assert platform.PLATFORM.supports_process_tree_kill is True
 
 
-def test_windows_reports_process_tree_kill_is_not_supported():
-    assert platform._WindowsPlatform().supports_process_tree_kill is False
+def test_windows_reports_process_tree_kill_is_supported():
+    windows = platform._WindowsPlatform()
+
+    assert windows.supports_process_tree_kill is True
+    assert windows.new_session_kwargs() == {
+        "creationflags": platform._CREATE_NEW_PROCESS_GROUP,
+    }
+
+
+def test_windows_kill_tree_uses_taskkill_and_reaps(monkeypatch):
+    class FakeProcess:
+        pid = 1234
+
+        def __init__(self):
+            self.alive = True
+            self.wait_timeouts = []
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def wait(self, *, timeout):
+            self.wait_timeouts.append(timeout)
+            return 0
+
+        def kill(self):
+            raise AssertionError("taskkill success must not use leader-only kill")
+
+    proc = FakeProcess()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        proc.alive = False
+
+    monkeypatch.setattr(platform.subprocess, "run", fake_run)
+
+    platform._WindowsPlatform().kill_tree(proc)
+
+    assert calls == [
+        (
+            ["taskkill", "/PID", "1234", "/T", "/F"],
+            {
+                "check": False,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "timeout": 10,
+            },
+        )
+    ]
+    assert proc.wait_timeouts == [5]
 
 
 def test_new_session_kwargs_is_a_separate_group():

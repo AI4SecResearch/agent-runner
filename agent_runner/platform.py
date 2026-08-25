@@ -5,11 +5,9 @@ the rest of the codebase (backends' ``invoke``, the engine's watchdog) calls
 abstract APIs — ``new_session_kwargs()`` and ``kill_tree(proc)`` — and never
 touches ``os.killpg``/``start_new_session`` directly.
 
-The POSIX implementation is the supported path (Linux/macOS/BSD). A Windows
-implementation is stubbed as an extension point: the project's keypool and
-path handling are cross-platform (see the vendored lpm copy's flock helpers),
-but watchdog *process-tree kill* is genuinely Unix-shaped semantics and a
-correct Windows port (``taskkill /T /F`` + job objects) is left for later.
+The POSIX implementation uses a new session and ``killpg``. Windows uses a
+new process group plus ``taskkill /T /F`` so watchdog timeout and cancellation
+also tear down descendants instead of only the wrapper process.
 """
 
 from __future__ import annotations
@@ -18,6 +16,13 @@ import os
 import signal
 import subprocess
 import sys
+
+
+_CREATE_NEW_PROCESS_GROUP = getattr(
+    subprocess,
+    "CREATE_NEW_PROCESS_GROUP",
+    0x00000200,
+)
 
 
 class Platform:
@@ -63,26 +68,34 @@ class _PosixPlatform(Platform):
 
 
 class _WindowsPlatform(Platform):
-    # Extension point — not implemented in this revision. The correct
-    # approach is CREATE_NEW_PROCESS_GROUP on spawn + taskkill /T /F /PID
-    # (or a Win32 Job Object) for tree kill. Surfacing a clear error here
-    # is better than silent Unix semantics on Windows.
     @property
     def supports_process_tree_kill(self) -> bool:
-        return False
+        return True
 
     def new_session_kwargs(self) -> dict:
-        raise NotImplementedError(
-            "agent-runner watchdog process-group kill is not yet "
-            "implemented on Windows. See agent_runner/platform.py. "
-            "Use a POSIX system, or contribute a Windows implementation."
-        )
+        return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
 
     def kill_tree(self, proc: subprocess.Popen) -> None:
-        raise NotImplementedError(
-            "agent-runner watchdog process-tree kill is not yet "
-            "implemented on Windows."
-        )
+        if proc.poll() is None:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
 
 def get_platform() -> Platform:
