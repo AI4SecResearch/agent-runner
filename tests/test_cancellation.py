@@ -253,8 +253,16 @@ def test_running_cancellation_kills_group_and_reaps_before_return(
     assert result_box[0].outcome is RunOutcome.CANCELED
     assert kill_spy.calls == 1
     assert backend.processes[0].poll() is not None
-    with pytest.raises((ProcessLookupError, OSError)):
-        os.killpg(parent_pgid, 0)
+    # The runner reaps its direct child; init reaps killed grandchildren.
+    # A transient zombie keeps the group visible even though it cannot run.
+    reap_deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.killpg(parent_pgid, 0)
+        except (ProcessLookupError, OSError):
+            break
+        assert time.monotonic() < reap_deadline, "killed process group was not reaped"
+        time.sleep(0.01)
     with pytest.raises(ChildProcessError):
         os.waitpid(parent_pid, os.WNOHANG)
     time.sleep(0.6)
