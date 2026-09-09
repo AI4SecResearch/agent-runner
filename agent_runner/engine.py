@@ -25,6 +25,7 @@ keypool 的 ``init``/``rotate``/``on_success`` 返回纯 ``KeyContext``(不写
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -376,7 +377,11 @@ class Runner:
                 timeout_reason = f"无进展 {int(stall_elapsed)}s >= {stall_timeout}s"
                 break
 
-            time.sleep(_WATCHDOG_POLL_SECONDS)
+            # Wake when the child exits without scanning its log more often.
+            try:
+                proc.wait(timeout=_WATCHDOG_POLL_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
 
         if watchdog_outcome is not RunOutcome.SUCCEEDED:
             # Kill the whole process group (agent + its children) — the Popen
